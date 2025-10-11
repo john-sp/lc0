@@ -527,6 +527,7 @@ void OnnxComputation<DataType>::ComputeBlocking() {
       CaptureCudaGraph();
     }
     ReportCUDAErrors(cudaGraphLaunch(graph, inputs_outputs_->exec_stream_));
+    ReportCUDAErrors(cudaStreamSynchronize(inputs_outputs_->exec_stream_));
   } else
 #endif
   {
@@ -545,13 +546,37 @@ void OnnxComputation<DataType>::ComputeBlocking() {
         network_->provider_ == OnnxProvider::TRT) {
       network_->lock_.unlock();
     }
-  }
 #ifdef USE_ONNX_CUDART
   if (network_->provider_ == OnnxProvider::TRT ||
       network_->provider_ == OnnxProvider::CUDA) {
-    ReportCUDAErrors(cudaStreamSynchronize(inputs_outputs_->exec_stream_));
+    ReportCUDAErrors(cudaEventSynchronize(
+        inputs_outputs_->outputs_download_event_));
   }
 #endif
+  }
+  if (network_->wdl_head_ != -1) {
+    const DataType* data = static_cast<DataType*>(
+        inputs_outputs_->output_tensors_data_[network_->wdl_head_]);
+    for (size_t i = 0; i < input_size_; i++) {
+      float w = AsFloat(data[i * 3 + 0]);
+      float d = AsFloat(data[i * 3 + 1]);
+      float l = AsFloat(data[i * 3 + 2]);
+      if (network_->cpu_wdl_) {
+        // Value softmax done cpu side.
+        float m = std::max({w, d, l});
+        w = std::exp(w - m);
+        d = std::exp(d - m);
+        l = std::exp(l - m);
+        float sum = w + d + l;
+        w /= sum;
+        l /= sum;
+        d = 1.0f - w - l;
+      }
+      inputs_outputs_->wdl_output_data_[3 * i + 0] = w;
+      inputs_outputs_->wdl_output_data_[3 * i + 1] = d;
+      inputs_outputs_->wdl_output_data_[3 * i + 2] = l;
+    }
+  }
 }
 
 template <typename DataType>
@@ -687,29 +712,6 @@ void OnnxComputation<DataType>::ComputeBlockingImpl() {
         network_->upload_stream_, inputs_outputs_->outputs_download_event_, 0));
   }
 #endif
-  if (network_->wdl_head_ != -1) {
-    const DataType* data = static_cast<DataType*>(
-        inputs_outputs_->output_tensors_data_[network_->wdl_head_]);
-    for (size_t i = 0; i < input_size_; i++) {
-      float w = AsFloat(data[i * 3 + 0]);
-      float d = AsFloat(data[i * 3 + 1]);
-      float l = AsFloat(data[i * 3 + 2]);
-      if (network_->cpu_wdl_) {
-        // Value softmax done cpu side.
-        float m = std::max({w, d, l});
-        w = std::exp(w - m);
-        d = std::exp(d - m);
-        l = std::exp(l - m);
-        float sum = w + d + l;
-        w /= sum;
-        l /= sum;
-        d = 1.0f - w - l;
-      }
-      inputs_outputs_->wdl_output_data_[3 * i + 0] = w;
-      inputs_outputs_->wdl_output_data_[3 * i + 1] = d;
-      inputs_outputs_->wdl_output_data_[3 * i + 2] = l;
-    }
-  }
 }
 
 Ort::SessionOptions OnnxNetwork::GetOptions(int threads, int batch_size,
