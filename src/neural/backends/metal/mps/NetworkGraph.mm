@@ -31,6 +31,8 @@
 #import "neural/tables/policy_map.h"
 #import "NetworkGraph.h"
 
+static const MPSDataType kDataType = MPSDataTypeFloat32;
+
 static MPSGraphConvolution2DOpDescriptor * __nonnull convolution2DDescriptor = [MPSGraphConvolution2DOpDescriptor descriptorWithStrideInX:1
                                                                                                                                 strideInY:1
                                                                                                                           dilationRateInX:1
@@ -141,52 +143,18 @@ static const NSInteger kMinSubBatchSize = 20;
                                                            masks:(uint64_t * __nonnull)masks
                                                          outputs:(float * __nonnull * __nonnull)outputBuffers
 {
-    // Calculate number of sub-batches to split across GPU command buffers for parallel execution.
-    // Shouldn't be more than kMaxInflightBuffers and each sub-batch shouldn't be smaller than kMinSubBatchSize.
-    NSUInteger splits = (batchSize + kMinSubBatchSize + 1) / kMinSubBatchSize;
-    if (splits > kMaxInflightBuffers) splits = kMaxInflightBuffers;
-    NSUInteger subBatchSize = batchSize / splits;
-    NSUInteger inputDataLength = subBatchSize * [_inputTensor sizeOfDimensionsFrom:@1];
+    // Create a semaphore to wait for the GPU to finish the specific job.
+    // This makes the method blocking from the caller's perspective, but is 
+    // fully async on the GPU, allowing other threads to queue work without a global lock.
+    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
 
-    // Split batchSize into smaller sub-batches and run using double-buffering.
-    NSUInteger subBatch = 0;
-    MPSCommandBuffer * commandBuffer;
-    for (subBatch = 0; subBatch < splits - 1; subBatch++) {
-        commandBuffer = [self runCommandSubBatchWithInputs:inputs + subBatch * inputDataLength
-                                                     masks:masks + subBatch * inputDataLength
-                                                  subBatch:subBatch
-                                              subBatchSize:subBatchSize];
-    }
-    // Last sub-batch may be smaller or larger than others.
-    MPSCommandBuffer * latestCommandBuffer = [self runCommandSubBatchWithInputs:inputs + subBatch * inputDataLength
-                                                                          masks:masks + subBatch * inputDataLength
-                                                                       subBatch:subBatch
-                                                                   subBatchSize:batchSize - subBatch * subBatchSize];
-
-    // Wait for the last batch to be processed.
-    [latestCommandBuffer waitUntilCompleted];
-    [commandBuffer waitUntilCompleted];
-
-    [self copyResultsToBuffers:outputBuffers subBatchSize:subBatchSize];
-
-    return _resultTensors;
-}
-
--(nonnull MPSCommandBuffer *) runCommandSubBatchWithInputs:(float * __nonnull)inputs
-                                                     masks:(uint64_t * __nonnull)masks
-                                                  subBatch:(NSUInteger)subBatch
-                                              subBatchSize:(NSUInteger)subBatchSize
-{
-    // Double buffering semaphore to correctly double buffer iterations.
-    dispatch_semaphore_wait(_doubleBufferingSemaphore, DISPATCH_TIME_FOREVER);
-
-    // Create command buffer for this sub-batch.
+    // Create command buffer for the entire batch.
     MPSCommandBuffer * commandBuffer = [MPSCommandBuffer commandBufferFromCommandQueue:_queue];
 
-    MPSShape * shape = @[@(subBatchSize), _inputTensor.shape[1], _inputTensor.shape[2]];
+    MPSShape * shape = @[@(batchSize), _inputTensor.shape[1], _inputTensor.shape[2]];
 
     NSData * inputData = [NSData dataWithBytesNoCopy:inputs
-                                              length:subBatchSize * sizeof(float)
+                                              length:batchSize * [_inputTensor sizeOfDimensionsFrom:@1] * sizeof(float)
                                         freeWhenDone:NO];
 
     MPSGraphTensorData * inputTensorData = [[MPSGraphTensorData alloc] initWithDevice:_device
@@ -195,7 +163,7 @@ static const NSInteger kMinSubBatchSize = 20;
                                                                              dataType:_inputTensor.dataType];
 
     NSData * maskData = [NSData dataWithBytesNoCopy:masks
-                                             length:subBatchSize * sizeof(uint64_t)
+                                             length:batchSize * [_maskTensor sizeOfDimensionsFrom:@1] * sizeof(uint64_t)
                                        freeWhenDone:NO];
 
     MPSGraphTensorData * inputMaskData = [[MPSGraphTensorData alloc] initWithDevice:_device
@@ -205,17 +173,24 @@ static const NSInteger kMinSubBatchSize = 20;
 
     NSDictionary * feeds = @{_inputTensor : inputTensorData, _maskTensor : inputMaskData};
 
-    // Create execution descriptor with block to update results for each iteration.
+    MPSGraphCompilationDescriptor * compilationDescriptor = [[MPSGraphCompilationDescriptor alloc] init];
+    compilationDescriptor.optimizationLevel = MPSGraphOptimizationLevel0;
+
     MPSGraphExecutionDescriptor * executionDescriptor = [[MPSGraphExecutionDescriptor alloc] init];
+    executionDescriptor.compilationDescriptor = compilationDescriptor;
     executionDescriptor.completionHandler = ^(MPSGraphTensorDataDictionary * resultDictionary, NSError * _Nullable error) {
         if (error) {
             NSLog(@"Error occurred during execution: %@", error);
         } else {
-            _resultDataDicts[@(subBatch)] = resultDictionary;
+            for (NSUInteger rsIdx = 0; rsIdx < [_resultTensors count]; rsIdx++) {
+                MPSGraphTensorData * resultData = resultDictionary[_resultTensors[rsIdx]];
+                [resultData.mpsndarray readBytes:outputBuffers[rsIdx]
+                                     strideBytes:nil];
+            }
         }
 
         // Release double buffering semaphore for the next training iteration to be encoded.
-        dispatch_semaphore_signal(_doubleBufferingSemaphore);
+        dispatch_semaphore_signal(semaphore);
     };
 
     [self encodeToCommandBuffer:commandBuffer
@@ -226,7 +201,10 @@ static const NSInteger kMinSubBatchSize = 20;
 
     // Commit the command buffer
     [commandBuffer commit];
-    return commandBuffer;
+
+    dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
+
+    return _resultTensors;
 }
 
 
@@ -258,7 +236,7 @@ static const NSInteger kMinSubBatchSize = 20;
                                                         label:(NSString * __nullable)label
 {
     _inputTensor = [self placeholderWithShape:@[@(-1), @(channels), @1]
-                                     dataType:MPSDataTypeFloat32
+                                     dataType:kDataType
                                          name:label];
     return _inputTensor;
 }
@@ -333,7 +311,7 @@ static const NSInteger kMinSubBatchSize = 20;
                                              name:[NSString stringWithFormat:@"%@/input/broadcast", label]];
 
     expandedMaskTensor = [self castTensor:expandedMaskTensor
-                                   toType:MPSDataTypeFloat32
+                                   toType:kDataType
                                      name:[NSString stringWithFormat:@"%@/input/cast", label]];
 
     // Final multiplication: value * mask
@@ -375,7 +353,7 @@ static const NSInteger kMinSubBatchSize = 20;
 
     MPSGraphTensor * weightsTensor = [self constantWithData:weightsData
                                                       shape:@[@(outputChannels), @(inputChannels), @(kernelSize), @(kernelSize)]
-                                                   dataType:MPSDataTypeFloat32];
+                                                   dataType:kDataType];
 
     NSData * biasData = [NSData dataWithBytesNoCopy:biases
                                              length:outputChannels * sizeof(float)
@@ -383,7 +361,7 @@ static const NSInteger kMinSubBatchSize = 20;
 
     MPSGraphTensor * biasTensor = [self constantWithData:biasData
                                                    shape:@[@(outputChannels), @1, @1]
-                                                dataType:MPSDataTypeFloat32];
+                                                dataType:kDataType];
 
     MPSGraphTensor * convTensor = [self convolution2DWithSourceTensor:parent
                                                         weightsTensor:weightsTensor
@@ -468,7 +446,7 @@ static const NSInteger kMinSubBatchSize = 20;
 
     MPSGraphTensor * weightTensor = [self constantWithData:weightData
                                                      shape:@[@(outputChannels), @(inputChannels)]
-                                                  dataType:MPSDataTypeFloat32];
+                                                  dataType:kDataType];
 
     // Leela weights are OIHW, need to be transposed to IO** to allow matmul.
     weightTensor = [self transposeTensor:weightTensor
@@ -487,7 +465,7 @@ static const NSInteger kMinSubBatchSize = 20;
 
         MPSGraphTensor * biasTensor = [self constantWithData:biasData
                                                        shape:@[@(outputChannels)]
-                                                    dataType:MPSDataTypeFloat32];
+                                                    dataType:kDataType];
 
         parent = [self additionWithPrimaryTensor:parent
                                  secondaryTensor:biasTensor
@@ -776,7 +754,7 @@ static const NSInteger kMinSubBatchSize = 20;
 
     MPSGraphTensor * gammaTensor = [self constantWithData:gammaData
                                                     shape:@[@(channelSize)]
-                                                 dataType:MPSDataTypeFloat32];
+                                                 dataType:kDataType];
 
     NSData * betaData = [NSData dataWithBytesNoCopy:betas
                                              length:channelSize * sizeof(float)
@@ -784,7 +762,7 @@ static const NSInteger kMinSubBatchSize = 20;
 
     MPSGraphTensor * betaTensor = [self constantWithData:betaData
                                                    shape:@[@(channelSize)]
-                                                dataType:MPSDataTypeFloat32];
+                                                dataType:kDataType];
 
     return [self normalizationWithTensor:parent
                               meanTensor:means
@@ -835,7 +813,7 @@ static const NSInteger kMinSubBatchSize = 20;
 
     MPSGraphTensor * gammaTensor = [self constantWithData:gammaData
                                                     shape:@[@(channelSize)]
-                                                 dataType:MPSDataTypeFloat32];
+                                                 dataType:kDataType];
 
     factor = [self multiplicationWithPrimaryTensor:factor
                                    secondaryTensor:gammaTensor
@@ -1087,7 +1065,7 @@ static const NSInteger kMinSubBatchSize = 20;
 
     MPSGraphTensor * encodingTensor = [self constantWithData:encodingData
                                                        shape:shape
-                                                    dataType:MPSDataTypeFloat32];
+                                                    dataType:kDataType];
 
     MPSGraphTensor * shapeTensor = [self shapeOfTensor:tensor
                                                   name:[NSString stringWithFormat:@"%@/shape", label]];
@@ -1173,7 +1151,7 @@ static const NSInteger kMinSubBatchSize = 20;
 
     MPSGraphTensor * weightsTensor = [self constantWithData:weightsData
                                                       shape:@[parent.shape[2], parent.shape[1]]
-                                                   dataType:MPSDataTypeFloat32];
+                                                   dataType:kDataType];
 
     // Leela weights are transposed.
     weightsTensor = [self transposeTensor:weightsTensor

@@ -168,9 +168,7 @@ MetalNetwork::MetalNetwork(const WeightsFile& file, const OptionsDict& options)
 }
 
 void MetalNetwork::forwardEval(InputsOutputs* io, int batchSize) {
-  // Metal is not thread-safe, so lock is needed.
-  lock_.lock();
-
+  
   if (moves_left_) {
     builder_->forwardEval(&io->input_val_mem_[0], &io->input_masks_mem_[0],
                           batchSize,
@@ -182,8 +180,6 @@ void MetalNetwork::forwardEval(InputsOutputs* io, int batchSize) {
                           {&io->op_policy_mem_[0], &io->op_value_mem_[0]});
   }
 
-  // The next thread can start using the GPU now.
-  lock_.unlock();
 }
 
 std::unique_ptr<Network> MakeMetalNetwork(const std::optional<WeightsFile>& w,

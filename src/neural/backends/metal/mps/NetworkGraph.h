@@ -58,9 +58,6 @@ static MPSImageFeatureChannelFormat fcFormat = MPSImageFeatureChannelFormatFloat
     NSMutableDictionary<NSNumber *, MPSGraphTensorDataDictionary *> * _resultDataDicts;
     NSMutableDictionary<NSString *, MPSGraphTensor *> * _readVariables;
 
-    // Variables for triple buffering
-    dispatch_semaphore_t _doubleBufferingSemaphore;
-
     // Global smolgen weights.
     float * __nullable _globalSmolgenWeights;
 }
@@ -213,12 +210,12 @@ static MPSImageFeatureChannelFormat fcFormat = MPSImageFeatureChannelFormatFloat
                                                            masks:(uint64_t * __nonnull)masks
                                                          outputs:(float * __nonnull * __nonnull)outputBuffers;
 
--(nonnull MPSCommandBuffer *) runCommandSubBatchWithInputs:(float * __nonnull)inputs
-                                                     masks:(uint64_t * __nonnull)masks
-                                                  subBatch:(NSUInteger)subBatch
-                                              subBatchSize:(NSUInteger)subBatchSize;
+// -(nonnull MPSCommandBuffer *) runCommandSubBatchWithInputs:(float * __nonnull)inputs
+//                                                      masks:(uint64_t * __nonnull)masks
+//                                                   subBatch:(NSUInteger)subBatch
+//                                               subBatchSize:(NSUInteger)subBatchSize;
 
--(void) copyResultsToBuffers:(float * __nonnull * __nonnull)outputBuffers
-                subBatchSize:(NSUInteger)subBatchSize;
+// -(void) copyResultsToBuffers:(float * __nonnull * __nonnull)outputBuffers
+//                 subBatchSize:(NSUInteger)subBatchSize;
 
 @end
