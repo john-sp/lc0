@@ -217,20 +217,6 @@ static const NSInteger kMinSubBatchSize = 20;
 }
 
 
--(void) copyResultsToBuffers:(float * __nonnull * __nonnull)outputBuffers
-                subBatchSize:(NSUInteger)subBatchSize
-{
-    // Copy results for batch back into the output buffers.
-    for (NSUInteger rsIdx = 0; rsIdx < [_resultTensors count]; rsIdx++) {
-        NSUInteger outputDataLength = [_resultTensors[rsIdx] sizeOfDimensions:@[@1, @2, @3]] * subBatchSize;
-        for (NSUInteger subBatch = 0; subBatch < [_resultDataDicts count]; subBatch++) {
-            [[_resultDataDicts[@(subBatch)][_resultTensors[rsIdx]] mpsndarray] readBytes:outputBuffers[rsIdx] + subBatch * outputDataLength
-                                                                             strideBytes:nil];
-        }
-    }
-}
-
-
 -(void) setResultTensors:(NSArray<MPSGraphTensor *> * __nonnull)results
 {
     // Set the results we're interested in.
