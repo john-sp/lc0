@@ -143,10 +143,15 @@ static const NSInteger kMinSubBatchSize = 20;
                                                            masks:(uint64_t * __nonnull)masks
                                                          outputs:(float * __nonnull * __nonnull)outputBuffers
 {
-    // Create a semaphore to wait for the GPU to finish the specific job.
-    // This makes the method blocking from the caller's perspective, but is 
-    // fully async on the GPU, allowing other threads to queue work without a global lock.
-    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+    // Wait for an available slot in the double buffering queue.
+    // This allows up to kMaxInflightBuffers command buffers to be in flight simultaneously,
+    // improving GPU utilization by overlapping computation and data transfer.
+    dispatch_semaphore_wait(_doubleBufferingSemaphore, DISPATCH_TIME_FOREVER);
+
+    // Create a completion semaphore for this specific inference job.
+    // This makes the method blocking from the caller's perspective, but allows
+    // GPU work to execute fully async, enabling other threads to queue work.
+    dispatch_semaphore_t completionSemaphore = dispatch_semaphore_create(0);
 
     // Create command buffer for the entire batch.
     MPSCommandBuffer * commandBuffer = [MPSCommandBuffer commandBufferFromCommandQueue:_queue];
@@ -189,8 +194,11 @@ static const NSInteger kMinSubBatchSize = 20;
             }
         }
 
-        // Release double buffering semaphore for the next training iteration to be encoded.
-        dispatch_semaphore_signal(semaphore);
+        // Signal completion of this specific job.
+        dispatch_semaphore_signal(completionSemaphore);
+        
+        // Release a slot in the double buffering queue for the next inference.
+        dispatch_semaphore_signal(_doubleBufferingSemaphore);
     };
 
     [self encodeToCommandBuffer:commandBuffer
@@ -202,7 +210,8 @@ static const NSInteger kMinSubBatchSize = 20;
     // Commit the command buffer
     [commandBuffer commit];
 
-    dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
+    // Wait for this specific job to complete before returning.
+    dispatch_semaphore_wait(completionSemaphore, DISPATCH_TIME_FOREVER);
 
     return _resultTensors;
 }

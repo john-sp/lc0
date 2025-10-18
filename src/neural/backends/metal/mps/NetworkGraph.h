@@ -58,6 +58,9 @@ static MPSImageFeatureChannelFormat fcFormat = MPSImageFeatureChannelFormatFloat
     NSMutableDictionary<NSNumber *, MPSGraphTensorDataDictionary *> * _resultDataDicts;
     NSMutableDictionary<NSString *, MPSGraphTensor *> * _readVariables;
 
+    // Variables for triple buffering
+    dispatch_semaphore_t _doubleBufferingSemaphore;
+    
     // Global smolgen weights.
     float * __nullable _globalSmolgenWeights;
 }
