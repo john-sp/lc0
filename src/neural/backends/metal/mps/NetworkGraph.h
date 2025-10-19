@@ -141,6 +141,7 @@ static MPSImageFeatureChannelFormat fcFormat = MPSImageFeatureChannelFormatFloat
                                     scaledSecondaryTensor:(MPSGraphTensor * __nullable)secondary
                                                    gammas:(float * __nonnull)gammas
                                                     alpha:(float)alpha
+                                                    epsilon:(float)epsilon
                                                     label:(NSString * __nonnull)label;
 
 -(nonnull MPSGraphTensor *) scaledMHAMatmulWithQueries:(MPSGraphTensor * __nonnull)queries
