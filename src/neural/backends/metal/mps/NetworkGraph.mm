@@ -654,6 +654,7 @@ static const NSInteger kMinSubBatchSize = 20;
                             scaledSecondaryTensor:mha
                                            gammas:&encoder.ln1_gammas[0]
                                             alpha:alpha
+                                            epsilon:epsilon
                                             label:[NSString stringWithFormat:@"%@/ln1", label]];
     }
     else if ([normtype isEqual:@"skipfirst"]) {
@@ -702,6 +703,7 @@ static const NSInteger kMinSubBatchSize = 20;
                              scaledSecondaryTensor:ffn
                                             gammas:&encoder.ln2_gammas[0]
                                              alpha:alpha
+                                             epsilon:epsilon
                                              label:[NSString stringWithFormat:@"%@/ln1", label]];
     }
     else {
@@ -773,6 +775,7 @@ static const NSInteger kMinSubBatchSize = 20;
                                     scaledSecondaryTensor:(MPSGraphTensor * __nullable)secondary
                                                    gammas:(float * __nonnull)gammas
                                                     alpha:(float)alpha
+                                                    epsilon:(float)epsilon
                                                     label:(NSString * __nonnull)label
 {
     if (secondary != nil) {
@@ -798,6 +801,14 @@ static const NSInteger kMinSubBatchSize = 20;
     factor = [self meanOfTensor:factor
                            axes:@[@(axis)]
                            name:[NSString stringWithFormat:@"%@/mean", label]];
+
+    MPSGraphTensor * epsilonTensor = [self constantWithScalar:epsilon
+                                                          shape:@[@1]
+                                                       dataType:kDataType];
+
+    factor = [self additionWithPrimaryTensor:factor
+                             secondaryTensor:epsilonTensor
+                                        name:[NSString stringWithFormat:@"%@/add_epsilon", label]];
 
     factor = [self squareRootWithTensor:factor
                                    name:[NSString stringWithFormat:@"%@/sqrt", label]];
