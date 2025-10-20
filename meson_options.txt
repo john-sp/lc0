@@ -55,7 +55,7 @@ option('build_backends',
 
 option('blas',
        type: 'boolean',
-       value: true,
+       value: false,
        description: 'Enable BLAS backend')
 
 option('ispc',
@@ -85,7 +85,7 @@ option('plain_cuda',
 
 option('cutlass',
        type: 'boolean',
-       value: false,
+       value: true,
        description: 'Enable cutlass lib for cuda backend. Only supports Ampere+ right now')
 
 option('opencl',
