@@ -2152,9 +2152,6 @@ void AdjustBadMovePolicy(const LowNode& low, EvalResult& result,
     }
     index++;
   }
-  if (modified) {
-    SoftmaxPolicy(result.p);
-  }
 }
 
 }  // namespace

@@ -618,17 +618,22 @@ int ChessBoard::GetPieceValue(const Square& square) const {
   return kKnightValue;
 }
 
+// Check if static exchange evaluation is >= threshold
 bool ChessBoard::StaticExchangeEvaluation(Move move, int threshold) const {
-  const Square& to = move.to();
+  Square to = move.to();
   const Square& from = move.from();
   assert(our_pieces_.get(from));
-  if (their_pieces_.get(to) == 0 && !move.is_en_passant()) {
-    // TODO: Should we also evaluate silent moves which can be captured?.
-    return 0 >= threshold;
-  }
+
+
+  if (move.is_promotion() || move.is_en_passant()) return true;
+  // Assume checks pass the SEE
+  ChessBoard copy2{*this};
+  copy2.ApplyMove(move);
+  copy2.Mirror();
+  if (copy2.IsUnderCheck()) return true;
 
   // TODO: Should we handle promotions?
-  int captured_value = move.is_en_passant() ? kPawnValue : GetPieceValue(to);
+  int captured_value = GetPieceValue(to);
   captured_value -= threshold;
   if (captured_value < 0) {
     return false;
@@ -642,7 +647,7 @@ bool ChessBoard::StaticExchangeEvaluation(Move move, int threshold) const {
   while (true) {
     copy.ApplyMove(move);
     copy.Mirror();
-    good_move ^= 1;
+    to.Flip();  
     auto legal_moves = copy.GeneratePseudolegalMoves();
     auto end = std::copy_if(legal_moves.begin(), legal_moves.end(), legal_moves.begin(),
                  [&](Move m) { return m.to() == to; });
@@ -655,7 +660,8 @@ bool ChessBoard::StaticExchangeEvaluation(Move move, int threshold) const {
     }
     move = *min_m;
     captured_value = copy.GetPieceValue(move.from()) - captured_value;
-    if (captured_value < good_move) {
+    good_move ^= 1;
+    if (captured_value < 0) {
       break;
     }
   }
