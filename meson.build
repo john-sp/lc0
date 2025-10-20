@@ -484,7 +484,7 @@ if get_option('build_backends')
 	if get_option('cutlass')
 	  add_project_arguments('-DUSE_CUTLASS', language : 'cpp')
 	  cuda_arguments += ['-DUSE_CUTLASS']
-	  cuda_arguments += ['-I', get_option('cutlass_include')]
+	  cuda_arguments += ['-I', subproject('cutlass').get_variable('include_directory')]
 	endif
     nvcc_extra_args = []
     if cuda_cc != ''
