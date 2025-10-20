@@ -95,6 +95,7 @@ class ChessBoard {
   KingAttackInfo GenerateKingAttackInfo() const;
   // Checks if "our" (white) king is under check.
   bool IsUnderCheck() const { return IsUnderAttack(our_king_); }
+  bool StaticExchangeEvaluation(Move move, int value_threshold) const;
 
   // Checks whether at least one of the sides has mating material.
   bool HasMatingMaterial() const;
@@ -233,6 +234,7 @@ class ChessBoard {
   void PutPiece(Square square, PieceType piece, bool is_theirs);
   // Check internal state is consistent after state transformations.
   bool IsValid() const;
+  int GetPieceValue(const Square& square) const;
 
   // All white pieces.
   BitBoard our_pieces_;

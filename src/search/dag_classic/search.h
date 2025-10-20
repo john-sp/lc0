@@ -60,7 +60,8 @@ class Search {
          std::chrono::steady_clock::time_point start_time,
          std::unique_ptr<classic::SearchStopper> stopper, bool infinite,
          bool ponder, const OptionsDict& options, TranspositionTable* tt,
-         SyzygyTablebase* syzygy_tb);
+         SyzygyTablebase* syzygy_tb, float bad_move_policy_threshold,
+         float bad_move_policy_factor, int static_exchange_threshold);
 
   ~Search();
 
@@ -185,6 +186,9 @@ class Search {
   // tb_hits_ must be initialized before root_move_filter_.
   std::atomic<int> tb_hits_{0};
   const MoveList root_move_filter_;
+  const float bad_move_policy_threshold_;
+  const float bad_move_policy_factor_;
+  const int static_exchange_threshold_;
 
   mutable SharedMutex nodes_mutex_;
   EdgeAndNode current_best_edge_ GUARDED_BY(nodes_mutex_);
@@ -319,6 +323,7 @@ class SearchWorker {
 
     // The path to the node to extend.
     BackupPath path;
+    ChessBoard board;
     // The node to extend.
     Node* node;
     std::unique_ptr<EvalResult> eval;
@@ -346,8 +351,9 @@ class SearchWorker {
       return NodeToProcess(path, collision_count, max_count);
     }
     static NodeToProcess Visit(const BackupPath& path,
-                               const PositionHistory& history) {
-      return NodeToProcess(path, history);
+                               const PositionHistory& history,
+                               const ChessBoard& board) {
+      return NodeToProcess(path, history, board);
     }
 
     std::string DebugString() const {
@@ -384,8 +390,9 @@ class SearchWorker {
           maxvisit(max_count),
           is_collision(true),
           repetitions(0) {}
-    NodeToProcess(const BackupPath& path, const PositionHistory& in_history)
+    NodeToProcess(const BackupPath& path, const PositionHistory& in_history, const ChessBoard& board)
         : path(path),
+          board(board),
           node(std::get<0>(path.back())),
           eval(std::make_unique<EvalResult>()),
           multivisit(1),

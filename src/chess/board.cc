@@ -593,6 +593,75 @@ bool ChessBoard::IsValid() const {
   return true;
 }
 
+namespace {
+// Quick approximations based on #odds-bots estimations against humans.
+constexpr int kQueenValue = 0x100 * 8.6;
+constexpr int kRookValue = 0x100 * 4.7;
+constexpr int kBishopValue = 0x100 * 3.2;
+constexpr int kKnightValue = 0x100 * 3.0;
+constexpr int kPawnValue = 0x100;
+}  // namespace
+
+int ChessBoard::GetPieceValue(const Square& square) const {
+  if (!(ours() | theirs()).get(square)) {
+    return 0;
+  } else if (queens().get(square)) {
+    return kQueenValue;
+  } else if (rooks().get(square)) {
+    return kRookValue;
+  } else if (bishops().get(square)) {
+    return kBishopValue;
+  } else if (pawns().get(square)) {
+    return kPawnValue;
+  }
+  assert(!kings().get(square));
+  return kKnightValue;
+}
+
+bool ChessBoard::StaticExchangeEvaluation(Move move, int threshold) const {
+  const Square& to = move.to();
+  const Square& from = move.from();
+  assert(our_pieces_.get(from));
+  if (their_pieces_.get(to) == 0 && !move.is_en_passant()) {
+    // TODO: Should we also evaluate silent moves which can be captured?.
+    return 0 >= threshold;
+  }
+
+  // TODO: Should we handle promotions?
+  int captured_value = move.is_en_passant() ? kPawnValue : GetPieceValue(to);
+  captured_value -= threshold;
+  if (captured_value < 0) {
+    return false;
+  }
+  captured_value = GetPieceValue(from) - captured_value;
+  if (captured_value <= 0) {
+    return true;
+  }
+  int good_move = 1;
+  ChessBoard copy{*this};
+  while (true) {
+    copy.ApplyMove(move);
+    copy.Mirror();
+    good_move ^= 1;
+    auto legal_moves = copy.GeneratePseudolegalMoves();
+    auto end = std::copy_if(legal_moves.begin(), legal_moves.end(), legal_moves.begin(),
+                 [&](Move m) { return m.to() == to; });
+    auto min_m = std::min_element(
+        legal_moves.begin(), end, [&](Move a, Move b) {
+          return copy.GetPieceValue(a.from()) < copy.GetPieceValue(b.from());
+        });
+    if (min_m == end) {
+      break;
+    }
+    move = *min_m;
+    captured_value = copy.GetPieceValue(move.from()) - captured_value;
+    if (captured_value < good_move) {
+      break;
+    }
+  }
+  return good_move;
+}
+
 bool ChessBoard::ApplyMove(Move move) {
   assert(our_pieces_.intersects(BitBoard::FromSquare(move.from())));
 #ifndef NDEBUG

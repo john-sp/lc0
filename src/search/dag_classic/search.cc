@@ -194,7 +194,8 @@ Search::Search(const NodeTree& tree, Backend* backend,
                std::chrono::steady_clock::time_point start_time,
                std::unique_ptr<classic::SearchStopper> stopper, bool infinite,
                bool ponder, const OptionsDict& options, TranspositionTable* tt,
-               SyzygyTablebase* syzygy_tb)
+               SyzygyTablebase* syzygy_tb, float bad_move_policy_threshold,
+               float bad_move_policy_factor, int static_exchange_threshold)
     : ok_to_respond_bestmove_(!infinite && !ponder),
       stopper_(std::move(stopper)),
       root_node_(tree.GetCurrentHead()),
@@ -210,6 +211,9 @@ Search::Search(const NodeTree& tree, Backend* backend,
       root_move_filter_(MakeRootMoveFilter(
           searchmoves_, syzygy_tb_, played_history_,
           params_.GetSyzygyFastPlay(), &tb_hits_, &root_is_in_dtz_)),
+      bad_move_policy_threshold_(bad_move_policy_threshold),
+      bad_move_policy_factor_(bad_move_policy_factor),
+      static_exchange_threshold_(static_exchange_threshold),
       uci_responder_(std::move(uci_responder)) {
   // Evict expired entries from the transposition table.
   // Garbage collection may lead to expiration at any time so this is not
@@ -1736,8 +1740,9 @@ void SearchWorker::PickNodesToExtendTask(
           // ensure the outer gather loop gives up.
           if (node->TryStartScoreUpdate()) {
             cur_limit -= 1;
-            minibatch_.push_back(
-                NodeToProcess::Visit(full_path, search_->played_history_));
+            minibatch_.push_back(NodeToProcess::Visit(
+                full_path, search_->played_history_,
+                search_->played_history_.Last().GetBoard()));
             completed_visits++;
           }
         }
@@ -1911,7 +1916,8 @@ void SearchWorker::PickNodesToExtendTask(
             // Reduce 1 for the visits_to_perform to ensure the collision
             // created doesn't include this visit.
             (*visits_to_perform.back())[best_idx] -= 1;
-            receiver->push_back(NodeToProcess::Visit(full_path, history));
+            receiver->push_back(NodeToProcess::Visit(
+                full_path, history, history.Last().GetBoard()));
             completed_visits++;
           } else {
             child_node->IncrementNInFlight(new_visits);
@@ -2122,6 +2128,37 @@ void SearchWorker::FetchMinibatchResults() {
   }
 }
 
+namespace {
+void SoftmaxPolicy(std::vector<float>& p) {
+  const float max_p = *std::max_element(p.begin(), p.end());
+  const float total =
+      std::accumulate(p.begin(), p.end(), 0.0f, [&](float total, float& value) {
+        return total + (value = std::exp(value - max_p));
+      });
+  const float scale = total > 0.0f ? 1.0f / total : 1.0f;
+  std::for_each(p.begin(), p.end(), [scale](float& value) { value *= scale; });
+}
+
+void AdjustBadMovePolicy(const LowNode& low, EvalResult& result,
+                         const ChessBoard& board, const float threshold,
+                         const float factor, const int value_threshold) {
+  size_t index = 0;
+  bool modified = false;
+  for (const auto& edge : std::span(low.GetEdges(), low.GetNumEdges())) {
+    if (result.p[index] < threshold &&
+        !board.StaticExchangeEvaluation(edge.GetMove(), value_threshold)) {
+      result.p[index] *= factor;
+      modified = true;
+    }
+    index++;
+  }
+  if (modified) {
+    SoftmaxPolicy(result.p);
+  }
+}
+
+}  // namespace
+
 void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process) {
   if (!node_to_process->nn_queried) return;
 
@@ -2143,6 +2180,10 @@ void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process) {
     }
   };
   wdl_rescale();
+  AdjustBadMovePolicy(*node_to_process->tt_low_node, *node_to_process->eval,
+                      node_to_process->board,
+                      search_->bad_move_policy_threshold_,
+                      search_->bad_move_policy_factor_, search_->static_exchange_threshold_);
   node_to_process->tt_low_node->SetNNEval(node_to_process->eval.get());
   node_to_process->tt_low_node->SortEdges();
 

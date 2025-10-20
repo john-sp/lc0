@@ -48,6 +48,22 @@ const OptionId kClearTree{
      .uci_option = "ClearTree",
      .help_text = "Clear the tree before the next search.",
      .visibility = OptionId::kProOnly}};
+const OptionId kBadMovePolicyThresholdId{
+    {.long_flag = "bad-move-policy-threshold",
+     .uci_option = "BadMovePolicyThreshold",
+     .help_text = "Policy threshold for bad moves in dag-preview search.",
+     .visibility = OptionId::kProOnly}};
+const OptionId kBadMovePolicyFactorId{
+    {.long_flag = "bad-move-policy-factor",
+     .uci_option = "BadMovePolicyFactor",
+     .help_text = "Policy factor for bad moves in dag-preview search.",
+     .visibility = OptionId::kProOnly}};
+const OptionId kStaticExchangeThresholdOptionId{
+    {.long_flag = "static-exchange-threshold",
+     .uci_option = "StaticExchangeThreshold",
+     .help_text =
+         "Static exchange evaluation threshold for dag-preview search.",
+     .visibility = OptionId::kProOnly}};
 
 class DagClassicSearch : public SearchBase {
  public:
@@ -142,7 +158,10 @@ void DagClassicSearch::StartSearch(const GoParams& params) {
       *tree_, backend_, std::move(forwarder),
       StringsToMovelist(params.searchmoves, tree_->HeadPosition().GetBoard()),
       *move_start_time_, std::move(stopper), params.infinite, params.ponder,
-      *options_, &tt_, syzygy_tb_);
+      *options_, &tt_, syzygy_tb_,
+      options_->Get<float>(kBadMovePolicyThresholdId),
+      options_->Get<float>(kBadMovePolicyFactorId),
+      options_->Get<int>(kStaticExchangeThresholdOptionId));
 
   LOGFILE << "Timer started at "
           << FormatTime(SteadyClockToSystemClock(*move_start_time_));
@@ -162,6 +181,10 @@ class DagClassicSearchFactory : public SearchFactory {
     classic::PopulateTimeManagementOptions(classic::RunType::kUci, parser);
 
     parser->Add<ButtonOption>(kClearTree);
+    parser->Add<FloatOption>(kBadMovePolicyThresholdId, 0.0f, 1.0f) = 0.01f;
+    parser->Add<FloatOption>(kBadMovePolicyFactorId, 0.0f, 1.0f) =
+        0.3333333333333333f;
+    parser->Add<IntOption>(kStaticExchangeThresholdOptionId, -0xA00, 0xA00) = 0;
   }
 };
 
