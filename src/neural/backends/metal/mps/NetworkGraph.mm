@@ -227,11 +227,7 @@ static const NSInteger kMinSubBatchSize = 20;
         NSUInteger i = 0;
         for (MPSGraphTensor * tensor in results) {
             NSString *name;
-            if (@available(macOS 12.0, iOS 15.0, *)) {
-                name = tensor.name;
-            } else {
-                name = [NSString stringWithFormat:@"output_%lu", (unsigned long)i];
-            }
+            name = [NSString stringWithFormat:@"output_%lu", (unsigned long)i];
             [castedResults addObject:[self castTensor:tensor
                                               toType:MPSDataTypeFloat32
                                                 name:[NSString stringWithFormat:@"%@/cast_to_fp32", name]]];
