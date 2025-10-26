@@ -40,8 +40,6 @@
 
 @end
 
-static MPSImageFeatureChannelFormat fcFormat = MPSImageFeatureChannelFormatFloat16;
-
 @interface Lc0NetworkGraph : MPSGraph {
 @public
     // Keep the device and command queue objects around for ease of use.
@@ -63,14 +61,19 @@ static MPSImageFeatureChannelFormat fcFormat = MPSImageFeatureChannelFormatFloat
     
     // Global smolgen weights.
     float * __nullable _globalSmolgenWeights;
+
+    BOOL _useFP16;
+    MPSDataType _dataType;
 }
 
 +(Lc0NetworkGraph * _Nonnull) getGraphAt:(NSNumber * _Nonnull)index;
 
 +(void) graphWithDevice:(id<MTLDevice> __nonnull)device
-                  index:(NSNumber * _Nonnull)index;
+                  index:(NSNumber * _Nonnull)index
+                useFP16:(BOOL)useFP16;
 
--(nonnull instancetype) initWithDevice:(id<MTLDevice> __nonnull)device;
+-(nonnull instancetype) initWithDevice:(id<MTLDevice> __nonnull)device
+                           useFP16:(BOOL)useFP16;
 
 -(nonnull MPSGraphTensor *) inputPlaceholderWithInputChannels:(NSUInteger)channels
                                                         label:(NSString * __nullable)label;

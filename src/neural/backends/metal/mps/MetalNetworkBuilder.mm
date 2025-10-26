@@ -36,7 +36,7 @@ namespace metal_backend {
 MetalNetworkBuilder::MetalNetworkBuilder(void){}
 MetalNetworkBuilder::~MetalNetworkBuilder(void){}
 
-std::string MetalNetworkBuilder::init(int gpu_id)
+std::string MetalNetworkBuilder::init(int gpu_id, bool use_fp16)
 {
     // All metal devices.
     NSArray<id<MTLDevice>> * devices = MTLCopyAllDevices();
@@ -47,9 +47,12 @@ std::string MetalNetworkBuilder::init(int gpu_id)
         return "";
     }
 
+    this->use_fp16_ = use_fp16;
+
     // Initialize the metal MPS Graph executor with the selected device.
     [Lc0NetworkGraph graphWithDevice:devices[gpu_id]
-                               index:[NSNumber numberWithInt:gpu_id]];
+                               index:[NSNumber numberWithInt:gpu_id]
+                             useFP16:this->use_fp16_];
 
     this->gpu_id = gpu_id;
 
