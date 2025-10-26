@@ -333,58 +333,6 @@ static const NSInteger kMinSubBatchSize = 20;
                           name:[NSString stringWithFormat:@"%@/input/reshape", label]];
 }
 
-    MPSGraphTensor * expandedMaskTensor;
-    if (@available(macOS 13.0, *)) {
-        // Expand the bitmap using the masks and values.
-        expandedMaskTensor = [self bitwiseANDWithPrimaryTensor:maskTensor
-                                               secondaryTensor:bitIndicesTensor
-                                                          name:[NSString stringWithFormat:@"%@/mask/bitwise_and", label]];
-
-        MPSGraphTensor * zeroTensor = [self constantWithScalar:0.0
-                                                         shape:@[@1]
-                                                      dataType:MPSDataTypeUInt64];
-
-        expandedMaskTensor = [self notEqualWithPrimaryTensor:expandedMaskTensor
-                                             secondaryTensor:zeroTensor
-                                                        name:[NSString stringWithFormat:@"%@/zero_equals", label]];
-    } else {
-        // Alternative method: bitwise ops not available in earlier macos versions, so using integer division and modulo.
-        // Divide by the bit index, which is also a power of 2, to shift the desired bit to position 0.
-        expandedMaskTensor = [self divisionWithPrimaryTensor:maskTensor
-                                             secondaryTensor:bitIndicesTensor
-                                                        name:[NSString stringWithFormat:@"%@/mask/divide", label]];
-
-        // Take modulo 2 to extract the least significant bit
-        MPSGraphTensor * twoTensor = [self constantWithScalar:2.0
-                                                        shape:@[@1]
-                                                     dataType:MPSDataTypeUInt64];
-
-        expandedMaskTensor = [self moduloWithPrimaryTensor:expandedMaskTensor
-                                           secondaryTensor:twoTensor
-                                                      name:[NSString stringWithFormat:@"%@/mask/modulo", label]];
-    }
-
-    // Broadcast input tensor values to match the expanded dimensions.
-    valueTensor = [self broadcastByStackingTensor:valueTensor
-                                             axis:3
-                                            times:64
-                                             name:[NSString stringWithFormat:@"%@/input/broadcast", label]];
-
-    expandedMaskTensor = [self castTensor:expandedMaskTensor
-                                   toType:kDataType
-                                     name:[NSString stringWithFormat:@"%@/input/cast", label]];
-
-    // Final multiplication: value * mask
-    expandedMaskTensor = [self multiplicationWithPrimaryTensor:expandedMaskTensor
-                                               secondaryTensor:valueTensor
-                                                          name:[NSString stringWithFormat:@"%@/input/multiply", label]];
-
-    // Reshape to final output format [batch_size, kInputPlanes, 8, 8]
-    return [self reshapeTensor:expandedMaskTensor
-                     withShape:@[@(-1), valueTensor.shape[1], @8, @8]
-                          name:[NSString stringWithFormat:@"%@/input/reshape", label]];
-}
-
 - (nonnull MPSGraphTensor *) broadcastByStackingTensor:(MPSGraphTensor * __nonnull)input
                                                   axis:(NSInteger)axis
                                                  times:(NSUInteger)times
