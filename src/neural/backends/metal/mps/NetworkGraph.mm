@@ -224,8 +224,18 @@ static const NSInteger kMinSubBatchSize = 20;
     // Set the results we're interested in.
     if (_useFP16) {
         NSMutableArray<MPSGraphTensor *> * castedResults = [NSMutableArray arrayWithCapacity:[results count]];
+        NSUInteger i = 0;
         for (MPSGraphTensor * tensor in results) {
-            [castedResults addObject:[self castTensor:tensor toType:MPSDataTypeFloat32 name:[NSString stringWithFormat:@"%@/cast_to_fp32", tensor.name]]];
+            NSString *name;
+            if (@available(macOS 12.0, iOS 15.0, *)) {
+                name = tensor.name;
+            } else {
+                name = [NSString stringWithFormat:@"output_%lu", (unsigned long)i];
+            }
+            [castedResults addObject:[self castTensor:tensor
+                                              toType:MPSDataTypeFloat32
+                                                name:[NSString stringWithFormat:@"%@/cast_to_fp32", name]]];
+            i++;
         }
         _resultTensors = castedResults;
     } else {
