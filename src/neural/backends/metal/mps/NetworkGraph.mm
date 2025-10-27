@@ -181,7 +181,7 @@ static const NSInteger kMinSubBatchSize = 20;
     NSDictionary * feeds = @{_inputTensor : inputTensorData, _maskTensor : inputMaskData};
 
     MPSGraphCompilationDescriptor * compilationDescriptor = [[MPSGraphCompilationDescriptor alloc] init];
-    compilationDescriptor.optimizationLevel = MPSGraphOptimizationLevel0;
+    compilationDescriptor.optimizationLevel = MPSGraphOptimizationLevel1;
 
     MPSGraphExecutionDescriptor * executionDescriptor = [[MPSGraphExecutionDescriptor alloc] init];
     executionDescriptor.compilationDescriptor = compilationDescriptor;
@@ -915,11 +915,19 @@ static const NSInteger kMinSubBatchSize = 20;
     MPSGraphTensor * attn = [self matrixMultiplicationWithPrimaryTensor:queries
                                                         secondaryTensor:keys
                                                                    name:[NSString stringWithFormat:@"%@/matmul_qk", label]];
-    attn = [self divisionWithPrimaryTensor:attn
-                           secondaryTensor:[self constantWithScalar:sqrt(depth)
-                                                              shape:@[@1]
-                                                           dataType:attn.dataType]
-                                      name:[NSString stringWithFormat:@"%@/scale", label]];
+    float invScaleFloat = 1.0f / sqrtf((float) depth);
+
+    // Make sure the constant uses the same dataType as `attn`.
+    // If attn is FP16 you want the constant to be FP16, if FP32 then FP32.
+    MPSDataType constDataType = attn.dataType;
+    MPSGraphTensor *invScaleConst = [self constantWithScalar:invScaleFloat
+                                                        shape:@[@1]
+                                                    dataType:constDataType];
+
+    // Multiply (elementwise) instead of divide.
+    attn = [self multiplicationWithPrimaryTensor:attn
+                                secondaryTensor:invScaleConst
+                                            name:[NSString stringWithFormat:@"%@/scale_mul", label]]
     // Smolgen.
     if (smolgen != nil) {
         // Smolgen weights.

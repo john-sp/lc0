@@ -93,7 +93,7 @@ MetalNetwork::MetalNetwork(const WeightsFile& file, const OptionsDict& options)
 
   try {
     const int gpu_id = options.GetOrDefault<int>("gpu", 0);
-    bool use_fp16 = options.GetOrDefault<bool>("fp16", false);
+    bool use_fp16 = options.GetOrDefault<bool>("fp16", true);
     builder_ = std::make_unique<MetalNetworkBuilder>();
     std::string device = builder_->init(gpu_id, use_fp16);
     CERR << "Initialized metal backend on device " << device;
