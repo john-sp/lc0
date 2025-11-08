@@ -1084,7 +1084,7 @@ OnnxNetwork::OnnxNetwork(const WeightsFile& file, const OptionsDict& opts,
 #if USE_ONNX_CUDART
   if ((provider == OnnxProvider::TRT || provider == OnnxProvider::CUDA) &&
       graphs_enabled_) {
-    auto init_graphs = [&](auto data_type_tag) {
+    auto init_graphs = [&](auto data_type_tag, bool capture) {
       using DataType = decltype(data_type_tag);
       OnnxComputation<DataType> comp1(this);
       OnnxComputation<DataType> comp2(this);
@@ -1094,19 +1094,21 @@ OnnxNetwork::OnnxNetwork(const WeightsFile& file, const OptionsDict& opts,
         comp2.AddInput(std::move(planes));
         // Initialize the session and TensorRT context state.
         comp1.ComputeBlockingImpl();
-
-        ReportCUDAErrors(cudaStreamSynchronize(compute_stream_));
+        if (!capture) continue;
 
         comp1.CaptureCudaGraph();
         comp2.CaptureCudaGraph();
       }
     };
     if (fp16_) {
-      init_graphs(Ort::Float16_t{});
+      init_graphs(Ort::Float16_t{}, false);
+      init_graphs(Ort::Float16_t{}, true);
     } else if (bf16_) {
-      init_graphs(Ort::BFloat16_t{});
+      init_graphs(Ort::BFloat16_t{}, false);
+      init_graphs(Ort::BFloat16_t{}, true);
     } else {
-      init_graphs(float{});
+      init_graphs(float{}, false);
+      init_graphs(float{}, true);
     }
   }
 #endif
