@@ -60,6 +60,7 @@
 #include "utils/exception.h"
 #include "utils/fp16_utils.h"
 #include "utils/logging.h"
+#include "utils/trace.h"
 
 namespace lczero {
 namespace {
@@ -534,6 +535,7 @@ void OnnxComputation<DataType>::CaptureCudaGraph(std::unique_lock<std::mutex>&& 
 
 template <typename DataType>
 void OnnxComputation<DataType>::ComputeBlocking() {
+  LCTRACE_FUNCTION_SCOPE;
 #ifdef USE_ONNX_CUDART
   if ((network_->provider_ == OnnxProvider::TRT ||
        network_->provider_ == OnnxProvider::CUDA) &&
@@ -604,7 +606,7 @@ void OnnxComputation<DataType>::ComputeBlocking() {
         float sum = w + d + l;
         w /= sum;
         l /= sum;
-        d = 1.0f - w - l;
+        d /= sum;
       }
       inputs_outputs_->wdl_output_data_[3 * i + 0] = w;
       inputs_outputs_->wdl_output_data_[3 * i + 1] = d;
@@ -851,6 +853,7 @@ Ort::SessionOptions OnnxNetwork::GetOptions(int threads, int batch_size,
       std::map<std::string, std::string> trt_options;
       trt_options["device_id"] = std::to_string(gpu_);
       trt_options["trt_fp16_enable"] = fp16_ ? "1" : "0";
+      trt_options["trt_bf16_enable"] = bf16_ ? "1" : "0";
       trt_options["trt_int8_enable"] = "0";
       trt_options["trt_max_partition_iterations"] = "1000";
       trt_options["trt_min_subgraph_size"] = "1";

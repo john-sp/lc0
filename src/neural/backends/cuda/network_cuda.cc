@@ -41,6 +41,7 @@
 #include "neural/tables/policy_map.h"
 #include "utils/exception.h"
 #include "utils/fp16_utils.h"
+#include "utils/trace.h"
 
 #if CUDART_VERSION >= 11010
 #define CUDA_GRAPH_SUPPORTS_EXTERNAL_EVENTS 1
@@ -770,14 +771,8 @@ class CudaNetwork : public Network {
 #endif
     }
 
-    constexpr bool fp16 = std::is_same<half, DataType>::value;
-    if constexpr (fp16) {
-      expandPlanes_Fp16_NCHW((half*)(tensor_mem[0]), ipDataMasks, ipDataValues,
-                             batchSize * kInputPlanes, compute_stream);
-    } else {
-      expandPlanes_Fp32_NCHW((float*)(tensor_mem[0]), ipDataMasks, ipDataValues,
-                             batchSize * kInputPlanes, compute_stream);
-    }
+    expandPlanes_NCHW(tensor_mem[0], ipDataMasks, ipDataValues,
+                      batchSize * kInputPlanes, compute_stream);
 
     auto* opPol = io->op_policy_mem_gpu_;
     auto* opVal = io->op_value_mem_gpu_;
@@ -1013,7 +1008,7 @@ class CudaNetwork : public Network {
         float sum = w + d + l;
         w /= sum;
         l /= sum;
-        d = 1.0f - w - l;
+        d /= sum;
         wdl[2 * i + 0] = w - l;
         wdl[2 * i + 1] = d;
       }
@@ -1248,6 +1243,7 @@ void CudaNetworkComputation<DataType>::CaptureGraph(
 
 template <typename DataType>
 void CudaNetworkComputation<DataType>::ComputeBlocking() {
+  LCTRACE_FUNCTION_SCOPE;
   assert(GetBatchSize() >= 1);
   if (inputs_outputs_->cuda_graphs_[GetBatchSize() - 1]) {
     std::unique_lock<std::mutex> lock = network_->LockEval();

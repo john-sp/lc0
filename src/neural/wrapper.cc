@@ -34,6 +34,7 @@
 #include "neural/shared_params.h"
 #include "utils/atomic_vector.h"
 #include "utils/fastmath.h"
+#include "utils/trace.h"
 
 namespace lczero {
 
@@ -150,6 +151,7 @@ class NetworkAsBackendComputation : public BackendComputation {
   void ComputeBlocking(ComputationCallback callback) override {
     for (auto& entry : entries_) computation_->AddInput(std::move(entry.input));
     computation_->ComputeBlocking();
+    LCTRACE_FUNCTION_SCOPE;
     callback(ComputationEvent::FIRST_BACKEND_IDLE);
     for (size_t i = 0; i < entries_.size(); ++i) {
       entries_[i].ProcessResult(*computation_, i,
@@ -189,4 +191,5 @@ std::unique_ptr<Backend> NetworkAsBackendFactory::Create(
   network_options.CheckAllOptionsRead(name_);
   return std::make_unique<NetworkAsBackend>(std::move(network), options);
 }
+
 }  // namespace lczero
