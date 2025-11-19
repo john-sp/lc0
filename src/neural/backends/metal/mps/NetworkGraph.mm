@@ -1224,23 +1224,55 @@ static const NSInteger kMinSubBatchSize = 20;
                                      label:(NSString * __nonnull)label
 {
     // mish(x) = x * tanh(softplus(x)) = x * tanh(ln(1 + exp(x)))
-    MPSGraphTensor * mishTensor = [self exponentWithTensor:tensor
-                                                      name:[NSString stringWithFormat:@"%@/exp", label]];
+    MPSGraphTensor * eTensor = [self exponentWithTensor:tensor
+                                                   name:[NSString stringWithFormat:@"%@/exp", label]];
 
-    MPSGraphTensor * oneTensor = [self constantWithScalar:1.0 shape:@[@1] dataType:mishTensor.dataType];
-    mishTensor = [self additionWithPrimaryTensor:mishTensor
-                                 secondaryTensor:oneTensor
-                                            name:[NSString stringWithFormat:@"%@/add", label]];
+    MPSGraphTensor * twoTensor = [self constantWithScalar:2.0f
+                                                    shape:@[@1]
+                                                 dataType:kDataType];
 
-    mishTensor = [self logarithmWithTensor:mishTensor name:[NSString stringWithFormat:@"%@/ln", label]];
+    MPSGraphTensor * nTensor = [self multiplicationWithPrimaryTensor:eTensor
+                                                     secondaryTensor:eTensor
+                                                                name:[NSString stringWithFormat:@"%@/e_square", label]];
+    nTensor = [self additionWithPrimaryTensor:nTensor
+                               secondaryTensor:[self multiplicationWithPrimaryTensor:twoTensor
+                                                                     secondaryTensor:eTensor
+                                                                                name:[NSString stringWithFormat:@"%@/two_e", label]]]
+                                          name:[NSString stringWithFormat:@"%@/n", label]];
 
-    mishTensor = [self tanhWithTensor:mishTensor name:[NSString stringWithFormat:@"%@/tanh", label]];
+    MPSGraphTensor * denominator = [self additionWithPrimaryTensor:nTensor
+                                                   secondaryTensor:twoTensor
+                                                              name:[NSString stringWithFormat:@"%@/n_plus_two", label]];
 
-    mishTensor = [self multiplicationWithPrimaryTensor:mishTensor
-                                       secondaryTensor:tensor
-                                                  name:[NSString stringWithFormat:@"%@/multiply", label]];
+    MPSGraphTensor * dTensor = [self divisionWithPrimaryTensor:tensor
+                                               secondaryTensor:denominator
+                                                          name:[NSString stringWithFormat:@"%@/d", label]];
 
-    return mishTensor;
+    // Conditional logic: if (tensor <= -0.6f) { return n * d; } else { return tensor - 2.0f * d; }
+    MPSGraphTensor * threshold = [self constantWithScalar:-0.6f
+                                                    shape:@[@1]
+                                                 dataType:kDataType];
+
+    MPSGraphTensor * condition = [self lessThanOrEqualToWithPrimaryTensor:tensor
+                                                          secondaryTensor:threshold
+                                                                     name:[NSString stringWithFormat:@"%@/condition", label]];
+
+    MPSGraphTensor * trueBranch = [self multiplicationWithPrimaryTensor:nTensor
+                                                        secondaryTensor:dTensor
+                                                                   name:[NSString stringWithFormat:@"%@/true_branch", label]];
+
+    MPSGraphTensor * twoTimesDTensor = [self multiplicationWithPrimaryTensor:twoTensor
+                                                             secondaryTensor:dTensor
+                                                                        name:[NSString stringWithFormat:@"%@/two_times_d", label]];
+
+    MPSGraphTensor * falseBranch = [self subtractionWithPrimaryTensor:tensor
+                                                       secondaryTensor:twoTimesDTensor
+                                                                  name:[NSString stringWithFormat:@"%@/false_branch", label]];
+
+    return [self selectWithCondition:condition
+                          trueTensor:trueBranch
+                         falseTensor:falseBranch
+                                name:[NSString stringWithFormat:@"%@/mish", label]];
 }
 
 -(nonnull MPSGraphTensor *) swishWithTensor:(MPSGraphTensor * __nonnull)tensor
