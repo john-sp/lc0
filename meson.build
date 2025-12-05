@@ -123,7 +123,6 @@ files += onnx_pb
 files += gen.process('proto/hlo.proto',
   preserve_path_from : meson.current_source_dir())
 
-#############################################################################
 ## Main files
 #############################################################################
 common_files += [
@@ -167,6 +166,8 @@ files += [
   'src/neural/backends/network_record.cc',
   'src/neural/backends/network_rr.cc',
   'src/neural/backends/network_trivial.cc',
+  'src/neural/backends/client/proto.cc',
+  'src/neural/backends/client/backend_client.cc',
   'src/neural/memcache.cc',
   'src/neural/network_legacy.cc',
   'src/neural/onnx/adapters.cc',
@@ -193,6 +194,7 @@ files += [
   'src/selfplay/multigame.cc',
   'src/selfplay/tournament.cc',
   'src/tools/backendbench.cc',
+  'src/tools/backendserver.cc',
   'src/tools/benchmark.cc',
   'src/tools/describenet.cc',
   'src/tools/leela2onnx.cc',
@@ -1045,6 +1047,16 @@ endif
   endif
 
   deps += cc.find_library('atomic', required: false)
+
+  ## ~~~~
+  ## asio
+  ## ~~~~
+  deps += dependency('asio', required: true,
+                     fallback: ['asio', 'asio_dep'])
+  if host_machine.system() == 'windows'
+    mswsock = cc.find_library('mswsock', required: true)
+    deps += mswsock
+  endif
 
 #############################################################################
 ## Main Executable
