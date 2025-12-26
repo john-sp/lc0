@@ -475,7 +475,25 @@ std::string Converter::MakeRMSNorm(OnnxBuilder* builder,
     const std::string& name,
     const lczero::OnnxConst& gammas, float eps) {
   auto in = input;
-  return builder->RMSNormalization(name, in, gammas, 1, eps);
+  if (!options_.alt_rmsnorm) {
+    return builder->RMSNormalization(name, in, gammas, 1, eps);
+  }
+  if (GetDataType() != pblczero::TensorProto::FLOAT) {
+    in = builder->Cast(name + "/to_float", in, pblczero::TensorProto::FLOAT);
+  }
+  auto flow = builder->Mul(name + "/squared", in, in);
+  flow = builder->ReduceMean(name + "/mean", flow, {1});
+  flow =
+      builder->Add(name + "/mean_eps", flow,
+                   static_cast<const OnnxConst&>(FloatOnnxConst({eps}, {1})));
+  flow = builder->Sqrt(name + "/rms", flow);
+  flow = builder->Reciprocal(name + "/inv_rms", flow);
+  flow = builder->Mul(name + "/normalized", in, flow);
+  if (GetDataType() != pblczero::TensorProto::FLOAT) {
+    flow = builder->Cast(name + "/to_data_type", flow, GetDataType());
+  }
+  flow = builder->Mul(name + "/gammas", flow, gammas);
+  return flow;
 }
 
 std::string Converter::MakeLayerNorm(OnnxBuilder* builder,
