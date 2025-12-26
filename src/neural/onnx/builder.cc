@@ -384,6 +384,19 @@ std::string OnnxBuilder::LayerNormalization(const std::string& name,
   return out;
 }
 
+// Only supported since opset 23
+std::string OnnxBuilder::RMSNormalization(const std::string& name,
+                                         const std::string& input,
+                                         const OnnxConst& scale, int axis,
+                                         float epsilon) {
+  auto* node = model_.mutable_graph()->add_node();
+  auto out = PopulateStdNodeFields(node, name, input, "RMSNormalization");
+  node->add_input(AddInitializer(name + "/w/scale", scale));
+  AddIntAttribute(node, "axis", axis);
+  AddFloatAttribute(node, "epsilon", epsilon);
+  return out;
+}
+
 std::string OnnxBuilder::Expand(const std::string& name,
                                 const std::string& input,
                                 const std::string& shape) {

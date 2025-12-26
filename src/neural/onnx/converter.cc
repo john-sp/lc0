@@ -125,6 +125,10 @@ class Converter {
                           const std::string& encoder_in,
                           const std::string& name);
 
+  std::string MakeRMSNorm(OnnxBuilder* builder, const std::string& input,
+                          const std::string& name,
+                          const lczero::OnnxConst& gammas, float eps = 1e-6);
+
   std::string MakeLayerNorm(OnnxBuilder* builder, const std::string& input,
                             const std::string& name,
                             const lczero::OnnxConst& gammas,
@@ -453,12 +457,23 @@ std::string Converter::MakeSmolgen(OnnxBuilder* builder,
   return flow;
 }
 
+std::string Converter::MakeRMSNorm(OnnxBuilder* builder,
+    const std::string& input,
+    const std::string& name,
+    const lczero::OnnxConst& gammas, float eps) {
+  auto in = input;
+  return builder->RMSNormalization(name, in, gammas, 1, eps);
+}
+
 std::string Converter::MakeLayerNorm(OnnxBuilder* builder,
                                      const std::string& input,
                                      const std::string& name,
                                      const lczero::OnnxConst& gammas,
                                      const lczero::OnnxConst& betas,
                                      float eps) {
+  if (betas.GetRawData().empty()) {
+    return MakeRMSNorm(builder, input, name, gammas, eps);
+  }
   if (!options_.alt_layernorm) {
     return builder->LayerNormalization(name, input, gammas, betas, 1, eps);
   }
