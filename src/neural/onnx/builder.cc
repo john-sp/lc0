@@ -36,15 +36,16 @@
 namespace lczero {
 
 OnnxBuilder::OnnxBuilder(int opset, int ir) : opset_(opset) {
-  if (opset < 7 || opset > 22) {
-    throw Exception("Only ONNX opsets between 7 and 22 are supported.");
+  if (opset < 7 || opset > 23) {
+    throw Exception("Only ONNX opsets between 7 and 23 are supported.");
   }
   // Map of latest opset corresponding to IR version.
   std::map<int, int> opset_to_ir = {{8, 3},  {9, 4},   {10, 5},
                                     {11, 6}, {14, 7},  {18, 8},
-                                    {20, 9}, {22, 10}, {99, 11}};
+                                    {20, 9}, {22, 10}, {23, 11},
+                                    {24, 12}, {25, 13}};
   if (ir < 0) ir = opset_to_ir.upper_bound(opset - 1)->second;
-  if (ir < 3 || ir > 10) {
+  if (ir < 3 || ir > 11) {
     throw Exception("Only ONNX IR between 3 and 10 is supported.");
   }
   model_.set_ir_version(ir);
