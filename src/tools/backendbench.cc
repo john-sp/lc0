@@ -109,7 +109,7 @@ void BackendBenchmark::Run() {
     auto warm = [&]() {
       // Give GPU enough work to make it go from idle clocks to max clocks.
       for (int i = 0; i < 2; i++) {
-        auto warmup = backend->CreateComputation(0);
+        auto warmup = backend->CreateComputation();
         for (int j = 0; j < option_dict.Get<int>(kMaxBatchSizeId); ++j) {
           warmup->AddInput(pos, {});
         }
@@ -157,7 +157,7 @@ void BackendBenchmark::Run() {
         // It is not one of the --batches.
         while (first || j++ < batches) {
           // Put i copies of tree root node into computation and compute.
-          auto computation = backend->CreateComputation(0);
+          auto computation = backend->CreateComputation();
           for (int k = 0; k < i; k++) {
             computation->AddInput(pos, {});
           }
