@@ -38,17 +38,13 @@
 #include <string>
 #include <vector>
 
-#if __has_include("dml_provider_factory.h")
-#include "dml_provider_factory.h"
-#define USE_DML
-#endif
+#include "onnx_conf.h"
 
 #ifdef USE_ONNX_CUDART
 #include "cuda_runtime.h"
-#include "neural/backends/cuda/onnx_kernels.h"
+#include "neural/backends/onnx/onnx_kernels.h"
 #endif
 
-#include "cpu_provider_factory.h"
 #include "neural/factory.h"
 #include "neural/loader.h"
 #include "neural/network.h"
@@ -60,27 +56,16 @@
 #include "utils/exception.h"
 #include "utils/fp16_utils.h"
 #include "utils/logging.h"
+#include "utils/trace.h"
 
 namespace lczero {
-namespace {
+namespace onnx {
 
-enum class OnnxProvider { CPU, CUDA, DML, ROCM, TRT };
+enum class OnnxProvider { CPU, CUDA, DML, ROCM, TRT, MIGRAPHX };
 
 class OnnxNetwork;
 
 static constexpr int kNumOutputPolicy = 1858;
-
-#ifdef USE_ONNX_CUDART
-void CudaError(cudaError_t status, const char* file, int line) {
-  if (status != cudaSuccess) {
-    auto err = std::string("CUDA error: ") + cudaGetErrorString(status) + " (" +
-               file + ":" + std::to_string(line) + ") ";
-    CERR << err;
-    throw Exception(err);
-  }
-}
-#define ReportCUDAErrors(status) CudaError(status, __FILE__, __LINE__)
-#endif
 
 struct InputsOutputs {
   InputsOutputs(OnnxNetwork* network);
@@ -172,7 +157,11 @@ class OnnxNetwork final : public Network {
   std::unique_ptr<NetworkComputation> NewComputation() override {
 #ifdef USE_ONNX_CUDART
     if (provider_ == OnnxProvider::CUDA || provider_ == OnnxProvider::TRT) {
-      ReportCUDAErrors(cudaSetDevice(gpu_));
+      int device = -1;
+      ReportCUDAErrors(cudaGetDevice(&device));
+      if (device != gpu_) {
+        ReportCUDAErrors(cudaSetDevice(gpu_));
+      }
     }
 #endif
     if (fp16_) {
@@ -195,8 +184,7 @@ class OnnxNetwork final : public Network {
   }
   bool IsCpu() const override { return provider_ == OnnxProvider::CPU; }
 
-  Ort::SessionOptions GetOptions(int threads, int batch_size, uint64_t hash,
-                                 int attempt);
+  Ort::SessionOptions GetOptions(int threads, int batch_size, uint64_t hash, int optimize);
 
   std::unique_ptr<InputsOutputs> GetInputsOutputs() {
     std::lock_guard<std::mutex> lock(inputs_outputs_lock_);
@@ -215,9 +203,10 @@ class OnnxNetwork final : public Network {
     free_inputs_outputs_.push_back(std::move(resource));
   }
 
-  std::string TRTCachePrefix(int batch_size, uint64_t hash);
+  std::string TRTCachePrefix(int batch_size, uint64_t hash, int optimize);
   bool IsTRTEngineGood(std::filesystem::file_time_type start, int batch_size,
-                       uint64_t hash, size_t onnx_model_size, int attempt);
+                       uint64_t hash, size_t onnx_model_size, int attempt,
+                       int optimize);
 
   Ort::Env onnx_env_;
   // Prepare sessions for this many multiples of the batch size;
@@ -340,7 +329,7 @@ InputsOutputs::InputsOutputs(OnnxNetwork* network)
         output_tensors_data_device_[i] = output_tensors_data_[i];
       }
       memory_info_ =
-          Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+          Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeDefault);
   }
 }
 
@@ -473,7 +462,8 @@ Ort::IoBinding OnnxComputation<DataType>::PrepareInputs(int start,
     DataType* iter =
         static_cast<DataType*>(inputs_outputs_->input_tensor_data_);
     iter += start * kInputPlanes * 8 * 8;
-    std::memset(iter, 0, batch_size * kInputPlanes * 8 * 8 * sizeof(DataType));
+    std::memset(static_cast<void*>(iter), 0,
+                batch_size * kInputPlanes * 8 * 8 * sizeof(DataType));
     int end = std::min(start + batch_size, static_cast<int>(input_size_));
     for (int i = start; i < end; i++) {
       for (const auto& plane : raw_input_[i]) {
@@ -534,6 +524,7 @@ void OnnxComputation<DataType>::CaptureCudaGraph(std::unique_lock<std::mutex>&& 
 
 template <typename DataType>
 void OnnxComputation<DataType>::ComputeBlocking() {
+  LCTRACE_FUNCTION_SCOPE;
 #ifdef USE_ONNX_CUDART
   if ((network_->provider_ == OnnxProvider::TRT ||
        network_->provider_ == OnnxProvider::CUDA) &&
@@ -565,19 +556,13 @@ void OnnxComputation<DataType>::ComputeBlocking() {
   } else
 #endif
   {
-    // The DML onnxruntime execution provider is documented as not supporting
-    // multi-threaded calls to Run on the same inference session. We found the
-    // same to be true for the ROCm execution provider (at least for CNNs).
-    // TODO: This may be a onnxruntime/ROCm bug, check onnxruntime 1.16 release.
-    if (network_->provider_ == OnnxProvider::DML ||
-        network_->provider_ == OnnxProvider::ROCM ||
-        network_->provider_ == OnnxProvider::TRT) {
+    // Only the DML onnxruntime execution provider is documented as needing
+    // locking, but it seems all GPU backends need it.
+    if (network_->provider_ != OnnxProvider::CPU) {
       network_->lock_.lock();
     }
     ComputeBlockingImpl();
-    if (network_->provider_ == OnnxProvider::DML ||
-        network_->provider_ == OnnxProvider::ROCM ||
-        network_->provider_ == OnnxProvider::TRT) {
+    if (network_->provider_ != OnnxProvider::CPU) {
       network_->lock_.unlock();
     }
 #ifdef USE_ONNX_CUDART
@@ -604,7 +589,7 @@ void OnnxComputation<DataType>::ComputeBlocking() {
         float sum = w + d + l;
         w /= sum;
         l /= sum;
-        d = 1.0f - w - l;
+        d /= sum;
       }
       inputs_outputs_->wdl_output_data_[3 * i + 0] = w;
       inputs_outputs_->wdl_output_data_[3 * i + 1] = d;
@@ -667,20 +652,20 @@ void OnnxComputation<DataType>::ComputeBlockingImpl() {
         half* dst =
             reinterpret_cast<half*>(inputs_outputs_->input_tensor_data_device_);
         dst += i * kInputPlanes * 8 * 8;
-        cudnn_backend::expandPlanesOnnx(dst, dst_masks, batch * kInputPlanes,
-                                        network_->compute_stream_);
+        expandPlanesOnnx(dst, dst_masks, batch * kInputPlanes,
+                         network_->compute_stream_);
       } else if (network_->bf16_) {
         __nv_bfloat16* dst = reinterpret_cast<__nv_bfloat16*>(
             inputs_outputs_->input_tensor_data_device_);
         dst += i * kInputPlanes * 8 * 8;
-        cudnn_backend::expandPlanesOnnx(dst, dst_masks, batch * kInputPlanes,
-                                        network_->compute_stream_);
+        expandPlanesOnnx(dst, dst_masks, batch * kInputPlanes,
+                         network_->compute_stream_);
       } else {
         float* dst = reinterpret_cast<float*>(
             inputs_outputs_->input_tensor_data_device_);
         dst += i * kInputPlanes * 8 * 8;
-        cudnn_backend::expandPlanesOnnx(dst, dst_masks, batch * kInputPlanes,
-                                        network_->compute_stream_);
+        expandPlanesOnnx(dst, dst_masks, batch * kInputPlanes,
+                         network_->compute_stream_);
       }
 
       ReportCUDAErrors(cudaEventRecord(inputs_outputs_->inputs_processed_event_,
@@ -731,12 +716,10 @@ void OnnxComputation<DataType>::ComputeBlockingImpl() {
     {
       binding.SynchronizeOutputs();
     }
-    if (network_->provider_ == OnnxProvider::DML ||
-        network_->provider_ == OnnxProvider::ROCM ||
-        network_->provider_ == OnnxProvider::TRT) {
-      network_->lock_.unlock();
-    }
     i += batch;
+  }
+  if (network_->provider_ != OnnxProvider::CPU) {
+    network_->lock_.unlock();
   }
 #ifdef USE_ONNX_CUDART
   if ((network_->provider_ == OnnxProvider::TRT ||
@@ -748,7 +731,7 @@ void OnnxComputation<DataType>::ComputeBlockingImpl() {
 #endif
 }
 
-std::string OnnxNetwork::TRTCachePrefix(int batch_size, uint64_t hash) {
+std::string OnnxNetwork::TRTCachePrefix(int batch_size, uint64_t hash, int optimize) {
   std::ostringstream oss;
   oss << std::hex << hash;
   return "Lc0_ONNX_TRT_ORT_" + Ort::GetVersionString() + "_batch_" +
@@ -757,15 +740,15 @@ std::string OnnxNetwork::TRTCachePrefix(int batch_size, uint64_t hash) {
                                std::to_string(opt_batch_size_)
                          : std::to_string(batch_size - batch_size_ + 1) + "-" +
                                std::to_string(batch_size)) +
-         "_" + oss.str() + "_";
+         "_o" + std::to_string(optimize) + "_" + oss.str() + "_";
 }
 
 bool OnnxNetwork::IsTRTEngineGood(std::filesystem::file_time_type start,
                                   int batch_size, uint64_t hash,
-                                  size_t onnx_model_size, int attempt) {
+                                  size_t onnx_model_size, int attempt, int optimize) {
   std::filesystem::path cache_dir =
       CommandLine::BinaryDirectory() + "/trt_cache";
-  const auto prefix = TRTCachePrefix(batch_size, hash);
+  const auto prefix = TRTCachePrefix(batch_size, hash, optimize);
   std::filesystem::file_time_type last_edit{};
   std::filesystem::directory_entry latest_matching{};
   std::filesystem::path timing_cache{};
@@ -820,10 +803,25 @@ bool OnnxNetwork::IsTRTEngineGood(std::filesystem::file_time_type start,
 }
 
 Ort::SessionOptions OnnxNetwork::GetOptions(int threads, int batch_size,
-                                            uint64_t hash, int attempt) {
+                                            uint64_t hash, int optimize) {
   Ort::SessionOptions options;
   options.SetIntraOpNumThreads(threads);
-  options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+  GraphOptimizationLevel level = GraphOptimizationLevel::ORT_DISABLE_ALL;
+  switch (optimize) {
+    case 0:
+      level = GraphOptimizationLevel::ORT_DISABLE_ALL;
+      break;
+    case 1:
+      level = GraphOptimizationLevel::ORT_ENABLE_BASIC;
+      break;
+    case 2:
+      level = GraphOptimizationLevel::ORT_ENABLE_EXTENDED;
+      break;
+    default:
+      level = GraphOptimizationLevel::ORT_ENABLE_ALL;
+      break;
+  }
+  options.SetGraphOptimizationLevel(level);
 
   if (batch_size > 0 && provider_ != OnnxProvider::TRT) {
     // Override the default (variable) batch size.
@@ -834,37 +832,37 @@ Ort::SessionOptions OnnxNetwork::GetOptions(int threads, int batch_size,
   }
 
   switch (provider_) {
-    case OnnxProvider::DML:
-      options.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
-      options.DisableMemPattern();
-#ifdef USE_DML
-      Ort::ThrowOnError(
-          OrtSessionOptionsAppendExecutionProvider_DML(options, gpu_));
-#else
-      throw Exception("ONNX backend internal error.");
-#endif
+    case OnnxProvider::DML: {
+      std::unordered_map<std::string, std::string> dml_options;
+      dml_options["device_id"] = std::to_string(gpu_);
+      dml_options["performance_preference"] = "high_performance";
+      options.AppendExecutionProvider("DML", dml_options);
       break;
+    }
     case OnnxProvider::TRT: {
       options.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
 
       std::string cache_dir = CommandLine::BinaryDirectory() + "/trt_cache";
       std::map<std::string, std::string> trt_options;
       trt_options["device_id"] = std::to_string(gpu_);
-      trt_options["trt_fp16_enable"] = fp16_ ? "1" : "0";
-      trt_options["trt_int8_enable"] = "0";
+      trt_options["trt_builder_optimization_level"] = std::to_string(std::clamp(optimize, 0, 5));
+      trt_options["trt_fp16_enable"] = optimize >= 6 ? "1" : "0";
+#if ORT_API_VERSION >= 23
+      trt_options["trt_bf16_enable"] = optimize >= 7 ? "1" : "0";
+#endif
+      trt_options["trt_int8_enable"] = optimize >= 8 ? "1" : "0";
       trt_options["trt_max_partition_iterations"] = "1000";
       trt_options["trt_min_subgraph_size"] = "1";
       trt_options["trt_engine_cache_enable"] = "1";
       // We need the batch size as well as the hash, as it is set after
       // loading.
-      trt_options["trt_engine_cache_prefix"] = TRTCachePrefix(batch_size, hash);
+      trt_options["trt_engine_cache_prefix"] = TRTCachePrefix(batch_size, hash, optimize);
       trt_options["trt_engine_cache_path"] = cache_dir;
       trt_options["trt_timing_cache_enable"] = "1";
       trt_options["trt_timing_cache_path"] = cache_dir;
       trt_options["trt_layer_norm_fp32_fallback"] = "1";
       trt_options["trt_force_sequential_engine_build"] = "1";
       trt_options["trt_context_memory_sharing_enable"] = "1";
-      trt_options["trt_builder_optimization_level"] = attempt < 2 ? "4" : "5";
       // Looks like we need I/O binding to enable this.
 #ifdef USE_ONNX_CUDART
       trt_options["has_user_compute_stream"] = "1";
@@ -911,6 +909,24 @@ Ort::SessionOptions OnnxNetwork::GetOptions(int threads, int batch_size,
       options.AppendExecutionProvider_ROCM(rocm_options);
       break;
     }
+    case OnnxProvider::MIGRAPHX: {
+      std::unordered_map<std::string, std::string> migraphx_options;
+      migraphx_options["device_id"] = std::to_string(gpu_);
+      migraphx_options["migraphx_exhaustive_tune"] = optimize >= 5 ? "1" : "0";
+      migraphx_options["migraphx_fp16_enable"] = optimize >= 6 ? "1" : "0";
+      migraphx_options["migraphx_bf16_enable"] = optimize >= 7 ? "1" : "0";
+      migraphx_options["migraphx_fp8_enable"] = optimize >= 8 ? "1" : "0";
+      std::filesystem::path cache_dir = CommandLine::BinaryDirectory();
+      cache_dir /= "migraphx_cache";
+
+      if (!std::filesystem::exists(cache_dir)) {
+        std::filesystem::create_directories(cache_dir);
+      }
+      migraphx_options["migraphx_model_cache_dir"] = cache_dir.string();
+
+      options.AppendExecutionProvider("MIGraphX", migraphx_options);
+      break;
+    }
     case OnnxProvider::CUDA: {
       OrtCUDAProviderOptions cuda_options;
       cuda_options.device_id = gpu_;
@@ -922,14 +938,7 @@ Ort::SessionOptions OnnxNetwork::GetOptions(int threads, int batch_size,
       break;
     }
     case OnnxProvider::CPU:
-      auto status = OrtSessionOptionsAppendExecutionProvider_CPU(options, 0);
-      if (status) {
-        std::string error_message = Ort::GetApi().GetErrorMessage(status);
-        OrtErrorCode error_code = Ort::GetApi().GetErrorCode(status);
-        Ort::GetApi().ReleaseStatus(status);
-        throw Exception("ONNX CPU error " + std::to_string(error_code) + ": " +
-                        error_message);
-      }
+      // The CPU execution provider is always available.
       break;
   }
   return options;
@@ -984,13 +993,25 @@ OnnxNetwork::OnnxNetwork(const WeightsFile& file, const OptionsDict& opts,
 
   int threads =
       opts.GetOrDefault<int>("threads", provider == OnnxProvider::CPU ? 1 : 0);
+  int default_batch = -1;
+  int default_steps = 1;
+  int default_min_batch = 1;
+  switch (provider) {
+    case OnnxProvider::DML:
+    case OnnxProvider::MIGRAPHX:
+      default_batch = 16;
+      default_steps = 4;
+      break;
+    case OnnxProvider::TRT:
+      default_min_batch = 4;
+    default:
+      break;
+  }
 
-  batch_size_ =
-      opts.GetOrDefault<int>("batch", provider == OnnxProvider::DML ? 16 : -1);
-  steps_ =
-      opts.GetOrDefault<int>("steps", provider == OnnxProvider::DML ? 4 : 1);
-  min_batch_size_ = opts.GetOrDefault<int>(
-      "min_batch", provider == OnnxProvider::TRT ? 4 : 1);
+  int optimize = opts.GetOrDefault<int>("optimize", 3);
+  batch_size_ = opts.GetOrDefault<int>("batch", default_batch);
+  steps_ = opts.GetOrDefault<int>("steps", default_steps);
+  min_batch_size_ = opts.GetOrDefault<int>("min_batch", default_min_batch);
   opt_batch_size_ = opts.GetOrDefault<int>(
       "optimize_batch", batch_size_ < 0 ? 256 : batch_size_ * steps_);
 
@@ -1044,8 +1065,7 @@ OnnxNetwork::OnnxNetwork(const WeightsFile& file, const OptionsDict& opts,
       ReportCUDAErrors(
           cudaEventCreate(&compute_ordering_event_, cudaEventDisableTiming));
 #else
-      CERR << "WARNING: CUDA support missing. Enable plain_cuda build option "
-              "for CUDA optimizations.";
+      CERR << "WARNING: Simplified version without CUDA enhancements.";
 #endif
       break;
     default:
@@ -1063,11 +1083,13 @@ OnnxNetwork::OnnxNetwork(const WeightsFile& file, const OptionsDict& opts,
     session_.emplace_back(
         onnx_env_, file.onnx_model().model().data(),
         file.onnx_model().model().size(),
-        GetOptions(threads, batch_size_ * step, hash, attempt++));
+        GetOptions(threads, batch_size_ * step, hash, optimize));
+    attempt++;
 
     if (provider == OnnxProvider::TRT && (fp16_ || bf16_)) {
       if (!IsTRTEngineGood(start, batch_size_ * step, hash,
-                           file.onnx_model().model().size(), attempt)) {
+                           file.onnx_model().model().size(), attempt,
+                           optimize)) {
         if (attempt > 3) {
           throw Exception("TensorRT failed to build a good engine after " +
                           std::to_string(attempt) + " attempts.");
@@ -1081,7 +1103,7 @@ OnnxNetwork::OnnxNetwork(const WeightsFile& file, const OptionsDict& opts,
     }
     attempt = 0;
   }
-#if USE_ONNX_CUDART
+#ifdef USE_ONNX_CUDART
   if ((provider == OnnxProvider::TRT || provider == OnnxProvider::CUDA) &&
       graphs_enabled_) {
     auto init_graphs = [&](auto data_type_tag, bool capture) {
@@ -1101,13 +1123,10 @@ OnnxNetwork::OnnxNetwork(const WeightsFile& file, const OptionsDict& opts,
       }
     };
     if (fp16_) {
-      init_graphs(Ort::Float16_t{}, false);
       init_graphs(Ort::Float16_t{}, true);
     } else if (bf16_) {
-      init_graphs(Ort::BFloat16_t{}, false);
       init_graphs(Ort::BFloat16_t{}, true);
     } else {
-      init_graphs(float{}, false);
       init_graphs(float{}, true);
     }
   }
@@ -1123,18 +1142,24 @@ std::unique_ptr<Network> MakeOnnxNetwork(const std::optional<WeightsFile>& w,
     return std::make_unique<OnnxNetwork>(*w, opts, kProvider, false);
   } else {
     WeightsToOnnxConverterOptions converter_options;
-    converter_options.opset = opts.GetOrDefault<int>("opset", 17);
     converter_options.ir = opts.GetOrDefault<int>("ir", -1);
     converter_options.alt_mish = opts.GetOrDefault<bool>(
         "alt_mish", kProvider == OnnxProvider::CPU ? true : false);
     converter_options.alt_layernorm = opts.GetOrDefault<bool>(
-        "alt_layernorm", kProvider == OnnxProvider::DML ? true : false);
+        "alt_layernorm",
+        kProvider == OnnxProvider::DML &&
+                w->format().network_format().ffn_activation() ==
+                    pblczero::NetworkFormat::ACTIVATION_RELU_2
+            ? true
+            : false);
     converter_options.no_shape = opts.GetOrDefault<bool>("no_shape", false);
     converter_options.policy_head =
         opts.GetOrDefault<std::string>("policy_head", "vanilla");
     converter_options.value_head =
         opts.GetOrDefault<std::string>("value_head", "winner");
     converter_options.no_wdl_softmax = true;
+    // No execution provider has a better mish version, some don't even have it.
+    converter_options.real_mish = false;
 
     std::string datatype;
     if (opts.Exists<std::string>("datatype")) {
@@ -1146,12 +1171,20 @@ std::unique_ptr<Network> MakeOnnxNetwork(const std::optional<WeightsFile>& w,
     }
     converter_options.data_type =
         WeightsToOnnxConverterOptions::StringToDataType(datatype);
+    converter_options.opset = opts.GetOrDefault<int>(
+        "opset", converter_options.data_type ==
+                         WeightsToOnnxConverterOptions::DataType::kBFloat16
+                     ? 22
+                     : 17);
 
     auto converted = ConvertWeightsToOnnx(*w, converter_options);
     return std::make_unique<OnnxNetwork>(converted, opts, kProvider, true);
   }
 }
 
+#ifdef USE_MIGRAPHX
+REGISTER_NETWORK("onnx-migraphx", MakeOnnxNetwork<OnnxProvider::MIGRAPHX>, 65)
+#endif
 #ifdef USE_ROCM
 REGISTER_NETWORK("onnx-rocm", MakeOnnxNetwork<OnnxProvider::ROCM>, 64)
 #endif
@@ -1162,5 +1195,5 @@ REGISTER_NETWORK("onnx-trt", MakeOnnxNetwork<OnnxProvider::TRT>, 60)
 REGISTER_NETWORK("onnx-cuda", MakeOnnxNetwork<OnnxProvider::CUDA>, 61)
 REGISTER_NETWORK("onnx-cpu", MakeOnnxNetwork<OnnxProvider::CPU>, 62)
 
-}  // namespace
+}  // namespace onnx
 }  // namespace lczero

@@ -41,6 +41,7 @@
 #include "utils/fastmath.h"
 #include "utils/random.h"
 #include "utils/spinhelper.h"
+#include "utils/trace.h"
 
 namespace lczero {
 namespace classic {
@@ -1250,6 +1251,7 @@ void SearchWorker::ExecuteOneIteration() {
 // 1. Initialize internal structures.
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 void SearchWorker::InitializeIteration() {
+  LCTRACE_FUNCTION_SCOPE;
   // Free the old computation before allocating a new one. This works better
   // when backend caches buffer allocations between computations.
   computation_.reset();
@@ -1284,6 +1286,7 @@ int CalculateCollisionsLeft(int64_t nodes, const SearchParams& params) {
 }  // namespace
 
 void SearchWorker::GatherMinibatch() {
+  LCTRACE_FUNCTION_SCOPE;
   // Total number of nodes to process.
   int minibatch_size = 0;
   int cur_n = 0;
@@ -1385,6 +1388,7 @@ void SearchWorker::GatherMinibatch() {
       }
     }
     if (some_ooo) {
+      LCTRACE_FUNCTION_SCOPE;
       SharedMutex::Lock lock(search_->nodes_mutex_);
       for (int i = static_cast<int>(minibatch_.size()) - 1; i >= new_start;
            i--) {
@@ -1409,6 +1413,7 @@ void SearchWorker::GatherMinibatch() {
       }
     }
 
+    LCTRACE_FUNCTION_SCOPE;
     // Check for stop at the end so we have at least one node.
     for (size_t i = new_start; i < minibatch_.size(); i++) {
       auto& picked_node = minibatch_[i];
@@ -1437,6 +1442,7 @@ void SearchWorker::GatherMinibatch() {
 
 void SearchWorker::ProcessPickedTask(int start_idx, int end_idx,
                                      TaskWorkspace* workspace) {
+  LCTRACE_FUNCTION_SCOPE;
   auto& history = workspace->history;
   history = search_->played_history_;
 
@@ -1567,6 +1573,7 @@ void SearchWorker::PickNodesToExtendTask(
     const std::vector<Move>& moves_to_base,
     std::vector<NodeToProcess>* receiver,
     TaskWorkspace* workspace) NO_THREAD_SAFETY_ANALYSIS {
+  LCTRACE_FUNCTION_SCOPE;
   // TODO: Bring back pre-cached nodes created outside locks in a way that works
   // with tasks.
   // TODO: pre-reserve visits_to_perform for expected depth and likely maximum
@@ -2008,6 +2015,7 @@ void SearchWorker::ExtendNode(Node* node, int depth,
 
 // 2b. Copy collisions into shared collisions.
 void SearchWorker::CollectCollisions() {
+  LCTRACE_FUNCTION_SCOPE;
   SharedMutex::Lock lock(search_->nodes_mutex_);
 
   for (const NodeToProcess& node_to_process : minibatch_) {
@@ -2021,6 +2029,7 @@ void SearchWorker::CollectCollisions() {
 // 3. Prefetch into cache.
 // ~~~~~~~~~~~~~~~~~~~~~~~
 void SearchWorker::MaybePrefetchIntoCache() {
+  LCTRACE_FUNCTION_SCOPE;
   // TODO(mooskagh) Remove prefetch into cache if node collisions work well.
   // If there are requests to NN, but the batch is not full, try to prefetch
   // nodes which are likely useful in future.
@@ -2150,6 +2159,7 @@ void SearchWorker::RunNNComputation() {
 // 5. Retrieve NN computations (and terminal values) into nodes.
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 void SearchWorker::FetchMinibatchResults() {
+  LCTRACE_FUNCTION_SCOPE;
   // Populate NN/cached results, or terminal results, into nodes.
   for (auto& node_to_process : minibatch_) {
     FetchSingleNodeResult(&node_to_process);
@@ -2198,6 +2208,7 @@ void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process) {
 // 6. Propagate the new nodes' information to all their parents in the tree.
 // ~~~~~~~~~~~~~~
 void SearchWorker::DoBackupUpdate() {
+  LCTRACE_FUNCTION_SCOPE;
   // Nodes mutex for doing node updates.
   SharedMutex::Lock lock(search_->nodes_mutex_);
 
@@ -2370,6 +2381,7 @@ bool SearchWorker::MaybeSetBounds(Node* p, float m, int* n_to_fix,
 // 7. Update the Search's status and progress information.
 //~~~~~~~~~~~~~~~~~~~~
 void SearchWorker::UpdateCounters() {
+  LCTRACE_FUNCTION_SCOPE;
   search_->PopulateCommonIterationStats(&iteration_stats_);
   search_->MaybeTriggerStop(iteration_stats_, &latest_time_manager_hints_);
   search_->MaybeOutputInfo();
