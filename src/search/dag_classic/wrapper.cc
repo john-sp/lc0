@@ -191,7 +191,7 @@ class DagClassicSearchFactory : public SearchFactory {
   void PopulateParams(OptionsParser* parser) const override {
     parser->Add<IntOption>(kThreadsOptionId, 0, 128) = 0;
 #ifdef FIX_TT
-    parser->Add<IntOption>(kHashId, 0, 2000) = 50;
+    parser->Add<IntOption>(kHashId, 0, 10000) = 50;
 #endif
     SearchParams::Populate(parser);
     classic::PopulateTimeManagementOptions(classic::RunType::kUci, parser);
