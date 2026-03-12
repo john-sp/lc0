@@ -56,6 +56,26 @@ class KingAttackInfo {
   BitBoard attack_lines_ = {0};
 };
 
+// SEE threshold separating "positive" (>= threshold) from "equal" captures.
+constexpr int kTacticalSeeThreshold = 1;
+
+// Holds all 13 tactical feature bitboards for INPUT_112_WITH_TACTICAL.
+struct TacticalInfo {
+  BitBoard see_positive{0};
+  BitBoard see_equal{0};
+  BitBoard see_negative{0};
+  BitBoard control_plus{0};
+  BitBoard control_equal{0};
+  BitBoard control_minus{0};
+  BitBoard our_hanging{0};
+  BitBoard our_pins{0};
+  BitBoard their_pins{0};
+  BitBoard our_discovered_checks{0};
+  BitBoard our_passed_pawns{0};
+  BitBoard their_passed_pawns{0};
+  BitBoard legal_checks{0};
+};
+
 // Represents a board position.
 // Unlike most chess engines, the board is mirrored for black.
 class ChessBoard {
@@ -95,6 +115,9 @@ class ChessBoard {
   KingAttackInfo GenerateKingAttackInfo() const;
   // Checks if "our" (white) king is under check.
   bool IsUnderCheck() const { return IsUnderAttack(our_king_); }
+  int StaticExchangeEvaluation(Move move) const;
+  // Computes all tactical features for the current position.
+  TacticalInfo ComputeTacticalInfo() const;
 
   // Checks whether at least one of the sides has mating material.
   bool HasMatingMaterial() const;
@@ -233,6 +256,7 @@ class ChessBoard {
   void PutPiece(Square square, PieceType piece, bool is_theirs);
   // Check internal state is consistent after state transformations.
   bool IsValid() const;
+  int GetPieceValue(const Square& square) const;
 
   // All white pieces.
   BitBoard our_pieces_;

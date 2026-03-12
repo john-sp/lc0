@@ -531,6 +531,52 @@ TEST(EncodePositionForNN, EncodeEarlyGameFlipFormat3) {
   EXPECT_EQ(their_king_plane.value, 1.0f);
 }
 
+// Test INPUT_112_WITH_TACTICAL: planes 91-103 should contain tactical data,
+// plane slot 7 (indices 91-103) should NOT contain board history data, and
+// normal history planes 0-90 should still be filled.
+TEST(EncodePositionForNN, EncodeTacticalPlanes) {
+  ChessBoard board;
+  PositionHistory history;
+  // White: Ke1, Rd1, Pa5.  Black: Ke8, Pd6.
+  // Rd1-d8 gives check => d8 in legal_checks (plane 103).
+  // Pa5 is passed (no black pawn on a/b files ahead) => a5 in our_passed_pawns
+  // (plane 101).
+  board.SetFromFen("4k3/8/3p4/P7/8/8/8/3RK3 w - - 0 1");
+  history.Reset(board, 0, 1);
+
+  InputPlanes encoded_planes = EncodePositionForNN(
+      pblczero::NetworkFormat::INPUT_112_WITH_TACTICAL, history, 8,
+      FillEmptyHistory::NO, nullptr);
+
+  // Planes 0-12 (history slot 0) should have normal board data.
+  // Our pawns (plane 0): a5 = square 32.
+  EXPECT_NE(encoded_planes[0].mask, 0ull);
+
+  // Plane 91 = tactical base + 0 = see_positive.
+  // Plane 103 = tactical base + 12 = legal_checks.
+  constexpr int kTacticalBase = 7 * 13;  // 91
+
+  // legal_checks (plane 103): Rd1-d8 gives check.
+  // d8 = file d (3), rank 8 (7) => square index = 7*8 + 3 = 59.
+  auto legal_checks_plane = encoded_planes[kTacticalBase + 12];
+  EXPECT_TRUE((legal_checks_plane.mask & (1ull << 59)) != 0)
+      << "d8 should be a legal check square";
+
+  // our_passed_pawns (plane 101): a5 is passed.
+  // a5 = file a (0), rank 5 (4) => square index = 4*8 + 0 = 32.
+  auto our_passed_pawns_plane = encoded_planes[kTacticalBase + 10];
+  EXPECT_TRUE((our_passed_pawns_plane.mask & (1ull << 32)) != 0)
+      << "a5 should be a passed pawn";
+
+  // their_passed_pawns (plane 102): d6 — is it passed?
+  // Black pawn d6.  White pawn a5 is on file a, not adjacent to file d.
+  // So d6 has no enemy (white) pawns on c/d/e files with lower rank => passed.
+  auto their_passed_pawns_plane = encoded_planes[kTacticalBase + 11];
+  // d6 = file d (3), rank 6 (5) => square index = 5*8 + 3 = 43.
+  EXPECT_TRUE((their_passed_pawns_plane.mask & (1ull << 43)) != 0)
+      << "d6 should be a passed pawn for them";
+}
+
 }  // namespace lczero
 
 int main(int argc, char** argv) {

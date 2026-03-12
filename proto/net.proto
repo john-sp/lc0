@@ -157,7 +157,7 @@ message Weights {
   }
 
   message PolicyHeadMap {
-    required string key = 1;  // name of the policy head
+    required string key = 1; // name of the policy head
     required PolicyHead value = 2;
   }
 
@@ -173,7 +173,7 @@ message Weights {
   }
 
   message ValueHeadMap {
-    required string key = 1;  // name of the value head
+    required string key = 1; // name of the value head
     required ValueHead value = 2;
   }
 
@@ -283,6 +283,7 @@ message NetworkFormat {
     INPUT_112_WITH_CANONICALIZATION_HECTOPLIES_ARMAGEDDON = 132;
     INPUT_112_WITH_CANONICALIZATION_V2 = 5;
     INPUT_112_WITH_CANONICALIZATION_V2_ARMAGEDDON = 133;
+    INPUT_112_WITH_TACTICAL = 6;
   }
   optional InputFormat input = 1;
 

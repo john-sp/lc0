@@ -2250,6 +2250,166 @@ TEST(ChessBoard, QueenMoveFromEnPassantFlagBug) {
   EXPECT_EQ(board.GenerateLegalMoves(), legal_moves);
 }
 
+// Helper to build a BitBoard from a list of squares.
+BitBoard MakeBitBoard(std::initializer_list<Square> squares) {
+  BitBoard bb(0);
+  for (auto sq : squares) bb.set(sq);
+  return bb;
+}
+
+// Position with a pin: black bishop on b4 pins white knight on c3 to white
+// king on d2.  Also tests that "their_pins" is empty (no white piece pins a
+// black piece here).
+TEST(ChessBoard, TacticalInfoPins) {
+  ChessBoard board;
+  board.SetFromFen("4k3/8/8/8/1b6/2N5/3K4/8 w - - 0 1");
+
+  auto info = board.ComputeTacticalInfo();
+
+  // Nc3 is pinned along the b4-d2 diagonal.
+  Square c3(kFileC, kRank3);
+  EXPECT_TRUE(info.our_pins.get(c3));
+  // No other piece should be pinned.
+  EXPECT_EQ(info.our_pins, MakeBitBoard({c3}));
+  // No black piece is pinned by white.
+  EXPECT_EQ(info.their_pins.as_int(), 0ull);
+}
+
+// Position with passed pawns: white pawn on a5 is passed (no black pawns on
+// a/b files ahead).  Black pawn on h4 is passed (no white pawns on g/h files
+// behind it from black's perspective).
+TEST(ChessBoard, TacticalInfoPassedPawns) {
+  ChessBoard board;
+  board.SetFromFen("4k3/8/8/P7/7p/8/8/4K3 w - - 0 1");
+
+  auto info = board.ComputeTacticalInfo();
+
+  Square a5(kFileA, kRank5);
+  Square h4(kFileH, kRank4);
+  EXPECT_TRUE(info.our_passed_pawns.get(a5));
+  EXPECT_TRUE(info.their_passed_pawns.get(h4));
+}
+
+// Verify a pawn blocked by an enemy pawn on the same file is NOT passed.
+TEST(ChessBoard, TacticalInfoBlockedPawnNotPassed) {
+  ChessBoard board;
+  board.SetFromFen("4k3/3p4/8/8/8/8/3P4/4K3 w - - 0 1");
+
+  auto info = board.ComputeTacticalInfo();
+
+  Square d2(kFileD, kRank2);
+  Square d7(kFileD, kRank7);
+  EXPECT_FALSE(info.our_passed_pawns.get(d2));
+  EXPECT_FALSE(info.their_passed_pawns.get(d7));
+}
+
+// Position with a discovered check: white rook on a1, white knight on a4
+// blocking the a-file to the black king on a8.  Moving the knight aside
+// discovers check from the rook.  But vertical ray + pawn blocker is excluded,
+// so we use a knight.
+TEST(ChessBoard, TacticalInfoDiscoveredChecks) {
+  ChessBoard board;
+  board.SetFromFen("k7/8/8/8/N7/8/8/R3K3 w Q - 0 1");
+
+  auto info = board.ComputeTacticalInfo();
+
+  Square a4(kFileA, kRank4);
+  EXPECT_TRUE(info.our_discovered_checks.get(a4));
+}
+
+// Discovered check is excluded when the blocker is a pawn on a vertical ray
+// (it can't step aside).
+TEST(ChessBoard, TacticalInfoDiscoveredCheckPawnVerticalExcluded) {
+  ChessBoard board;
+  board.SetFromFen("k7/8/8/8/P7/8/8/R3K3 w Q - 0 1");
+
+  auto info = board.ComputeTacticalInfo();
+
+  Square a4(kFileA, kRank4);
+  EXPECT_FALSE(info.our_discovered_checks.get(a4));
+}
+
+// Diagonal discovered check: white bishop on a1, white knight on c3 blocking
+// diagonal to black king on e5.
+TEST(ChessBoard, TacticalInfoDiscoveredCheckDiagonal) {
+  ChessBoard board;
+  board.SetFromFen("8/8/8/4k3/8/2N5/8/B3K3 w - - 0 1");
+
+  auto info = board.ComputeTacticalInfo();
+
+  Square c3(kFileC, kRank3);
+  EXPECT_TRUE(info.our_discovered_checks.get(c3));
+}
+
+// Hanging piece: white knight on d4 attacked by black bishop on g7 with no
+// white piece defending it.
+TEST(ChessBoard, TacticalInfoHangingPiece) {
+  ChessBoard board;
+  board.SetFromFen("4k3/6b1/8/8/3N4/8/8/4K3 w - - 0 1");
+
+  auto info = board.ComputeTacticalInfo();
+
+  Square d4(kFileD, kRank4);
+  EXPECT_TRUE(info.our_hanging.get(d4));
+}
+
+TEST(ChessBoard, TacticalInfoControl) {
+  ChessBoard board;
+  // White: Ke1, Pf3.  Black: Ke8, Pd5, Pe4.
+  board.SetFromFen("4k3/8/8/3p4/4p3/5P2/8/4K3 w - - 0 1");
+
+  auto info = board.ComputeTacticalInfo();
+
+  Square e4(kFileE, kRank4);
+  // e4 is attacked equally by both sides (1 each).
+  EXPECT_TRUE(info.control_equal.get(e4));
+  EXPECT_FALSE(info.control_plus.get(e4));
+  EXPECT_FALSE(info.control_minus.get(e4));
+}
+
+// SEE-positive capture: white queen captures undefended black pawn.
+TEST(ChessBoard, TacticalInfoSeePositive) {
+  ChessBoard board;
+  // White: Ke1, Qd1.  Black: Ke8, Pd4.
+  // Qd1 can capture Pd4 (a pawn, value ~1, undefended).  SEE should be
+  // positive (>= kTacticalSeeThreshold = 1).
+  board.SetFromFen("4k3/8/8/8/3p4/8/8/3QK3 w - - 0 1");
+
+  auto info = board.ComputeTacticalInfo();
+
+  Square d4(kFileD, kRank4);
+  EXPECT_TRUE(info.see_positive.get(d4));
+  EXPECT_FALSE(info.see_equal.get(d4));
+  EXPECT_FALSE(info.see_negative.get(d4));
+}
+
+// Legal checks: a move whose destination gives check.
+TEST(ChessBoard, TacticalInfoLegalChecks) {
+  ChessBoard board;
+  // White: Ke1, Rd1.  Black: Ke8.
+  // Rd1-d8 gives check.  d8 should be in legal_checks.
+  board.SetFromFen("4k3/8/8/8/8/8/8/3RK3 w - - 0 1");
+
+  auto info = board.ComputeTacticalInfo();
+
+  Square d8(kFileD, kRank8);
+  EXPECT_TRUE(info.legal_checks.get(d8));
+}
+
+// Comprehensive position with multiple tactical features.
+TEST(ChessBoard, TacticalInfoComprehensive) {
+  ChessBoard board;
+  // Position: white Ke1, Ra1, Bb5, Nc3, Pa5; black Ke8, Qd8, Bc8, Pd6, Pf7.
+  // FEN: "2bqk3/5p2/3p4/PB6/8/2N5/8/R3K3 w Q - 0 1"
+  board.SetFromFen("2bqk3/5p2/3p4/PB6/8/2N5/8/R3K3 w Q - 0 1");
+
+  auto info = board.ComputeTacticalInfo();
+
+  // White pawn a5 is passed (no black pawns on a/b files with rank > 5).
+  Square a5(kFileA, kRank5);
+  EXPECT_TRUE(info.our_passed_pawns.get(a5));
+}
+
 }  // namespace lczero
 
 int main(int argc, char** argv) {

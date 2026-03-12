@@ -148,8 +148,43 @@ void ShowNetworkWeightsBodyInfo(const pblczero::Net& weights) {
   if (w.encoder_size() > 0) {
     COUT << Justify("Encoders") << w.encoder_size();
     COUT << Justify("Encoder heads") << w.headcount();
-    COUT << Justify("Embedding size") << w.ip_emb_b().params().size() / 2;
-    COUT << Justify("Dmodel") << w.encoder(0).mha().q_b().params().size() / 2;
+
+    const auto& enc0 = w.encoder(0);
+    int embedding_size = w.ip_emb_b().params().size() / 2;
+    if (embedding_size == 0 && enc0.has_ln1_gammas()) {
+      embedding_size = enc0.ln1_gammas().params().size() / 2;
+    }
+    COUT << Justify("Embedding size") << embedding_size;
+
+    const auto& mha = enc0.mha();
+    int d_model = 0;
+    if (mha.has_q_b()) {
+      d_model = mha.q_b().params().size() / 2;
+    } else {
+      d_model = mha.q_w().params().size() / 2 / embedding_size;
+    }
+    COUT << Justify("Dmodel") << d_model;
+
+    int heads = w.headcount();
+    int depth = d_model / heads;
+    int kv_heads = 0;
+    if (mha.has_k_b()) {
+      kv_heads = (mha.k_b().params().size() / 2) / depth;
+    } else {
+      kv_heads = ((mha.k_w().params().size() / 2) / embedding_size) / depth;
+    }
+    if (heads != kv_heads) {
+      COUT << Justify("KV heads") << kv_heads;
+    }
+
+    if (!mha.has_q_b()) {
+      COUT << Justify("QKV Biases") << "Absent";
+    }
+
+    if (!enc0.has_ln1_betas()) {
+      COUT << Justify("RMS Norm") << "True";
+    }
+
     COUT << Justify("Encoder DFF")
          << w.encoder(0).ffn().dense1_b().params().size() / 2;
   } else {

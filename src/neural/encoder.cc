@@ -152,6 +152,7 @@ InputPlanes EncodePositionForNN(
       transform = ChooseTransform(board);
     }
     switch (input_format) {
+      case pblczero::NetworkFormat::INPUT_112_WITH_TACTICAL:
       case pblczero::NetworkFormat::INPUT_CLASSICAL_112_PLANE: {
         // "Legacy" input planes with:
         // - Plane 104 (0-based) filled with 1 if we can castle queenside.
@@ -272,6 +273,12 @@ InputPlanes EncodePositionForNN(
       continue;
     }
 
+    if (input_format == pblczero::NetworkFormat::INPUT_112_WITH_TACTICAL &&
+        i == 7) {
+      if (history_idx > 0) flip = !flip;
+      continue;
+    }
+
     const int base = i * kPlanesPerBoard;
     result[base + 0].mask = (board.ours() & board.pawns()).as_int();
     result[base + 1].mask = (board.ours() & board.knights()).as_int();
@@ -305,6 +312,29 @@ InputPlanes EncodePositionForNN(
     // If no capture no pawn is 0, the previous was start of game, capture or
     // pawn push, so no need to go back further if stopping early.
     if (stop_early && position.GetRule50Ply() == 0) break;
+  }
+  // Fill tactical planes 91-103 for INPUT_112_WITH_TACTICAL format.
+  if (input_format ==
+      pblczero::NetworkFormat::INPUT_112_WITH_TACTICAL) {
+    const ChessBoard& board = history.back().GetBoard();
+    TacticalInfo tactical = board.ComputeTacticalInfo();
+    constexpr int kTacticalBase = 7 * kPlanesPerBoard;  // = 91
+    result[kTacticalBase + 0].mask = tactical.see_positive.as_int();
+    result[kTacticalBase + 1].mask = tactical.see_equal.as_int();
+    result[kTacticalBase + 2].mask = tactical.see_negative.as_int();
+    result[kTacticalBase + 3].mask = tactical.control_plus.as_int();
+    result[kTacticalBase + 4].mask = tactical.control_equal.as_int();
+    result[kTacticalBase + 5].mask = tactical.control_minus.as_int();
+    result[kTacticalBase + 6].mask = tactical.our_hanging.as_int();
+    result[kTacticalBase + 7].mask = tactical.our_pins.as_int();
+    result[kTacticalBase + 8].mask = tactical.their_pins.as_int();
+    result[kTacticalBase + 9].mask =
+        tactical.our_discovered_checks.as_int();
+    result[kTacticalBase + 10].mask =
+        tactical.our_passed_pawns.as_int();
+    result[kTacticalBase + 11].mask =
+        tactical.their_passed_pawns.as_int();
+    result[kTacticalBase + 12].mask = tactical.legal_checks.as_int();
   }
   if (transform != NoTransform) {
     // Transform all masks.

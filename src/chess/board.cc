@@ -28,6 +28,7 @@
 #include "chess/board.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <charconv>
 #include <cstdlib>
@@ -593,6 +594,107 @@ bool ChessBoard::IsValid() const {
   return true;
 }
 
+namespace {
+// Quick approximations based on #odds-bots estimations against humans.
+constexpr int kKingValue = 100000;
+constexpr int kQueenValue = 0x100 * 8.6;
+constexpr int kRookValue = 0x100 * 4.7;
+constexpr int kBishopValue = 0x100 * 3.2;
+constexpr int kKnightValue = 0x100 * 3.0;
+constexpr int kPawnValue = 0x100;
+}  // namespace
+
+int ChessBoard::GetPieceValue(const Square& square) const {
+  if (!(ours() | theirs()).get(square)) {
+    return 0;
+  } else if (queens().get(square)) {
+    return kQueenValue;
+  } else if (rooks().get(square)) {
+    return kRookValue;
+  } else if (bishops().get(square)) {
+    return kBishopValue;
+  } else if (pawns().get(square)) {
+    return kPawnValue;
+  } else if (kings().get(square)) { 
+    return kKingValue;
+  }
+  return kKnightValue;
+}
+
+int ChessBoard::StaticExchangeEvaluation(Move move) const {
+  // 1. Initial Capture Value
+  int captured_value = GetPieceValue(move.to());
+  if (move.is_en_passant()) {
+    captured_value = kPawnValue;
+  }
+
+  int gain[32];
+  int d = 0;
+  gain[d] = captured_value;
+
+  // 3. Setup Simulation
+  int attacker_value = GetPieceValue(move.from());
+  Square target_sq = move.to();
+  
+  // We need a copy to simulate moves. 
+  // NOTE: In high-performance engines we use bitmasks without copying,
+  // but for a tensor generator, copying is safe and much easier to read.
+  ChessBoard copy = *this;
+  copy.ApplyMove(move);
+  copy.Mirror(); 
+  
+  // Correct the target square for the mirrored board
+  target_sq.Flip(); 
+
+  while (true) {
+    d++;
+    
+    // The value of the piece standing on the square is 'attacker_value' from prev iteration
+    // We captured it. 
+    // gain[d] = Value_We_Captured - Value_We_Risked
+    gain[d] = attacker_value - gain[d - 1];
+
+    // Pruning: If the current side is losing material even if they stop,
+    // they won't stand for it (cutoff).
+    if (std::max(-gain[d - 1], gain[d]) < 0) break;
+
+    // Find Least Valuable Attacker (LVA)
+    // Generating all pseudolegal moves is slightly inefficient but robust.
+    auto legal_moves = copy.GenerateLegalMoves();
+    
+    int best_attacker_val = 100000; // Infinity
+    Move best_move = Move();
+    bool found = false;
+
+    for (const auto& m : legal_moves) {
+      if (m.to() == target_sq) {
+        int val = copy.GetPieceValue(m.from());
+        if (val < best_attacker_val) {
+          best_attacker_val = val;
+          best_move = m;
+          found = true;
+        }
+      }
+    }
+
+    if (!found) break; // No more attackers
+
+    // Advance
+    attacker_value = best_attacker_val;
+    copy.ApplyMove(best_move);
+    copy.Mirror();
+    target_sq.Flip();
+  }
+
+  // 5. Minimax Back-propagation
+  // Backtrack to find the optimal stop point
+  while (--d > 0) {
+    gain[d - 1] = -std::max(-gain[d - 1], gain[d]);
+  }
+
+  return gain[0];
+}
+
 bool ChessBoard::ApplyMove(Move move) {
   assert(our_pieces_.intersects(BitBoard::FromSquare(move.from())));
 #ifndef NDEBUG
@@ -964,6 +1066,245 @@ MoveList ChessBoard::GenerateLegalMoves() const {
                      [&](Move m) { return !IsLegalMove(m, king_attack_info); }),
       result.end());
   return result;
+}
+
+namespace {
+
+// Counts the number of pieces from `side_pieces` attacking each square.
+// `side_is_ours` controls pawn direction: true means pawns advance up (rank+1).
+std::array<uint8_t, 64> ComputeAttackCounts(const ChessBoard& board,
+                                            const BitBoard& side_pieces,
+                                            bool side_is_ours) {
+  std::array<uint8_t, 64> counts{};
+  const BitBoard occupancy = board.ours() | board.theirs();
+
+  const BitBoard pawns = board.pawns() & side_pieces;
+  const BitBoard knights = board.knights() & side_pieces;
+  const BitBoard bishops = board.bishops() & side_pieces;
+  const BitBoard rooks = board.rooks() & side_pieces;
+  const BitBoard queens = board.queens() & side_pieces;
+  const BitBoard king_bb = board.kings() & side_pieces;
+
+  // Pawn attacks.
+  const int pawn_dir = side_is_ours ? 1 : -1;
+  for (auto square : pawns) {
+    const int file = square.file().idx;
+    const int rank = square.rank().idx + pawn_dir;
+    if (rank < 0 || rank > 7) continue;
+    if (file > 0) {
+      auto idx =
+          Square(File::FromIdx(file - 1), Rank::FromIdx(rank)).as_idx();
+      if (counts[idx] < 255) ++counts[idx];
+    }
+    if (file < 7) {
+      auto idx =
+          Square(File::FromIdx(file + 1), Rank::FromIdx(rank)).as_idx();
+      if (counts[idx] < 255) ++counts[idx];
+    }
+  }
+
+  // Knight attacks.
+  for (auto square : knights) {
+    for (auto target : kKnightAttacks[square.as_idx()]) {
+      auto idx = target.as_idx();
+      if (counts[idx] < 255) ++counts[idx];
+    }
+  }
+
+  // King attacks.
+  for (auto square : king_bb) {
+    const int file = square.file().idx;
+    const int rank = square.rank().idx;
+    for (const auto& [df, dr] : kKingMoves) {
+      const int f = file + df;
+      const int r = rank + dr;
+      if (f < 0 || f > 7 || r < 0 || r > 7) continue;
+      auto idx = Square(File::FromIdx(f), Rank::FromIdx(r)).as_idx();
+      if (counts[idx] < 255) ++counts[idx];
+    }
+  }
+
+  // Bishop attacks (using magic bitboards per piece).
+  for (auto square : bishops) {
+    for (auto target : GetBishopAttacks(square, occupancy)) {
+      auto idx = target.as_idx();
+      if (counts[idx] < 255) ++counts[idx];
+    }
+  }
+
+  // Rook attacks (using magic bitboards per piece).
+  for (auto square : rooks) {
+    for (auto target : GetRookAttacks(square, occupancy)) {
+      auto idx = target.as_idx();
+      if (counts[idx] < 255) ++counts[idx];
+    }
+  }
+
+  // Queen attacks (rook + bishop combined).
+  for (auto square : queens) {
+    for (auto target : GetRookAttacks(square, occupancy)) {
+      auto idx = target.as_idx();
+      if (counts[idx] < 255) ++counts[idx];
+    }
+    for (auto target : GetBishopAttacks(square, occupancy)) {
+      auto idx = target.as_idx();
+      if (counts[idx] < 255) ++counts[idx];
+    }
+  }
+
+  return counts;
+}
+
+// Returns true if the pawn at `pawn` is a passed pawn (no enemy pawns on
+// same or adjacent files ahead of it).
+bool IsPassedPawn(const BitBoard& enemy_pawns, Square pawn,
+                  bool pawn_is_ours) {
+  const int pawn_file = pawn.file().idx;
+  const int pawn_rank = pawn.rank().idx;
+  for (auto enemy : enemy_pawns) {
+    const int enemy_file = enemy.file().idx;
+    if (std::abs(enemy_file - pawn_file) > 1) continue;
+    const int enemy_rank = enemy.rank().idx;
+    if (pawn_is_ours && enemy_rank > pawn_rank) return false;
+    if (!pawn_is_ours && enemy_rank < pawn_rank) return false;
+  }
+  return true;
+}
+
+// Finds our pieces that block a sliding attack line from one of our other
+// pieces to the enemy king (discovered check candidates).
+BitBoard OurDiscoveredChecks(const ChessBoard& board) {
+  const Square enemy_king =
+      *((board.kings() & board.theirs()).begin());
+  const BitBoard occupied = board.ours() | board.theirs();
+  BitBoard result(0);
+
+  static constexpr std::array<std::pair<int, int>, 8> kDirections = {
+      std::pair<int, int>{1, 0},  {0, 1},  {-1, 0}, {0, -1},
+      std::pair<int, int>{1, 1},  {-1, 1}, {1, -1}, {-1, -1}};
+
+  for (const auto& [df, dr] : kDirections) {
+    int f = enemy_king.file().idx + df;
+    int r = enemy_king.rank().idx + dr;
+    while (f >= 0 && f <= 7 && r >= 0 && r <= 7) {
+      Square sq(File::FromIdx(f), Rank::FromIdx(r));
+      if (occupied.get(sq)) {
+        if (!board.ours().get(sq)) break;
+        Square blocker = sq;
+        f += df;
+        r += dr;
+        while (f >= 0 && f <= 7 && r >= 0 && r <= 7) {
+          Square next_sq(File::FromIdx(f), Rank::FromIdx(r));
+          if (occupied.get(next_sq)) {
+            if (board.ours().get(next_sq)) {
+              const bool is_orth = df == 0 || dr == 0;
+              const bool is_diag = std::abs(df) == std::abs(dr);
+              const bool is_rook_like =
+                  board.rooks().get(next_sq) || board.queens().get(next_sq);
+              const bool is_bishop_like =
+                  board.bishops().get(next_sq) ||
+                  board.queens().get(next_sq);
+              if ((is_orth && is_rook_like) ||
+                  (is_diag && is_bishop_like)) {
+                // If ray is vertical and blocker is a pawn, it can't step
+                // aside.
+                if (df == 0 && board.pawns().get(blocker)) break;
+                result.set(blocker);
+              }
+            }
+            break;
+          }
+          f += df;
+          r += dr;
+        }
+        break;
+      }
+      f += df;
+      r += dr;
+    }
+  }
+
+  return result;
+}
+
+}  // namespace
+
+TacticalInfo ChessBoard::ComputeTacticalInfo() const {
+  TacticalInfo info;
+
+  // 1. Pins (our side).
+  info.our_pins = GenerateKingAttackInfo().pinned_pieces_;
+
+  // 2. Pins (their side): mirror, compute, mirror back.
+  {
+    ChessBoard mirrored = *this;
+    mirrored.Mirror();
+    info.their_pins = mirrored.GenerateKingAttackInfo().pinned_pieces_;
+    info.their_pins.Mirror();
+  }
+
+  // 3. Discovered checks.
+  info.our_discovered_checks = OurDiscoveredChecks(*this);
+
+  // 4. Passed pawns.
+  const BitBoard our_pawns = ours() & pawns();
+  const BitBoard their_pawns = theirs() & pawns();
+  for (auto sq : our_pawns) {
+    if (IsPassedPawn(their_pawns, sq, true)) info.our_passed_pawns.set(sq);
+  }
+  for (auto sq : their_pawns) {
+    if (IsPassedPawn(our_pawns, sq, false)) info.their_passed_pawns.set(sq);
+  }
+
+  // 5. Attack counts.
+  auto our_attacks = ComputeAttackCounts(*this, ours(), true);
+  auto their_attacks = ComputeAttackCounts(*this, theirs(), false);
+
+  // 6. Hanging pieces (ours attacked by them, no defenders).
+  for (auto sq : ours()) {
+    if (our_attacks[sq.as_idx()] == 0 && their_attacks[sq.as_idx()] > 0)
+      info.our_hanging.set(sq);
+  }
+
+  // 7. Control (occupied squares contested by both sides).
+  for (auto sq : ours() | theirs()) {
+    int ours_cnt = our_attacks[sq.as_idx()];
+    int theirs_cnt = their_attacks[sq.as_idx()];
+    if (ours_cnt == 0 || theirs_cnt == 0) continue;
+    if (ours_cnt > theirs_cnt)
+      info.control_plus.set(sq);
+    else if (ours_cnt == theirs_cnt)
+      info.control_equal.set(sq);
+    else
+      info.control_minus.set(sq);
+  }
+
+  // 8. Legal checks and SEE for captures.
+  MoveList legal_moves = GenerateLegalMoves();
+  for (const auto& move : legal_moves) {
+    Square dest = move.to();
+
+    // Check detection: apply the move, mirror, and test.
+    {
+      ChessBoard copy = *this;
+      copy.ApplyMove(move);
+      copy.Mirror();
+      if (copy.IsUnderCheck()) info.legal_checks.set(dest);
+    }
+
+    // SEE for captures only.
+    bool is_capture = move.is_en_passant() || theirs().get(dest);
+    if (!is_capture) continue;
+    int see = StaticExchangeEvaluation(move);
+    if (see >= kTacticalSeeThreshold)
+      info.see_positive.set(dest);
+    else if (see >= 0)
+      info.see_equal.set(dest);
+    else
+      info.see_negative.set(dest);
+  }
+
+  return info;
 }
 
 void ChessBoard::PutPiece(Square square, PieceType piece, bool is_theirs) {
