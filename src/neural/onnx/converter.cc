@@ -545,33 +545,105 @@ std::string Converter::MakeEncoderLayer(
     OnnxBuilder* builder, const MultiHeadWeights::EncoderLayer& layer,
     int embedding_size, int heads, const std::string& encoder_in,
     const std::string& name, ActivationFunction activation, float alpha) {
-  const int d_model = layer.mha.q_b.size();
+  int d_model = 0; 
+  if (!layer.mha.q_b.empty()) {
+    d_model = layer.mha.q_b.size();
+  } else {
+    d_model = layer.mha.q_w.size() / embedding_size;
+  }
   const int depth = d_model / heads;
+
+  int kv_heads = 0;
+  if (!layer.mha.k_b.empty()) {
+    kv_heads = layer.mha.k_b.size() / depth;
+  } else {
+    kv_heads = (layer.mha.k_w.size() / embedding_size) / depth;
+  }
+  const int d_model_kv = kv_heads * depth;
 
   auto mha_shape =
       builder->AddInitializer("/const" + name + "/mha/shape",
                               Int64OnnxConst({-1, 64, heads, depth}, {4}));
+  auto mha_kv_shape = builder->AddInitializer(
+      "/const" + name + "/mha/kv_shape",
+      Int64OnnxConst({-1, 64, kv_heads, depth}, {4}));
   auto flow = builder->MatMul(
       name + "/mha/Q/w", encoder_in,
       *GetWeghtsConverter(layer.mha.q_w, {embedding_size, d_model}, {1, 0}));
-  flow = builder->Add(name + "/mha/Q/b", flow,
-                      *GetWeghtsConverter(layer.mha.q_b, {d_model}));
+  if (!layer.mha.q_b.empty()) {
+    flow = builder->Add(name + "/mha/Q/b", flow,
+                        *GetWeghtsConverter(layer.mha.q_b, {d_model}));
+  }
   flow = builder->Reshape(name + "/mha/Q/reshape", flow, mha_shape);
   auto Q = builder->Transpose(name + "/mha/Q/transpose", flow, {0, 2, 1, 3});
   flow = builder->MatMul(
       name + "/mha/K/w", encoder_in,
-      *GetWeghtsConverter(layer.mha.k_w, {embedding_size, d_model}, {1, 0}));
-  flow = builder->Add(name + "/mha/K/b", flow,
-                      *GetWeghtsConverter(layer.mha.k_b, {d_model}));
-  flow = builder->Reshape(name + "/mha/K/reshape", flow, mha_shape);
+      *GetWeghtsConverter(layer.mha.k_w, {embedding_size, d_model_kv}, {1, 0}));
+  if (!layer.mha.k_b.empty()) {
+    flow = builder->Add(name + "/mha/K/b", flow,
+                        *GetWeghtsConverter(layer.mha.k_b, {d_model_kv}));
+  }
+  flow = builder->Reshape(name + "/mha/K/reshape", flow, mha_kv_shape);
   auto K = builder->Transpose(name + "/mha/K/transpose", flow, {0, 2, 3, 1});
+
+  
+  if (heads != kv_heads) {
+    // Repeat K
+    if (heads % kv_heads != 0) {
+      throw Exception("heads must be divisible by kv_heads");
+    }
+    // Expand K using matrix multiplication.
+    // K: [batch, kv_heads, depth, 64]
+    // Permute to [batch, depth, 64, kv_heads]
+    K = builder->Transpose(name + "/mha/K/perm_for_expand", K, {0, 2, 3, 1});
+    // Create expansion matrix [kv_heads, heads]
+    std::vector<float> expansion_matrix(kv_heads * heads, 0.0f);
+    int repeats = heads / kv_heads;
+    for (int i = 0; i < kv_heads; ++i) {
+      for (int j = 0; j < repeats; ++j) {
+        expansion_matrix[i * heads + i * repeats + j] = 1.0f;
+      }
+    }
+    K = builder->MatMul(
+        name + "/mha/K/expand_matmul", K,
+        *GetWeghtsConverter(expansion_matrix, {kv_heads, heads}));
+    // [batch, depth, 64, heads] -> [batch, heads, depth, 64]
+    K = builder->Transpose(name + "/mha/K/perm_after_expand", K, {0, 3, 1, 2});
+  }
+  
+
   flow = builder->MatMul(
       name + "/mha/V/w", encoder_in,
-      *GetWeghtsConverter(layer.mha.v_w, {embedding_size, d_model}, {1, 0}));
-  flow = builder->Add(name + "/mha/V/b", flow,
-                      *GetWeghtsConverter(layer.mha.v_b, {d_model}));
-  flow = builder->Reshape(name + "/mha/V/reshape", flow, mha_shape);
+      *GetWeghtsConverter(layer.mha.v_w, {embedding_size, d_model_kv}, {1, 0}));
+  if (!layer.mha.v_b.empty()) {
+    flow = builder->Add(name + "/mha/V/b", flow,
+                        *GetWeghtsConverter(layer.mha.v_b, {d_model_kv}));
+  }
+  flow = builder->Reshape(name + "/mha/V/reshape", flow, mha_kv_shape);
   auto V = builder->Transpose(name + "/mha/V/transpose", flow, {0, 2, 1, 3});
+
+  if (heads != kv_heads) {
+    // Repeat V
+    // V: [batch, kv_heads, 64, depth]
+    // Permute to [batch, 64, depth, kv_heads]
+    V = builder->Transpose(name + "/mha/V/perm_for_expand", V, {0, 2, 3, 1});
+    // Reuse expansion matrix [kv_heads, heads]
+    // But we need to recreate the OnnxConst or pass the same one.
+    // GetWeghtsConverter creates a unique_ptr, so we create a new one.
+    std::vector<float> expansion_matrix(kv_heads * heads, 0.0f);
+    int repeats = heads / kv_heads;
+    for (int i = 0; i < kv_heads; ++i) {
+      for (int j = 0; j < repeats; ++j) {
+        expansion_matrix[i * heads + i * repeats + j] = 1.0f;
+      }
+    }
+    V = builder->MatMul(
+        name + "/mha/V/expand_matmul", V,
+        *GetWeghtsConverter(expansion_matrix, {kv_heads, heads}));
+    // [batch, 64, depth, heads] -> [batch, heads, 64, depth]
+    V = builder->Transpose(name + "/mha/V/perm_after_expand", V, {0, 3, 1, 2});
+  }
+    
   flow = builder->MatMul(name + "/mha/QK/matmul", Q, K);
   flow = builder->Mul(name + "/mha/QK/scale", flow,
                       *GetScalarConverter(1.0f / sqrtf(depth)));

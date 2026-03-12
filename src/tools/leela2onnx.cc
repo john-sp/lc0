@@ -91,6 +91,8 @@ const OptionId kPolicyHead{"policy-head", "",
                            "Policy head to be used in the generated model. "
                            "Typical values are 'vanilla', 'optimistic' or "
                            "'soft', but only 'vanilla' is always available."};
+const OptionId kAltRmsNorm{"alt-rmsnorm", "",
+                           "Use alternate RMSNorm implementation."};
 
 bool ProcessParameters(OptionsParser* options) {
   options->Add<StringOption>(kInputFilenameId);
@@ -98,7 +100,7 @@ bool ProcessParameters(OptionsParser* options) {
   options->Add<StringOption>(kHloTextOutputFilenameId);
   options->Add<StringOption>(kHloProtoOutputFilenameId);
   options->Add<IntOption>(kOnnxBatchSizeId, -1, 2048) = -1;
-  options->Add<IntOption>(kOnnxOpsetId, 7, 18) = 17;
+  options->Add<IntOption>(kOnnxOpsetId, 7, 23) = 17;
   options->Add<IntOption>(kOnnxIrId, -1, 10) = -1;
   options->Add<IntOption>(kHloBatchSizeId, 1, 2048) = 333;
   options->Add<ChoiceOption>(
@@ -111,6 +113,7 @@ bool ProcessParameters(OptionsParser* options) {
   options->Add<StringOption>(kOutputValue) = "/output/value";
   options->Add<StringOption>(kOutputMlh) = "/output/mlh";
   options->Add<BoolOption>(kOnnxToPytorch) = false;
+  options->Add<BoolOption>(kAltRmsNorm) = false;
   options->Add<StringOption>(kValueHead) = "winner";
   options->Add<StringOption>(kPolicyHead) = "vanilla";
   if (!options->ProcessAllFlags()) return false;
@@ -156,6 +159,10 @@ void ConvertLeelaToOnnx() {
     // onnx2pytorch only needs an alternate layernorm-implementation, so it's
     // currently only enables that. Might need to be extended in the future.
     onnx_options.alt_layernorm = dict.Get<bool>(kOnnxToPytorch);
+    onnx_options.alt_rmsnorm = dict.Get<bool>(kAltRmsNorm);
+    if (!onnx_options.alt_rmsnorm && onnx_options.opset < 23) {
+      onnx_options.opset = 23;
+    }
     onnx_options.value_head = dict.Get<std::string>(kValueHead);
     onnx_options.policy_head = dict.Get<std::string>(kPolicyHead);
     weights_file = ConvertWeightsToOnnx(weights_file, onnx_options);
