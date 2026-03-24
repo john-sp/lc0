@@ -1429,8 +1429,10 @@ AttentionPolicyHead<DataType>::AttentionPolicyHead(
       // activations.
       act_(attention_body ? act : ACTIVATION_SELU) {
   embedding_op_size_ = weights.ip_pol_b.size();
-  wq_op_size_ = weights.ip2_pol_b.size();
-  wk_op_size_ = weights.ip3_pol_b.size();
+  wq_op_size_ = weights.ip2_pol_b.empty() ? weights.ip2_pol_w.size() / embedding_op_size_
+                                          : weights.ip2_pol_b.size();
+  wk_op_size_ = weights.ip3_pol_b.empty() ? weights.ip3_pol_w.size() / embedding_op_size_
+                                          : weights.ip3_pol_b.size();
 
   encoder_heads_ = weights.pol_encoder_head_count;
   policy_d_model_ = wq_op_size_;
@@ -1456,13 +1458,19 @@ AttentionPolicyHead<DataType>::AttentionPolicyHead(
     ReportCUDAErrors(cudaMemcpy(wqk_w_ + elements, ip3_pol_w_, size / 2,
                                 cudaMemcpyDeviceToDevice));
 
-    elements = weights.ip2_pol_b.size();
-    size = elements * sizeof(DataType) * 2;
+    elements = wq_op_size_ + wk_op_size_;
+    size = elements * sizeof(DataType);
     ReportCUDAErrors(cudaMalloc(&wqk_b_, size));
-    ReportCUDAErrors(
-        cudaMemcpy(wqk_b_, ip2_pol_b_, size / 2, cudaMemcpyDeviceToDevice));
-    ReportCUDAErrors(cudaMemcpy(wqk_b_ + elements, ip3_pol_b_, size / 2,
-                                cudaMemcpyDeviceToDevice));
+    ReportCUDAErrors(cudaMemset(wqk_b_, 0, size));
+    if (ip2_pol_b_) {
+      ReportCUDAErrors(cudaMemcpy(wqk_b_, ip2_pol_b_, wq_op_size_ * sizeof(DataType),
+                                  cudaMemcpyDeviceToDevice));
+    }
+    if (ip3_pol_b_) {
+      ReportCUDAErrors(cudaMemcpy(wqk_b_ + wq_op_size_, ip3_pol_b_,
+                                  wk_op_size_ * sizeof(DataType),
+                                  cudaMemcpyDeviceToDevice));
+    }
   }
 
   allocAndUpload<DataType>(&ip4_pol_w_, weights.ip4_pol_w, scratch);
@@ -1498,12 +1506,31 @@ EncoderBlock<DataType>::EncoderBlock(
       max_batch_size_(max_batch_size),
       use_fused_mha_(fused_mha),
       use_gemm_ex_(use_gemm_ex) {
-  mha_q_size_ = cpu_weights.mha.q_b.size();
-  mha_k_size_ = cpu_weights.mha.k_b.size();
-  mha_v_size_ = cpu_weights.mha.v_b.size();
+  mha_q_size_ = cpu_weights.mha.q_b.empty()
+                    ? cpu_weights.mha.q_w.size() / embedding_op_size_
+                    : cpu_weights.mha.q_b.size();
+  mha_k_size_ = cpu_weights.mha.k_b.empty()
+                    ? cpu_weights.mha.k_w.size() / embedding_op_size_
+                    : cpu_weights.mha.k_b.size();
+  mha_v_size_ = cpu_weights.mha.v_b.empty()
+                    ? cpu_weights.mha.v_w.size() / embedding_op_size_
+                    : cpu_weights.mha.v_b.size();
   mha_dense_size_ = cpu_weights.mha.dense_b.size();
   ffn_dense1_size_ = cpu_weights.ffn.dense1_b.size();
   ffn_dense2_size_ = cpu_weights.ffn.dense2_b.size();
+  if (mha_q_size_ % encoder_heads_ != 0) {
+    throw Exception("Q size must be divisible by attention heads.");
+  }
+  if (mha_k_size_ % (mha_q_size_ / encoder_heads_) != 0) {
+    throw Exception("K size must be divisible by attention head depth.");
+  }
+  encoder_kv_heads_ = mha_k_size_ / (mha_q_size_ / encoder_heads_);
+  if (encoder_kv_heads_ == 0 || encoder_heads_ % encoder_kv_heads_ != 0) {
+    throw Exception("KV heads must divide attention heads.");
+  }
+  if (mha_k_size_ != mha_v_size_) {
+    throw Exception("K and V sizes must match in CUDA attention backend.");
+  }
 
   allocAndUpload<DataType>(&mha_q_w, cpu_weights.mha.q_w, scratch);
   allocAndUpload<DataType>(&mha_q_b, cpu_weights.mha.q_b, scratch);
@@ -1514,8 +1541,10 @@ EncoderBlock<DataType>::EncoderBlock(
   allocAndUpload<DataType>(&mha_v_w, cpu_weights.mha.v_w, scratch);
   allocAndUpload<DataType>(&mha_v_b, cpu_weights.mha.v_b, scratch);
 
-  // big allocation to hold qkv weights one after the other
-  {
+  mha_qkv_w = nullptr;
+  mha_qkv_b = nullptr;
+  if (mha_q_size_ == mha_k_size_ && mha_q_size_ == mha_v_size_) {
+    // big allocation to hold qkv weights one after the other
     size_t elements = cpu_weights.mha.q_w.size();
     size_t size = elements * sizeof(DataType) * 3;
     ReportCUDAErrors(cudaMalloc(&mha_qkv_w, size));
@@ -1526,22 +1555,35 @@ EncoderBlock<DataType>::EncoderBlock(
     ReportCUDAErrors(cudaMemcpy(mha_qkv_w + elements * 2, mha_v_w, size / 3,
                                 cudaMemcpyDeviceToDevice));
 
-    elements = cpu_weights.mha.q_b.size();
-    size = elements * sizeof(DataType) * 3;
+    elements = mha_q_size_ * 3;
+    size = elements * sizeof(DataType);
     ReportCUDAErrors(cudaMalloc(&mha_qkv_b, size));
-    ReportCUDAErrors(
-        cudaMemcpy(mha_qkv_b, mha_q_b, size / 3, cudaMemcpyDeviceToDevice));
-    ReportCUDAErrors(cudaMemcpy(mha_qkv_b + elements, mha_k_b, size / 3,
-                                cudaMemcpyDeviceToDevice));
-    ReportCUDAErrors(cudaMemcpy(mha_qkv_b + elements * 2, mha_v_b, size / 3,
-                                cudaMemcpyDeviceToDevice));
+    ReportCUDAErrors(cudaMemset(mha_qkv_b, 0, size));
+    if (mha_q_b) {
+      ReportCUDAErrors(cudaMemcpy(mha_qkv_b, mha_q_b, mha_q_size_ * sizeof(DataType),
+                                  cudaMemcpyDeviceToDevice));
+    }
+    if (mha_k_b) {
+      ReportCUDAErrors(cudaMemcpy(mha_qkv_b + mha_q_size_, mha_k_b,
+                                  mha_k_size_ * sizeof(DataType),
+                                  cudaMemcpyDeviceToDevice));
+    }
+    if (mha_v_b) {
+      ReportCUDAErrors(cudaMemcpy(mha_qkv_b + mha_q_size_ + mha_k_size_, mha_v_b,
+                                  mha_v_size_ * sizeof(DataType),
+                                  cudaMemcpyDeviceToDevice));
+    }
   }
 
   allocAndUpload<DataType>(&mha_dense_w, cpu_weights.mha.dense_w, scratch);
   allocAndUpload<DataType>(&mha_dense_b, cpu_weights.mha.dense_b, scratch);
 
   allocAndUpload<DataType>(&ln1_gammas, cpu_weights.ln1_gammas, scratch);
-  allocAndUpload<DataType>(&ln1_betas, cpu_weights.ln1_betas, scratch);
+  if (cpu_weights.ln1_betas.empty()) {
+    ln1_betas = nullptr;
+  } else {
+    allocAndUpload<DataType>(&ln1_betas, cpu_weights.ln1_betas, scratch);
+  }
 
   allocAndUpload<DataType>(&ffn_dense1_w, cpu_weights.ffn.dense1_w, scratch);
   allocAndUpload<DataType>(&ffn_dense1_b, cpu_weights.ffn.dense1_b, scratch);
@@ -1550,7 +1592,11 @@ EncoderBlock<DataType>::EncoderBlock(
   allocAndUpload<DataType>(&ffn_dense2_b, cpu_weights.ffn.dense2_b, scratch);
 
   allocAndUpload<DataType>(&ln2_gammas, cpu_weights.ln2_gammas, scratch);
-  allocAndUpload<DataType>(&ln2_betas, cpu_weights.ln2_betas, scratch);
+  if (cpu_weights.ln2_betas.empty()) {
+    ln2_betas = nullptr;
+  } else {
+    allocAndUpload<DataType>(&ln2_betas, cpu_weights.ln2_betas, scratch);
+  }
 
   // Smolgen weights.
   if (has_smolgen_) {
@@ -1572,12 +1618,20 @@ EncoderBlock<DataType>::EncoderBlock(
 
     allocAndUpload<DataType>(&smol_ln1_gammas,
                              cpu_weights.mha.smolgen.ln1_gammas, scratch);
-    allocAndUpload<DataType>(&smol_ln1_betas, cpu_weights.mha.smolgen.ln1_betas,
-                             scratch);
+    if (cpu_weights.mha.smolgen.ln1_betas.empty()) {
+      smol_ln1_betas = nullptr;
+    } else {
+      allocAndUpload<DataType>(&smol_ln1_betas,
+                               cpu_weights.mha.smolgen.ln1_betas, scratch);
+    }
     allocAndUpload<DataType>(&smol_ln2_gammas,
                              cpu_weights.mha.smolgen.ln2_gammas, scratch);
-    allocAndUpload<DataType>(&smol_ln2_betas, cpu_weights.mha.smolgen.ln2_betas,
-                             scratch);
+    if (cpu_weights.mha.smolgen.ln2_betas.empty()) {
+      smol_ln2_betas = nullptr;
+    } else {
+      allocAndUpload<DataType>(&smol_ln2_betas,
+                               cpu_weights.mha.smolgen.ln2_betas, scratch);
+    }
 
     // GPU memory already allocated in AttentionBody.
     smol_global = smolgen_global_scratch;
@@ -1662,6 +1716,7 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
                                   cudaStream_t stream,
                                   DataType*** offset_pointers) const {
   const int d_model = mha_q_size_;
+  const int kv_d_model = mha_k_size_;
   const int depth = d_model / encoder_heads_;
 
   // Calculate smolgen weights. Do this first so we can make use of
@@ -1737,21 +1792,46 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
 
   {
     const int num_inputs = embedding_op_size_;
-    const int num_outputs = d_model;
     const int batch = N * 64;
     const int max_batch = max_batch_size_ * 64;
 
     mha_q = scratch;
-    mha_k = mha_q + num_outputs * max_batch;
-    mha_v = mha_k + num_outputs * max_batch;
+    mha_k = mha_q + d_model * max_batch;
+    mha_v = mha_k + kv_d_model * max_batch;
 
-    cublasXGemmStridedBatched<DataType>(
-        cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch, num_inputs, 1.0f,
-        mha_qkv_w, num_inputs, num_inputs * num_outputs, in_out_tensor,
-        num_inputs, 0, 0.0f, mha_q, num_outputs, num_outputs * max_batch, 3,
-        use_gemm_ex_);
-    addBiasBatched<DataType>(mha_q, mha_q, mha_qkv_b, 3, batch, num_outputs,
-                             max_batch, ACTIVATION_NONE, stream);
+    if (mha_qkv_w != nullptr) {
+      cublasXGemmStridedBatched<DataType>(
+          cublas, CUBLAS_OP_T, CUBLAS_OP_N, d_model, batch, num_inputs, 1.0f,
+          mha_qkv_w, num_inputs, num_inputs * d_model, in_out_tensor,
+          num_inputs, 0, 0.0f, mha_q, d_model, d_model * max_batch, 3,
+          use_gemm_ex_);
+      addBiasBatched<DataType>(mha_q, mha_q, mha_qkv_b, 3, batch, d_model,
+                               max_batch, ACTIVATION_NONE, stream);
+    } else {
+      cublasXgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, d_model, batch, num_inputs,
+                  1.0f, (const DataType*)mha_q_w, num_inputs, in_out_tensor,
+                  num_inputs, 0.0f, mha_q, d_model);
+      if (mha_q_b != nullptr) {
+        addBiasBatched<DataType>(mha_q, mha_q, mha_q_b, 1, batch, d_model,
+                                 ACTIVATION_NONE, stream);
+      }
+
+      cublasXgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, kv_d_model, batch,
+                  num_inputs, 1.0f, (const DataType*)mha_k_w, num_inputs,
+                  in_out_tensor, num_inputs, 0.0f, mha_k, kv_d_model);
+      if (mha_k_b != nullptr) {
+        addBiasBatched<DataType>(mha_k, mha_k, mha_k_b, 1, batch, kv_d_model,
+                                 ACTIVATION_NONE, stream);
+      }
+
+      cublasXgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, kv_d_model, batch,
+                  num_inputs, 1.0f, (const DataType*)mha_v_w, num_inputs,
+                  in_out_tensor, num_inputs, 0.0f, mha_v, kv_d_model);
+      if (mha_v_b != nullptr) {
+        addBiasBatched<DataType>(mha_v, mha_v, mha_v_b, 1, batch, kv_d_model,
+                                 ACTIVATION_NONE, stream);
+      }
+    }
   }
 
   // Apply split_heads() to q, k and v
@@ -1774,7 +1854,7 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
   float factor = 1.0f / sqrt((float)depth);
 
 #ifdef USE_CUTLASS
-  if (use_fused_mha_) {
+  if (use_fused_mha_ && encoder_kv_heads_ == encoder_heads_) {
     // TODO: check if we need skip in a different tensor than same tensor as
     // output!
     fusedMHA(buffer2, mha_q, mha_k, mha_v, has_smolgen_ ? buffer2 : nullptr, N,
@@ -1796,8 +1876,9 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
           cudaMalloc((void**)offset_pointers,
                      encoder_heads_ * max_batch_size_ * 5 * sizeof(DataType*)));
       genOffsetPointers((DataType**)*offset_pointers, encoder_heads_,
-                        max_batch_size_, depth, d_model, mha_k, mha_q, buffer1,
-                        mha_v, buffer2, stream);
+                        max_batch_size_, depth, encoder_kv_heads_, kv_d_model,
+                        d_model, mha_k, mha_q, buffer1, mha_v, buffer2,
+                        stream);
     }
 
     cublasXGemmBatched<DataType>(
@@ -1806,8 +1887,7 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
                       // transform
         factor,       // to handle "/ tf.math.sqrt(dk)"
         *offset_pointers,  // mha_k + offset /*A*/,
-        d_model /*LDA*/,   // (d_model = depth * encoder_heads_) to skip over
-                           // other "depth" slices / heads
+        kv_d_model /*LDA*/,  // to skip over other "depth" slices / heads
         // 64 * d_model,     /*strideA*/
         *offset_pointers +
             encoder_heads_ * max_batch_size_,  // mha_q + offset /*B*/,
@@ -1836,7 +1916,7 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
         cublas, CUBLAS_OP_N, CUBLAS_OP_N, depth /*M*/, 64 /*N*/, 64 /*K*/, 1.0f,
         *offset_pointers + encoder_heads_ * max_batch_size_ *
                                3,  // mha_v + offset /*A*/,  // "v" matrix
-        d_model /*LDA*/,           // to skip over other "depth" slices / heads
+        kv_d_model /*LDA*/,        // to skip over other "depth" slices / heads
         // 64 * d_model,          /*strideA*/
         *offset_pointers + encoder_heads_ * max_batch_size_ *
                                2,  // buffer1 + weightsOffset /*B*/,
@@ -2082,7 +2162,11 @@ AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,
     allocAndUpload<DataType>(&ip_emb_pre_b_, weights.ip_emb_preproc_b, scratch);
 
     allocAndUpload<DataType>(&ip_emb_ln_g_, weights.ip_emb_ln_gammas, scratch);
-    allocAndUpload<DataType>(&ip_emb_ln_b_, weights.ip_emb_ln_betas, scratch);
+    if (weights.ip_emb_ln_betas.empty()) {
+      ip_emb_ln_b_ = nullptr;
+    } else {
+      allocAndUpload<DataType>(&ip_emb_ln_b_, weights.ip_emb_ln_betas, scratch);
+    }
 
     allocAndUpload<DataType>(&ip_emb_ffn_d1_w_, weights.ip_emb_ffn.dense1_w,
                              scratch);
@@ -2096,8 +2180,12 @@ AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,
 
     allocAndUpload<DataType>(&ip_emb_ffn_ln_g_, weights.ip_emb_ffn_ln_gammas,
                              scratch);
-    allocAndUpload<DataType>(&ip_emb_ffn_ln_b_, weights.ip_emb_ffn_ln_betas,
-                             scratch);
+    if (weights.ip_emb_ffn_ln_betas.empty()) {
+      ip_emb_ffn_ln_b_ = nullptr;
+    } else {
+      allocAndUpload<DataType>(&ip_emb_ffn_ln_b_, weights.ip_emb_ffn_ln_betas,
+                               scratch);
+    }
 
     // 12 is the number of input channels used for the input encoding.
     embedding_dense_size_ = weights.ip_emb_preproc_b.size() / 64;

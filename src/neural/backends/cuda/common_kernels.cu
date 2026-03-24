@@ -990,34 +990,43 @@ __global__ void layer_norm_kernel(int N, int C, T* output, const T* input,
     }
   }
 
-  // 1. Compute mean
+  const bool rms_norm = betas == nullptr;
+
+  // 1. Compute mean or mean square.
   float s = 0;
   if (!oobThread)
     if (skip != nullptr) {
       for (int i = 0; i < 16; i++) {
         val[i] = activate(val[i], act) * alpha + oth[i];
-        s += val[i];
+        s += rms_norm ? val[i] * val[i] : val[i];
       }
     } else {
       for (int i = 0; i < 16; i++) {
         val[i] = activate(val[i], act) * alpha;
-        s += val[i];
+        s += rms_norm ? val[i] * val[i] : val[i];
       }
     }
 
   s = shared_sum_for_layer_norm(s);
-  float mean = s / C;
+  float mean = 0.0f;
+  float inv_stddev = 0.0f;
+  if (rms_norm) {
+    inv_stddev = rsqrtf(s / C + ep);
+  } else {
+    mean = s / C;
 
-  // 2. Compute varience
-  s = 0;
-  if (!oobThread)
-    for (int i = 0; i < 16; i++) {
-      float d = val[i] - mean;
-      float d_sq = d * d;
-      s += d_sq;
-    }
-  s = shared_sum_for_layer_norm(s);
-  float var = s / C;
+    // 2. Compute varience.
+    s = 0;
+    if (!oobThread)
+      for (int i = 0; i < 16; i++) {
+        float d = val[i] - mean;
+        float d_sq = d * d;
+        s += d_sq;
+      }
+    s = shared_sum_for_layer_norm(s);
+    float var = s / C;
+    inv_stddev = rsqrtf(var + ep);
+  }
 
   if (!oobThread) {
     // Load from memory (16 elements a time)
@@ -1037,30 +1046,31 @@ __global__ void layer_norm_kernel(int N, int C, T* output, const T* input,
 
   // 3. Normalize
   for (int i = 0; i < 16; i++) {
-    float d = val[i] - mean;
-    float norm = d / sqrt(var + ep);
+    float norm = rms_norm ? val[i] * inv_stddev : (val[i] - mean) * inv_stddev;
     float op = norm * oth[i];
     val[i] = op;
   }
 
-  if (!oobThread) {
-    // Load from memory (16 elements a time)
-    if (fp16) {
-      half inp[8];
-      copyAs<uint4>(&inp[0], &betas[biasIndex]);
-      for (int i = 0; i < 8; i++) oth[i] = (float)inp[i];
-      copyAs<uint4>(&inp[0], &betas[biasIndex + 8]);
-      for (int i = 0; i < 8; i++) oth[i + 8] = (float)inp[i];
-    } else {
-      copyAs<uint4>(&oth[0], &betas[biasIndex]);
-      copyAs<uint4>(&oth[4], &betas[biasIndex + 4]);
-      copyAs<uint4>(&oth[8], &betas[biasIndex + 8]);
-      copyAs<uint4>(&oth[12], &betas[biasIndex + 12]);
+  if (!rms_norm) {
+    if (!oobThread) {
+      // Load from memory (16 elements a time)
+      if (fp16) {
+        half inp[8];
+        copyAs<uint4>(&inp[0], &betas[biasIndex]);
+        for (int i = 0; i < 8; i++) oth[i] = (float)inp[i];
+        copyAs<uint4>(&inp[0], &betas[biasIndex + 8]);
+        for (int i = 0; i < 8; i++) oth[i + 8] = (float)inp[i];
+      } else {
+        copyAs<uint4>(&oth[0], &betas[biasIndex]);
+        copyAs<uint4>(&oth[4], &betas[biasIndex + 4]);
+        copyAs<uint4>(&oth[8], &betas[biasIndex + 8]);
+        copyAs<uint4>(&oth[12], &betas[biasIndex + 12]);
+      }
     }
-  }
 
-  for (int i = 0; i < 16; i++) {
-    val[i] += oth[i];
+    for (int i = 0; i < 16; i++) {
+      val[i] += oth[i];
+    }
   }
 
   if (!oobThread) {
@@ -1282,21 +1292,28 @@ void applyInputGating(T* output, const T* input, const T* mult, const T* add,
 
 template <typename T, int kWorkPerThread>
 __global__ void genOffsetPointers_kernel(T** offsets, int heads, int block_size,
-                                         int depth, int d_model, T* k, T* q,
-                                         T* b1, T* v, T* b2) {
+                                         int depth, int kv_heads, int k_stride,
+                                         int q_stride, T* k, T* q, T* b1, T* v,
+                                         T* b2) {
   const int i = (blockIdx.x * blockDim.x + threadIdx.x) * kWorkPerThread;
   if (i >= block_size) return;
-  const int h = i % heads;
-  const int n = i / heads;
+  const int kv_group_size = heads / kv_heads;
   int w;
   T* res[kWorkPerThread];
   for (w = 0; w < kWorkPerThread; w++) {
-    res[w] = k + h * depth + 64 * d_model * n + w * depth;
+    const int idx = i + w;
+    const int h = idx % heads;
+    const int n = idx / heads;
+    const int kv_h = h / kv_group_size;
+    res[w] = k + kv_h * depth + 64 * k_stride * n;
     offsets[i + w] = res[w];
   }
 
   for (w = 0; w < kWorkPerThread; w++) {
-    res[w] = q + h * depth + 64 * d_model * n + w * depth;
+    const int idx = i + w;
+    const int h = idx % heads;
+    const int n = idx / heads;
+    res[w] = q + h * depth + 64 * q_stride * n;
     offsets[i + w + block_size] = res[w];
   }
 
@@ -1306,19 +1323,27 @@ __global__ void genOffsetPointers_kernel(T** offsets, int heads, int block_size,
   }
 
   for (w = 0; w < kWorkPerThread; w++) {
-    res[w] = v + h * depth + 64 * d_model * n + w * depth;
+    const int idx = i + w;
+    const int h = idx % heads;
+    const int n = idx / heads;
+    const int kv_h = h / kv_group_size;
+    res[w] = v + kv_h * depth + 64 * k_stride * n;
     offsets[i + w + 3 * block_size] = res[w];
   }
 
   for (w = 0; w < kWorkPerThread; w++) {
-    res[w] = b2 + h * depth + 64 * d_model * n + w * depth;
+    const int idx = i + w;
+    const int h = idx % heads;
+    const int n = idx / heads;
+    res[w] = b2 + h * depth + 64 * q_stride * n;
     offsets[i + w + 4 * block_size] = res[w];
   }
 }
 
 template <typename T>
 void genOffsetPointers(T** offsets, int heads, int max_batch, int depth,
-                       int d_model, T* k, T* q, T* b1, T* v, T* b2,
+                       int kv_heads, int k_stride, int q_stride, T* k, T* q,
+                       T* b1, T* v, T* b2,
                        cudaStream_t stream) {
   const int block_size = heads * max_batch;
   // Process two elements per thread to use 128 bit store instructions.
@@ -1328,13 +1353,15 @@ void genOffsetPointers(T** offsets, int heads, int max_batch, int depth,
     // Handle odd block sizes.
     int grid = DivUp(block_size, kWorkGroupSize);
     genOffsetPointers_kernel<T, 1><<<grid, kWorkGroupSize, 0, stream>>>(
-        offsets, heads, block_size, depth, d_model, k, q, b1, v, b2);
+        offsets, heads, block_size, depth, kv_heads, k_stride, q_stride, k, q,
+        b1, v, b2);
   } else {
     // Handle even block size
     int grid = DivUp(block_size, kWorkGroupSize * kWorkPerThread);
     genOffsetPointers_kernel<T, kWorkPerThread>
-        <<<grid, kWorkGroupSize, 0, stream>>>(offsets, heads, block_size, depth,
-                                              d_model, k, q, b1, v, b2);
+        <<<grid, kWorkGroupSize, 0, stream>>>(
+            offsets, heads, block_size, depth, kv_heads, k_stride, q_stride, k,
+            q, b1, v, b2);
   }
 }
 
@@ -1647,12 +1674,14 @@ template void applyInputGating<float>(float* output, const float* input,
                                       cudaStream_t stream);
 
 template void genOffsetPointers<float>(float** offsets, int heads,
-                                       int max_batch, int depth, int d_model,
-                                       float* k, float* q, float* b1, float* v,
-                                       float* b2, cudaStream_t stream);
+                                       int max_batch, int depth, int kv_heads,
+                                       int k_stride, int q_stride, float* k,
+                                       float* q, float* b1, float* v, float* b2,
+                                       cudaStream_t stream);
 template void genOffsetPointers<half>(half** offsets, int heads, int max_batch,
-                                      int depth, int d_model, half* k, half* q,
-                                      half* b1, half* v, half* b2,
+                                      int depth, int kv_heads, int k_stride,
+                                      int q_stride, half* k, half* q, half* b1,
+                                      half* v, half* b2,
                                       cudaStream_t stream);
 }  // namespace cudnn_backend
 }  // namespace lczero

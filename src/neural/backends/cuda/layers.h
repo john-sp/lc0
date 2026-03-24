@@ -380,6 +380,7 @@ class EncoderBlock {
 
   int embedding_op_size_;
   int encoder_heads_;
+  int encoder_kv_heads_;
 
   float alpha_;  // scale to apply to skip connection add
   float default_eps_;  // value of epsilon where it wasn't specified in training

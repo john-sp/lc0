@@ -52,18 +52,26 @@ class CudnnNetwork;
 static size_t getMaxAttentionHeadSize(
     const MultiHeadWeights::PolicyHead& weights, int N) {
   const size_t embedding_op_size = weights.ip_pol_b.size();
-  const size_t policy_d_model = weights.ip2_pol_b.size();
-  assert(policy_d_model == weights.ip3_pol_b.size());
+  const size_t policy_d_model = weights.ip2_pol_b.empty()
+                                    ? weights.ip2_pol_w.size() / embedding_op_size
+                                    : weights.ip2_pol_b.size();
+  const size_t policy_k_d_model = weights.ip3_pol_b.empty()
+                                      ? weights.ip3_pol_w.size() / embedding_op_size
+                                      : weights.ip3_pol_b.size();
 
   size_t encoder_d_model = 0;
+  size_t encoder_k_d_model = 0;
   size_t encoder_dff = 0;
 
   if (weights.pol_encoder.size() > 0) {
-    encoder_d_model = weights.pol_encoder[0].mha.q_b.size();
+    encoder_d_model = weights.pol_encoder[0].mha.q_b.empty()
+                          ? weights.pol_encoder[0].mha.q_w.size() / embedding_op_size
+                          : weights.pol_encoder[0].mha.q_b.size();
+    encoder_k_d_model = weights.pol_encoder[0].mha.k_b.empty()
+                            ? weights.pol_encoder[0].mha.k_w.size() / embedding_op_size
+                            : weights.pol_encoder[0].mha.k_b.size();
     encoder_dff = weights.pol_encoder[0].ffn.dense1_b.size();
 
-    assert(encoder_d_model == weights.pol_encoder[0].mha.k_b.size());
-    assert(encoder_d_model == weights.pol_encoder[0].mha.v_b.size());
     assert(embedding_op_size == weights.pol_encoder[0].ffn.dense2_b.size());
   }
 
@@ -71,14 +79,15 @@ static size_t getMaxAttentionHeadSize(
 
   size_t size =
       N * 64 *
-      std::max(std::max(embedding_op_size, encoder_dff), policy_d_model);
+      std::max(std::max(std::max(embedding_op_size, encoder_dff), policy_d_model),
+               policy_k_d_model);
 
   // size of matmul_qk matrix = encoder_heads_ * Batch * 64 * 64
   const size_t matmul_qk_size = encoder_heads * N * 64 * 64;
   const size_t output_size = N * (64 * 64 + 8 * 24);
   size = std::max(size, std::max(matmul_qk_size, output_size));
 
-  size_t qkv_size = N * 64 * encoder_d_model;
+  size_t qkv_size = N * 64 * std::max(encoder_d_model, encoder_k_d_model);
   // We store qkv in single allocation, and other intermediate tensors are
   // sometimes stored by splitting an allocation into two halves.
   size = std::max(2 * size, 3 * qkv_size);

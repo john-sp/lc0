@@ -161,7 +161,8 @@ void applyInputGating(T* output, const T* input, const T* mult, const T* add,
 
 template <typename T>
 void genOffsetPointers(T** offsets, int heads, int max_batch, int depth,
-                       int d_model, T* k, T* q, T* b1, T* v, T* b2,
+                       int kv_heads, int k_stride, int q_stride, T* k, T* q,
+                       T* b1, T* v, T* b2,
                        cudaStream_t stream);
 
 void fusedMHA(void* output, void* mha_q, void* mha_k, void* mha_v, void* skip,
