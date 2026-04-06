@@ -52,7 +52,7 @@ class SearchParams : public classic::BaseSearchParams {
   float GetUncertaintyWeightingCoefficient() const {
     return options_.Get<float>(kUncertaintyWeightingCoefficientId);
   }
-  int GetUncertaintyWeightingExponents() const {
+  float GetUncertaintyWeightingExponents() const {
     return options_.Get<float>(kUncertaintyWeightingExponentId);
   }
 
