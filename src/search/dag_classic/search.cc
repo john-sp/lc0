@@ -43,6 +43,7 @@
 #include "utils/fastmath.h"
 #include "utils/random.h"
 #include "utils/spinhelper.h"
+#include "utils/trace.h"
 
 namespace lczero {
 namespace dag_classic {
@@ -720,12 +721,14 @@ Eval Search::GetBestEval(Move* move, bool* is_terminal) const {
   float parent_wl = -root_node_->GetWL();
   float parent_d = root_node_->GetD();
   float parent_m = root_node_->GetM();
-  if (!root_node_->HasChildren()) return {parent_wl, parent_d, parent_m};
+  float parent_e = root_node_->GetE();
+  if (!root_node_->HasChildren())
+    return {parent_wl, parent_d, parent_m, parent_e};
   EdgeAndNode best_edge = GetBestChildNoTemperature(root_node_, 0);
   if (move) *move = best_edge.GetMove(played_history_.IsBlackToMove());
   if (is_terminal) *is_terminal = best_edge.IsTerminal();
   return {best_edge.GetWL(parent_wl), best_edge.GetD(parent_d),
-          best_edge.GetM(parent_m - 1) + 1};
+          best_edge.GetM(parent_m - 1) + 1, best_edge.GetE()};
 }
 
 std::pair<Move, Move> Search::GetBestMove() {
@@ -1331,6 +1334,7 @@ void SearchWorker::ExecuteOneIteration() {
 // 1. Initialize internal structures.
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 void SearchWorker::InitializeIteration() {
+  LCTRACE_FUNCTION_SCOPE;
   // Free the old computation before allocating a new one. This works better
   // when backend caches buffer allocations between computations.
   computation_.reset();
@@ -1365,6 +1369,7 @@ int CalculateCollisionsLeft(int64_t nodes, const SearchParams& params) {
 }  // namespace
 
 void SearchWorker::GatherMinibatch() {
+  LCTRACE_FUNCTION_SCOPE;
   // Total number of nodes to process.
   int minibatch_size = 0;
   int cur_n = 0;
@@ -1677,6 +1682,7 @@ void SearchWorker::PickNodesToExtendTask(
     const BackupPath& path, int collision_limit, PositionHistory& history,
     std::vector<NodeToProcess>* receiver,
     TaskWorkspace* workspace) NO_THREAD_SAFETY_ANALYSIS {
+  LCTRACE_FUNCTION_SCOPE;
   assert(path.size() == (size_t)history.GetLength() -
                             search_->played_history_.GetLength() + 1);
 
@@ -2125,6 +2131,7 @@ void SearchWorker::RunNNComputation() {
 // 5. Retrieve NN computations (and terminal values) into nodes.
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 void SearchWorker::FetchMinibatchResults() {
+  LCTRACE_FUNCTION_SCOPE;
   // Populate NN/cached results, or terminal results, into nodes.
   for (auto& node_to_process : minibatch_) {
     FetchSingleNodeResult(&node_to_process);
@@ -2168,6 +2175,7 @@ void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process) {
 // 6. Propagate the new nodes' information to all their parents in the tree.
 // ~~~~~~~~~~~~~~
 void SearchWorker::DoBackupUpdate() {
+  LCTRACE_FUNCTION_SCOPE;
   // Nodes mutex for doing node updates.
   SharedMutex::Lock lock(search_->nodes_mutex_);
 
@@ -2488,6 +2496,7 @@ bool SearchWorker::MaybeSetBounds(Node* p, float m, uint32_t* n_to_fix,
 // 7. Update the Search's status and progress information.
 //~~~~~~~~~~~~~~~~~~~~
 void SearchWorker::UpdateCounters() {
+  LCTRACE_FUNCTION_SCOPE;
   search_->PopulateCommonIterationStats(&iteration_stats_);
   search_->MaybeTriggerStop(iteration_stats_, &latest_time_manager_hints_);
   search_->MaybeOutputInfo(iteration_stats_);

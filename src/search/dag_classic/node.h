@@ -715,6 +715,9 @@ class EdgeAndNode {
   float GetD(float default_d) const {
     return (node_ && node_->GetN() > 0) ? node_->GetD() : default_d;
   }
+  float GetE() const {
+    return (node_ && node_->GetN() > 0) ? node_->GetE() : 0;
+  }
   float GetM(float default_m) const {
     return (node_ && node_->GetN() > 0) ? node_->GetM() : default_m;
   }
