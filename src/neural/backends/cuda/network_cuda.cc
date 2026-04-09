@@ -940,6 +940,13 @@ class CudaNetwork : public Network {
     network_[l++]->Eval(batchSize, (DataType*)opVal, flow, spare2, scratch_mem,
                         scratch_size_, nullptr, cublas,
                         compute_stream);  // value head
+    if (!(moves_left_ || wdl_err_) && !multi_stream_) {
+#if CUDA_GRAPH_SUPPORTS_EXTERNAL_EVENTS
+      ReportCUDAErrors(
+          cudaEventRecordWithFlags(compute_ordering_event_, compute_stream,
+                                   capture ? cudaEventRecordExternal : 0));
+#endif
+    }
     ReportCUDAErrors(cudaEventRecord(io->value_done_event_, compute_stream));
     ReportCUDAErrors(
         cudaStreamWaitEvent(download_stream, io->value_done_event_, 0));
@@ -962,6 +969,13 @@ class CudaNetwork : public Network {
                           scratch_mem, scratch_size_, nullptr, cublas,
                           compute_stream);  // value error head
 
+      if (!moves_left_ && !multi_stream_) {
+#if CUDA_GRAPH_SUPPORTS_EXTERNAL_EVENTS
+        ReportCUDAErrors(
+            cudaEventRecordWithFlags(compute_ordering_event_, compute_stream,
+                                     capture ? cudaEventRecordExternal : 0));
+#endif
+      }
       ReportCUDAErrors(
           cudaEventRecord(io->value_err_done_event_, compute_stream));
       ReportCUDAErrors(
@@ -986,15 +1000,13 @@ class CudaNetwork : public Network {
       network_[l++]->Eval(batchSize, (DataType*)opMov, spare2, nullptr,
                           scratch_mem, scratch_size_, nullptr, cublas,
                           compute_stream);
-    }
-    if (!multi_stream_) {
+      if (!multi_stream_) {
 #if CUDA_GRAPH_SUPPORTS_EXTERNAL_EVENTS
-      ReportCUDAErrors(
-          cudaEventRecordWithFlags(compute_ordering_event_, compute_stream,
-                                   capture ? cudaEventRecordExternal : 0));
+        ReportCUDAErrors(
+            cudaEventRecordWithFlags(compute_ordering_event_, compute_stream,
+                                     capture ? cudaEventRecordExternal : 0));
 #endif
-    }
-    if (moves_left_) {
+      }
       ReportCUDAErrors(
           cudaEventRecord(io->moves_left_done_event_, compute_stream));
       ReportCUDAErrors(
