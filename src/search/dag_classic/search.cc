@@ -790,11 +790,11 @@ inline double WDLRescale(T& v, T& d, float wdl_rescale_ratio,
   if (use_threshold) {
     // Keep centipawn scores within resonable limits when l or d becomes close
     // to zero.
-    const float wl_threshold = 0.006f;
-    const float d_threshold = 0.0004875f;
-    w = std::max(w, wl_threshold);
-    l = std::max(l, wl_threshold);
-    d = std::max(d, d_threshold);
+    const double wl_threshold = 0.006;
+    const double d_threshold = 0.0004875;
+    w = std::max<double>(w, wl_threshold);
+    l = std::max<double>(l, wl_threshold);
+    d = std::max<double>(d, d_threshold);
     const float scale = 1.0f / (w + l + d);
     w *= scale;
     l *= scale;
@@ -2204,14 +2204,17 @@ SearchWorker::PickNodesToExtendTask(int collision_limit, int tid,
   const bool visit_root = stop_root && node->TryStartScoreUpdate();
   const size_t starting_path_size = current_path.size();
   current_path.emplace_back(collision_limit, true, visit_root, stop_root, 0);
+  // take base sqrt(2) logarithm of root node for large subbranch N limit. It is
+  // used to split tasks.
+  const unsigned large_branch_limit = std::bit_width(search_->root_node_->GetN()) * 2;
   while (current_path.size() > starting_path_size) {
     assert(!full_path.empty());
-    int cur_limit = current_path.back().bits_.visits_;
+    int cur_limit = current_path.back().visits_;
     // First prepare visits_to_perform.
     // First check if node is terminal or not-expanded.  If either than create
     // a collision of appropriate size and pop current_path.
-    if (current_path.back().bits_.stop_picking_) {
-      if (current_path.back().bits_.visit_child_) {
+    if (current_path.back().stop_picking_) {
+      if (current_path.back().visit_child_) {
         Visit(full_path, history);
         cur_limit -= 1;
       }
@@ -2228,7 +2231,7 @@ SearchWorker::PickNodesToExtendTask(int collision_limit, int tid,
       max_limit = 0;
       bool saved_is_last_child;
       do {
-        saved_is_last_child = current_path.back().bits_.last_child_;
+        saved_is_last_child = current_path.back().last_child_;
         current_path.pop_back();
         if (current_path.size() == starting_path_size) break;
         history.Pop();
@@ -2377,7 +2380,7 @@ SearchWorker::PickNodesToExtendTask(int collision_limit, int tid,
         // We have already checked this child. We can use simplified process to
         // add more visits to the node.
         if (already_visited) {
-          if (visits_to_perform[best_idx].bits_.stop_picking_) {
+          if (visits_to_perform[best_idx].stop_picking_) {
             // We found a collision. All remaining visits go here.
             visits_to_perform[best_idx] += cur_limit;
             cur_limit = 0;
@@ -2399,12 +2402,14 @@ SearchWorker::PickNodesToExtendTask(int collision_limit, int tid,
         auto [child_repetitions, child_moves_left] =
             GetRepetitions(full_path.size(), history.Last(), params_);
         full_path.push_back({child_node, child_repetitions, child_moves_left});
+        visits_to_perform[best_idx].large_branch_ =
+            child_node->GetN() > large_branch_limit;
         if (child_node->TryStartScoreUpdate()) {
           current_nstarted[best_idx]++;
           new_visits -= 1;
           if (ShouldStopPickingHere(child_node, false, child_repetitions)) {
-            visits_to_perform[best_idx].bits_.visit_child_ = 1;
-            visits_to_perform[best_idx].bits_.stop_picking_ = 1;
+            visits_to_perform[best_idx].visit_child_ = 1;
+            visits_to_perform[best_idx].stop_picking_ = 1;
           } else {
             child_node->IncrementNInFlight(new_visits);
             current_nstarted[best_idx] += new_visits;
@@ -2415,7 +2420,7 @@ SearchWorker::PickNodesToExtendTask(int collision_limit, int tid,
         } else {
           // We found a collision. Remaining visits go here.
           visits_to_perform[best_idx] += cur_limit;
-          visits_to_perform[best_idx].bits_.stop_picking_ = 1;
+          visits_to_perform[best_idx].stop_picking_ = 1;
           cur_limit = 0;
           // Collision will take all future visits. The collision can expand
           // based on the parent limit.
@@ -2444,8 +2449,10 @@ SearchWorker::PickNodesToExtendTask(int collision_limit, int tid,
       // tree walk to get there. We don't split tasks when remaining limit is
       // too low compared to the cost of scheduling tasks.
       int task_workers = search_->state_.task_queue_.Size();
+      const bool is_large_main_branch = visits_to_perform[0].large_branch_;
       if (task_workers > 0 &&
-          collision_left >= params_.GetMinimumRemainingWorkSizeForPicking()) {
+          (!is_large_main_branch ||
+           collision_left >= params_.GetMinimumRemainingWorkSizeForPicking())) {
         // Queue all branches to taks if they are idling.
         const int kLowUtilizationLimit =
             params_.GetMinimumRemainingWorkSizeForPicking() * task_workers;
@@ -2456,9 +2463,16 @@ SearchWorker::PickNodesToExtendTask(int collision_limit, int tid,
         const int kMinimumSize =
             low_task_utilization ? 0 : params_.GetMinimumWorkSizeForPicking();
 
+        auto IsBranchWorthSplitting = [&](CurrentPath v) {
+          bool is_large_branch = v.large_branch_;
+          return !v.stop_picking_ && ((is_large_main_branch && is_large_branch) ||
+              ((is_large_main_branch || is_large_branch) && v > kMinimumSize) ||
+              v >= params_.GetMinimumRemainingWorkSizeForPicking());
+        };
+
         int task_count = std::count_if(
             visits_to_perform.begin() + 1, end, [=](CurrentPath v) {
-              return !v.bits_.stop_picking_ && v >= kMinimumSize;
+              return IsBranchWorthSplitting(v);
             });
 
         TaskArray<PickTaskGather> tasks(task_count);
@@ -2471,13 +2485,13 @@ SearchWorker::PickNodesToExtendTask(int collision_limit, int tid,
               visits_to_perform.begin() + 1, end, visits_to_perform.begin() + 1,
               [&](CurrentPath v) {
                 // Don't split if not expanded or terminal.
-                if (!v.bits_.stop_picking_ && v >= kMinimumSize) {
-                  int i = v.bits_.index_;
+                if (IsBranchWorthSplitting(v)) {
+                  int i = v.index_;
                   Node* child_node =
                       cur_iters[i].GetOrSpawnNode(/* parent */ node);
                   Move move = cur_iters[i].GetMove();
                   tasks.emplace_back(*this, gather_init, child_node, move,
-                                     int(v.bits_.visits_));
+                                     int(v.visits_));
                   return false;
                 }
                 return true;
@@ -2489,7 +2503,7 @@ SearchWorker::PickNodesToExtendTask(int collision_limit, int tid,
         // happens.
         auto rend = visits_to_perform.rend();
         auto rbegin = rend - std::distance(visits_to_perform.begin(), end);
-        rbegin->bits_.last_child_ = 1;
+        rbegin->last_child_ = 1;
         std::copy(rbegin, rend, std::back_inserter(current_path));
 
         // Queue tasks to workers. First we need to count tasks outstanding
@@ -2501,7 +2515,7 @@ SearchWorker::PickNodesToExtendTask(int collision_limit, int tid,
       } else {
         auto rend = visits_to_perform.rend();
         auto rbegin = rend - std::distance(visits_to_perform.begin(), end);
-        rbegin->bits_.last_child_ = 1;
+        rbegin->last_child_ = 1;
         // The last insertion should be the child with the most visits. This
         // makes it more likely that we generate task quickly for worker
         // threads.
@@ -2514,7 +2528,7 @@ SearchWorker::PickNodesToExtendTask(int collision_limit, int tid,
     // the last element in the curren_path stack.
     if (current_path.size() > starting_path_size) {
       assert(!full_path.empty());
-      unsigned index = current_path.back().bits_.index_;
+      unsigned index = current_path.back().index_;
       assert(index < node->GetNumEdges());
       auto child = node->Edges();
       std::advance(child, index);
@@ -2731,7 +2745,7 @@ void SearchWorker::ExtendNode(NodeToProcess& picked_node,
 void SearchWorker::RunNNComputation() {
   if (computation_->UsedBatchSize() > 0) {
     int old = search_->backend_waiting_counter_.fetch_add(1, std::memory_order_relaxed);
-    assert(old <= search_->thread_count_);
+    assert(old <= search_->total_workers_);
     std::ignore = old;
     computation_->ComputeBlocking([&](ComputationEvent event) {
       assert(event == ComputationEvent::FIRST_BACKEND_IDLE);
@@ -2887,6 +2901,7 @@ bool SearchWorker::MaybeAdjustForTerminalOrTransposition(
 void SearchWorker::DoBackupUpdateSingleNode(
     const NodeToProcess& node_to_process, const BackupPath& path)
     REQUIRES(search_->nodes_mutex_) {
+  LCTRACE_FUNCTION_SCOPE;
   auto [n, nr, nm] = path.back();
   if (node_to_process.nn_queried) {
 #ifdef FIX_TT
