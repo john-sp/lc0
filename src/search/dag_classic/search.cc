@@ -2810,9 +2810,6 @@ void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process,
 // ~~~~~~~~~~~~~~
 void SearchWorker::DoBackupUpdate() {
   LCTRACE_FUNCTION_SCOPE;
-  // Start task workers early. This leaves scheduler a little extra time if it
-  // needs to wake up a new CPU core.
-  search_->state_.task_queue_.ActivateTasks();
   // Nodes mutex for doing node updates.
   SharedMutex::Lock lock(search_->nodes_mutex_);
   auto& tc = search_->thread_count_;
@@ -2839,6 +2836,9 @@ void SearchWorker::DoBackupUpdate() {
   for (const NodeToProcess& node_to_process : state_.minibatch_) {
     DoBackupUpdateSingleNode(node_to_process, GetMinibatchPath(i++));
   }
+  // Start task workers early. This leaves scheduler a little extra time if it
+  // needs to wake up a new CPU core.
+  search_->state_.task_queue_.ActivateTasks();
   if (!work_done) return;
   search_->total_batches_ += 1;
 }
