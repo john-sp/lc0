@@ -2055,6 +2055,7 @@ int SearchWorker::AddCollisions(int collisions) {
 }
 
 void SearchWorker::CancelCollisionsTask(int start, int end, bool stop) {
+  LCTRACE_FUNCTION_SCOPE;
   if (stop) {
     search_->state_.task_queue_.DeactivateTasks();
   }
