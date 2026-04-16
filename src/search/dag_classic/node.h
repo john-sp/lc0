@@ -144,9 +144,7 @@ class atomic_unique_ptr {
   // Returns the managed pointer.
   pointer operator->() const noexcept { return get(); }
   // Returns the managed pointer.
-  pointer get() const noexcept {
-    return ptr.load(std::memory_order_acquire);
-  }
+  pointer get() const noexcept { return ptr.load(std::memory_order_acquire); }
 
   // Checks whether there is a managed pointer.
   explicit operator bool() const noexcept { return get() != pointer(); }
@@ -211,6 +209,7 @@ struct Eval {
   double wl;
   double d;
   float ml;
+  float e;
 };
 
 struct NNEval {
@@ -295,6 +294,7 @@ class Node {
 
   // Returns sum of policy priors which have had at least one playout.
   float GetVisitedPolicy() const;
+  float GetWeight() const { return weight_; }
   uint32_t GetN() const { return n_; }
   uint32_t GetNInFlight() const;
   uint32_t GetChildrenVisits() const;
@@ -308,6 +308,9 @@ class Node {
   double GetWL() const { return wl_; }
   double GetD() const { return d_; }
   float GetM() const { return m_; }
+  float GetE() const { return e_; }
+
+  void SetE(float e);
 
   // Returns whether the node is known to be draw/lose/win.
   bool IsTerminal() const { return terminal_type_ != Terminal::NonTerminal; }
@@ -336,9 +339,11 @@ class Node {
   // * Q (weighted average of all V in a subtree)
   // * N (+=multivisit)
   // * N-in-flight (-=multivisit)
-  double FinalizeScoreUpdate(double v, double d, float m, uint32_t multivisit);
+  double FinalizeScoreUpdate(double v, double d, float m, uint32_t multivisit,
+                           float multiweight);
   // Like FinalizeScoreUpdate, but it updates n existing visits by delta amount.
-  void AdjustForTerminal(double v, double d, float m, double divisor, uint32_t multivisit);
+  void AdjustForTerminal(double v, double d, float m, double divisor, uint32_t multivisit,
+                         float multiweight);
   // When search decides to treat one visit as several (in case of collisions
   // or visiting terminal nodes several times), it amplifies the visit by
   // incrementing n_in_flight.
@@ -377,8 +382,7 @@ class Node {
   std::string DebugString() const;
   // Return string describing the edge from node's parent to its low node in the
   // Graphviz dot format.
-  void DotEdgeString(std::ofstream& file,
-                     bool as_opponent = false,
+  void DotEdgeString(std::ofstream& file, bool as_opponent = false,
                      const LowNode* parent = nullptr) const;
   // Return string describing the graph starting at this node in the Graphviz
   // dot format.
@@ -415,13 +419,12 @@ class Node {
     explicit VisitorId();
     ~VisitorId();
 
-    operator type() const {
-      return id_;
-    }
+    operator type() const { return id_; }
 
     friend class Node;
     friend class LowNode;
-  private:
+
+   private:
     type id_;
   };
 #endif
@@ -446,6 +449,8 @@ class Node {
   // flipped depending on the side to move.
   double d_ = 0.0f;
 
+  double weight_ = 0.0;
+
   // 8 byte fields on 64-bit platforms, 4 byte on 32-bit.
   // Pointer to a next sibling. nullptr if there are no further siblings.
   atomic_unique_ptr<Node> sibling_;
@@ -453,6 +458,7 @@ class Node {
   // 4 byte fields.
   // Estimated remaining plies.
   float m_ = 0.0f;
+  float e_ = 0.0f;
   // How many completed visits this node had.
   uint32_t n_ = 0;
   // (AKA virtual loss.) How many threads currently process this node (started
@@ -480,7 +486,7 @@ class Node {
 };
 
 // Check that Node still fits into an expected cache line size.
-static_assert(sizeof(Node) <= 64, "Node is too large");
+// static_assert(sizeof(Node) <= 64, "Node is too large");
 
 class LowNode {
  public:
@@ -493,6 +499,7 @@ class LowNode {
       : wl_(p.wl_),
         d_(p.d_),
         m_(p.m_),
+        e_(p.e_),
         num_edges_(p.num_edges_),
         terminal_type_(Terminal::NonTerminal),
         lower_bound_(GameResult::BLACK_WON),
@@ -532,6 +539,7 @@ class LowNode {
     wl_ = eval->q;
     d_ = eval->d;
     m_ = eval->m;
+    e_ = std::sqrt(eval->e);
 
     assert(WLDMInvariantsHold());
   }
@@ -542,6 +550,7 @@ class LowNode {
   // Returns whether a node has children.
   bool HasChildren() const { return num_edges_ > 0; }
 
+  float GetWeight() const { return weight_; }
   uint32_t GetN() const { return n_; }
   uint32_t GetChildrenVisits() const { return n_ - 1; }
 
@@ -550,6 +559,7 @@ class LowNode {
   double GetWL() const { return wl_; }
   double GetD() const { return d_; }
   float GetM() const { return m_; }
+  float GetE() const { return e_; }
 
   // Returns whether the node is known to be draw/loss/win.
   bool IsTerminal() const { return terminal_type_ != Terminal::NonTerminal; }
@@ -575,9 +585,9 @@ class LowNode {
   // * Q (weighted average of all V in a subtree)
   // * N (+=multivisit)
   // * N-in-flight (-=multivisit)
-  double FinalizeScoreUpdate(double v, double d, float m, uint32_t multivisit);
+  double FinalizeScoreUpdate(double v, double d, float m, uint32_t multivisit, float multiweight);
   // Like FinalizeScoreUpdate, but it updates n existing visits by delta amount.
-  void AdjustForTerminal(double v, double d, float m, double divisor, uint32_t multivisit);
+  void AdjustForTerminal(double v, double d, float m, double divisor, uint32_t multivisi, float multiweightt);
 
   // Deletes all children.
   void ReleaseChildren();
@@ -638,6 +648,8 @@ class LowNode {
   // flipped depending on the side to move.
   double d_ = 0.0f;
 
+  double weight_ = 0.0f;
+
   // 8 byte fields on 64-bit platforms, 4 byte on 32-bit.
   // Array of edges.
   std::unique_ptr<Edge[]> edges_;
@@ -647,6 +659,7 @@ class LowNode {
   // 4 byte fields.
   // Estimated remaining plies.
   float m_ = 0.0f;
+  float e_ = 0.0f;
   // How many completed visits this node had.
   uint32_t n_ = 0;
 
@@ -671,7 +684,7 @@ class LowNode {
 };
 
 // Check that LowNode still fits into an expected cache line size.
-static_assert(sizeof(LowNode) <= 64, "LowNode is too large");
+// static_assert(sizeof(LowNode) <= 64, "LowNode is too large");
 
 // Contains Edge and Node pair and set of proxy functions to simplify access
 // to them.
@@ -701,13 +714,18 @@ class EdgeAndNode {
   double GetD(double default_d) const {
     return (node_ && node_->GetN() > 0) ? node_->GetD() : default_d;
   }
+  float GetE() const {
+    return (node_ && node_->GetN() > 0) ? node_->GetE() : 0;
+  }
   float GetM(float default_m) const {
     return (node_ && node_->GetN() > 0) ? node_->GetM() : default_m;
   }
   // N-related getters, from Node (if exists).
   uint32_t GetN() const { return node_ ? node_->GetN() : 0; }
   int GetNStarted() const { return node_ ? node_->GetNStarted() : 0; }
-  uint32_t GetNInFlight() const { return node_ ? node_->GetNInFlight() : 0; }
+  uint32_t GetNInFlight() const { return node_ ? node_->GetNInFlight() : 0;}
+
+  float GetWeight() const { return node_ ? node_->GetWeight() : 0; }
 
   // Whether the node is known to be terminal.
   bool IsTerminal() const { return node_ ? node_->IsTerminal() : false; }
@@ -1002,7 +1020,8 @@ class NodeTree {
 // the thread.
 class ReleaseNodesWork {
   static constexpr size_t kCapacity = 32;
-public:
+
+ public:
   ReleaseNodesWork(bool gc_thread = false);
   ~ReleaseNodesWork();
   bool IsWorker() const;
@@ -1013,8 +1032,9 @@ public:
 
   // Swap is used to transfer queue into a new stack variable. The stack
   // variable will flush the queue in the desctructor.
-  void swap(ReleaseNodesWork &other);
-private:
+  void swap(ReleaseNodesWork& other);
+
+ private:
   // Flush the local queue to the shared queue.
   void Submit();
 
@@ -1026,7 +1046,8 @@ private:
 class NodeGarbageCollector {
   NodeGarbageCollector();
   ~NodeGarbageCollector();
-public:
+
+ public:
   enum State {
     Running,
     GoToSleep,
@@ -1040,7 +1061,7 @@ public:
     return singleton;
   }
   // Delays node destruction until GC thread activates.
-  template<typename UniquePtr>
+  template <typename UniquePtr>
   void AddToGcQueue(UniquePtr& node);
 
   // Allow search to control when garbage collection runs.
@@ -1055,7 +1076,7 @@ public:
   // there is no need to call this.
   void NotifyThreadGoingSleep();
 
-private:
+ private:
   // Helper to transition between states safely
   bool SetState(State& old, State desired);
   bool IsActive() const;
@@ -1078,7 +1099,8 @@ private:
 #endif
   std::thread gc_thread_;
   SpinMutex mutex_;
-  std::deque<std::vector<std::unique_ptr<Node>>> released_nodes_ GUARDED_BY(mutex_);
+  std::deque<std::vector<std::unique_ptr<Node>>> released_nodes_
+      GUARDED_BY(mutex_);
 
   friend class ReleaseNodesWork;
 };

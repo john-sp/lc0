@@ -137,6 +137,7 @@ class OnnxComputation final : public NetworkComputation {
   void CaptureCudaGraph(std::unique_lock<std::mutex>&& lock = std::unique_lock<std::mutex>());
   float GetQVal(int sample) const override;
   float GetDVal(int sample) const override;
+  float GetEVal(int sample) const override;
   float GetPVal(int sample, int move_id) const override;
   float GetMVal(int sample) const override;
 
@@ -219,6 +220,7 @@ class OnnxNetwork final : public Network {
   int wdl_head_ = -1;
   int value_head_ = -1;
   int mlh_head_ = -1;
+  int error_head_ = -1;
   NetworkCapabilities capabilities_;
   bool fp16_;
   bool bf16_;
@@ -433,6 +435,14 @@ template <typename DataType>
 float OnnxComputation<DataType>::GetDVal(int sample) const {
   if (network_->wdl_head_ == -1) return 0.0f;
   return inputs_outputs_->wdl_output_data_[sample * 3 + 1];
+}
+
+template <typename DataType>
+float OnnxComputation<DataType>::GetEVal(int sample) const {
+  if (network_->error_head_ == -1) return 0.0f;
+  DataType* data = static_cast<DataType*>(
+      inputs_outputs_->output_tensors_data_[network_->error_head_]);
+  return AsFloat(data[sample]);
 }
 
 template <typename DataType>
@@ -1070,6 +1080,10 @@ OnnxNetwork::OnnxNetwork(const WeightsFile& file, const OptionsDict& opts,
     mlh_head_ = outputs_.size();
     outputs_.emplace_back(md.output_mlh());
   }
+  if (md.has_output_err()) {
+    error_head_ = outputs_.size();
+    outputs_.emplace_back(md.output_err());
+  }
   uint64_t hash = 0;
   if (provider == OnnxProvider::TRT) {
     hash = std::hash<std::string_view>()(md.model());
@@ -1183,6 +1197,8 @@ std::unique_ptr<Network> MakeOnnxNetwork(const std::optional<WeightsFile>& w,
         opts.GetOrDefault<std::string>("policy_head", "vanilla");
     converter_options.value_head =
         opts.GetOrDefault<std::string>("value_head", "winner");
+    converter_options.error_head =
+        opts.GetOrDefault<std::string>("error_head", "st");
     converter_options.no_wdl_softmax = true;
     converter_options.alt_selu =
         kProvider == OnnxProvider::COREML ? true : false;

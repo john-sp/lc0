@@ -71,6 +71,7 @@ void NetworkComputationRequest::ProcessResult(const NetworkComputation& computat
                                        int sample, const float temperature) {
   if (result.q) *result.q = computation.GetQVal(sample);
   if (result.d) *result.d = computation.GetDVal(sample);
+  if (result.e) *result.e = computation.GetEVal(sample);
   if (result.m) *result.m = computation.GetMVal(sample);
   if (!result.p.empty()) {
     SoftmaxPolicy(result.p, computation, sample, legal_moves, transform,
