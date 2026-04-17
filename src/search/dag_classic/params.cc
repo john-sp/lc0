@@ -49,12 +49,12 @@ const OptionId SearchParams::kUncertaintyWeightingExponentId{
 
 void SearchParams::Populate(OptionsParser* options) {
   BaseSearchParams::Populate(options);
-  options->Add<BoolOption>(kUseUncertaintyWeightingId) = false;
-  options->Add<FloatOption>(kUncertaintyWeightingCapId, 0.0f, 10.0f) = 1.0f;
+  options->Add<BoolOption>(kUseUncertaintyWeightingId) = true;
+  options->Add<FloatOption>(kUncertaintyWeightingCapId, 0.0f, 10.0f) = 1.039f;
   options->Add<FloatOption>(kUncertaintyWeightingCoefficientId, 0.0f, 10.0f) =
-      0.25f;
+      0.296f;
   options->Add<FloatOption>(kUncertaintyWeightingExponentId, -10.0f, 0.0f) =
-      -0.25f;
+      -0.336f;
 }
 
 SearchParams::SearchParams(const OptionsDict& options)
