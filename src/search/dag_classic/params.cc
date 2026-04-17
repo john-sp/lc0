@@ -58,6 +58,12 @@ void SearchParams::Populate(OptionsParser* options) {
 }
 
 SearchParams::SearchParams(const OptionsDict& options)
-    : BaseSearchParams(options) {}
+    : BaseSearchParams(options),
+      kUseUncertaintyWeighting(options.Get<bool>(kUseUncertaintyWeightingId)),
+      kUncertaintyWeightingCap(options.Get<float>(kUncertaintyWeightingCapId)),
+      kUncertaintyWeightingCoefficient(
+          options.Get<float>(kUncertaintyWeightingCoefficientId)),
+      kUncertaintyWeightingExponent(
+          options.Get<float>(kUncertaintyWeightingExponentId)) {}
 }  // namespace dag_classic
 }  // namespace lczero

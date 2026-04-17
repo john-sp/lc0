@@ -211,13 +211,7 @@ Search::Search(const NodeTree& tree, Backend* backend,
       root_move_filter_(MakeRootMoveFilter(
           searchmoves_, syzygy_tb_, played_history_,
           params_.GetSyzygyFastPlay(), &tb_hits_, &root_is_in_dtz_)),
-      uci_responder_(std::move(uci_responder)),
-      use_uncertainty_weighting_(params_.GetUseUncertaintyWeighting()),
-      uncertainty_weighting_cap_(params_.GetUncertaintyWeightingCap()),
-      uncertainty_weighting_coefficient_(
-          params_.GetUncertaintyWeightingCoefficient()),
-      uncertainty_weighting_exponent_(
-          params_.GetUncertaintyWeightingExponents()) {
+      uci_responder_(std::move(uci_responder)) {
   // Evict expired entries from the transposition table.
   // Garbage collection may lead to expiration at any time so this is not
   // enough to prevent expired entries later during the search.
@@ -2159,7 +2153,17 @@ void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process) {
     }
   };
   wdl_rescale();
-  node_to_process->tt_low_node->SetNNEval(node_to_process->eval.get());
+  auto& eval = *node_to_process->eval.get();
+  if (params_.GetUseUncertaintyWeighting()) {
+    const float e = eval.e;
+    const float cap = params_.GetUncertaintyWeightingCap();
+    const float coefficient = params_.GetUncertaintyWeightingCoefficient();
+    const float exponent = params_.GetUncertaintyWeightingExponents();
+    eval.e = std::min(cap, coefficient * FastExp(exponent * FastLog(e)));
+  } else {
+    eval.e = 1.0f;
+  }
+  node_to_process->tt_low_node->SetNNEval(&eval);
   node_to_process->tt_low_node->SortEdges();
 
   // Add NN results to node.
@@ -2289,21 +2293,7 @@ void SearchWorker::DoBackupUpdateSingleNode(
   float d_delta = 0.0f;
   float m_delta = 0.0f;
 
-  float avg_weight;
-  if (nl) {
-    float e = nl->GetE();
-    n->SetE(e);
-    if (search_->use_uncertainty_weighting_) {
-      const float cap = search_->uncertainty_weighting_cap_;
-      const float coefficient = search_->uncertainty_weighting_coefficient_;
-      const float exponent = search_->uncertainty_weighting_exponent_;
-      avg_weight = fmin(cap, coefficient * pow(e, exponent));
-    } else
-      avg_weight = 1;
-  } else {
-    n->SetE(-1.0f);
-    avg_weight = 1;
-  }
+  float avg_weight = 1.0f;
   
   // Update the low node at the start of the backup path first, but only visit
   // it the first time that backup sees it.

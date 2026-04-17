@@ -43,17 +43,13 @@ class SearchParams : public classic::BaseSearchParams {
   static void Populate(OptionsParser* options);
 
   // Parameter getters.
-  bool GetUseUncertaintyWeighting() const {
-    return options_.Get<bool>(kUseUncertaintyWeightingId);
-  }
-  float GetUncertaintyWeightingCap() const {
-    return options_.Get<float>(kUncertaintyWeightingCapId);
-  }
+  bool GetUseUncertaintyWeighting() const { return kUseUncertaintyWeighting; }
+  float GetUncertaintyWeightingCap() const { return kUncertaintyWeightingCap; }
   float GetUncertaintyWeightingCoefficient() const {
-    return options_.Get<float>(kUncertaintyWeightingCoefficientId);
+    return kUncertaintyWeightingCoefficient;
   }
   float GetUncertaintyWeightingExponents() const {
-    return options_.Get<float>(kUncertaintyWeightingExponentId);
+    return kUncertaintyWeightingExponent;
   }
 
   // Search parameter IDs.
@@ -61,6 +57,12 @@ class SearchParams : public classic::BaseSearchParams {
   static const OptionId kUncertaintyWeightingCapId;
   static const OptionId kUncertaintyWeightingCoefficientId;
   static const OptionId kUncertaintyWeightingExponentId;
+
+  // Search parameter values.
+  const bool kUseUncertaintyWeighting;
+  const float kUncertaintyWeightingCap;
+  const float kUncertaintyWeightingCoefficient;
+  const float kUncertaintyWeightingExponent;
 };
 
 }  // namespace dag_classic

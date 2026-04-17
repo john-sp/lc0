@@ -209,11 +209,6 @@ class Search {
   std::unique_ptr<UciResponder> uci_responder_;
   ContemptMode contempt_mode_;
   friend class SearchWorker;
-
-  const bool use_uncertainty_weighting_;
-  const float uncertainty_weighting_cap_;
-  const float uncertainty_weighting_coefficient_;
-  const float uncertainty_weighting_exponent_;
 };
 
 // Single thread worker of the search engine.
