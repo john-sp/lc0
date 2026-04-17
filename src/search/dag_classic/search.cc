@@ -716,13 +716,7 @@ Search::Search(SearchCachedState& state, const NodeTree& tree, Backend* backend,
       root_move_filter_(MakeRootMoveFilter(
           searchmoves_, syzygy_tb_, played_history_,
           params_.GetSyzygyFastPlay(), &tb_hits_, &root_is_in_dtz_)),
-      uci_responder_(std::move(uci_responder)),
-      use_uncertainty_weighting_(params_.GetUseUncertaintyWeighting()),
-      uncertainty_weighting_cap_(params_.GetUncertaintyWeightingCap()),
-      uncertainty_weighting_coefficient_(
-          params_.GetUncertaintyWeightingCoefficient()),
-      uncertainty_weighting_exponent_(
-          params_.GetUncertaintyWeightingExponents()) {
+      uci_responder_(std::move(uci_responder)) {
 #ifndef FIX_TT
   // Evict expired entries from the transposition table.
   // Garbage collection may lead to expiration at any time so this is not
@@ -2806,11 +2800,11 @@ void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process,
     }
   };
   wdl_rescale();
-  if (search_->use_uncertainty_weighting_) {
+  if (params_.GetUseUncertaintyWeighting()) {
     const float e = eval.e;
-    const float cap = search_->uncertainty_weighting_cap_;
-    const float coefficient = search_->uncertainty_weighting_coefficient_;
-    const float exponent = search_->uncertainty_weighting_exponent_;
+    const float cap = params_.GetUncertaintyWeightingCap();
+    const float coefficient = params_.GetUncertaintyWeightingCoefficient();
+    const float exponent = params_.GetUncertaintyWeightingExponents();
     eval.e = std::min(cap, coefficient * FastExp(exponent * FastLog(e)));
   } else {
     eval.e = 1.0f;
