@@ -642,7 +642,7 @@ bool Node::WLDMInvariantsHold() const {
 
   std::cerr << DebugString() << std::endl;
 
-  return true;
+  return false;
 }
 
 bool LowNode::WLDMInvariantsHold() const {
@@ -650,7 +650,7 @@ bool LowNode::WLDMInvariantsHold() const {
 
   std::cerr << DebugString() << std::endl;
 
-  return true;
+  return false;
 }
 
 /////////////////////////////////////////////////////////////////////////
