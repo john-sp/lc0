@@ -1079,7 +1079,6 @@ std::vector<std::string> Search::GetVerboseStats(
               : params_.GetWDLRescaleDiff() * params_.GetWDLEvalObjectivity(),
           is_perspective, true, params_.GetWDLMaxS());
       print(oss, "(WGT: ", n->GetWeight(), ") ", 11, 3);
-      print(oss, "(E: ", n->GetE(), ") ", 6, 5);
       print(oss, "(WL: ", wl, ") ", 8, 5);
       print(oss, "(D: ", d, ") ", 5, 3);
       print(oss, "(M: ", n->GetM(), ") ", 4, 1);
@@ -1092,6 +1091,7 @@ std::vector<std::string> Search::GetVerboseStats(
   auto print_tail = [&](auto* oss, const auto* n, bool is_edge) {
     const auto sign = n == node ? -1 : 1;
     std::optional<float> v;
+    float e = 0;
     if (n && n->IsTerminal()) {
       v = n->GetQ(sign * draw_score);
     } else if (n) {
@@ -1104,9 +1104,13 @@ std::vector<std::string> Search::GetVerboseStats(
       }
       std::optional<EvalResult> nneval = backend_->GetCachedEvaluation(
           EvalPosition{history.GetPositions(), {}});
-      if (nneval) v = -nneval->q;
+      if (nneval) {
+        v = -nneval->q;
+        e = nneval->e;
+      }
     }
     if (v) {
+      print(oss, "(E: ", e, ") ", 7, 4);
       print(oss, "(V: ", sign * *v, ") ", 7, 4);
     } else {
       *oss << "(V:  -.----) ";
@@ -1234,14 +1238,13 @@ Eval Search::GetBestEval(Move* move, bool* is_terminal) const {
   float parent_wl = -root_node_->GetWL();
   float parent_d = root_node_->GetD();
   float parent_m = root_node_->GetM();
-  float parent_e = root_node_->GetE();
   if (!root_node_->HasChildren())
-    return {parent_wl, parent_d, parent_m, parent_e};
+    return {parent_wl, parent_d, parent_m, 0.0f};
   EdgeAndNode best_edge = GetBestChildNoTemperature(root_node_, 0);
   if (move) *move = best_edge.GetMove(played_history_.IsBlackToMove());
   if (is_terminal) *is_terminal = best_edge.IsTerminal();
   return {best_edge.GetWL(parent_wl), best_edge.GetD(parent_d),
-          best_edge.GetM(parent_m - 1) + 1, best_edge.GetE()};
+          best_edge.GetM(parent_m - 1) + 1, 0.0f};
 }
 
 std::pair<Move, Move> Search::GetBestMove() {
@@ -2803,6 +2806,15 @@ void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process,
     }
   };
   wdl_rescale();
+  if (search_->use_uncertainty_weighting_) {
+    const float e = eval.e;
+    const float cap = search_->uncertainty_weighting_cap_;
+    const float coefficient = search_->uncertainty_weighting_coefficient_;
+    const float exponent = search_->uncertainty_weighting_exponent_;
+    eval.e = std::min(cap, coefficient * FastExp(exponent * FastLog(e)));
+  } else {
+    eval.e = 1.0f;
+  }
   node_to_process->tt_low_node->SetNNEval(&eval);
   node_to_process->tt_low_node->SortEdges();
 
@@ -2855,8 +2867,8 @@ void SearchWorker::DoBackupUpdate() {
 
 bool SearchWorker::MaybeAdjustForTerminalOrTransposition(
     Node* n, const std::shared_ptr<LowNode>& nl, double& v, double& d, float& m,
-    uint32_t& n_to_fix, float& weight_to_fix, double& v_delta, double& d_delta, float& m_delta,
-    bool& update_parent_bounds) const {
+    uint32_t& n_to_fix, double& weight_to_fix, double& v_delta, double& d_delta,
+    float& m_delta, bool& update_parent_bounds) const {
   if (n->IsTerminal()) {
     v = n->GetWL();
     d = n->GetD();
@@ -2875,7 +2887,7 @@ bool SearchWorker::MaybeAdjustForTerminalOrTransposition(
     // When starting at or going through a transposition/terminal, make sure to
     // use the information it has already acquired.
     n_to_fix = n->GetN();
-    weight_to_fix = n->GetWeight();
+    weight_to_fix = n->GetWeight() + n->GetN();
     v_delta = v - n->GetWL();
     d_delta = d - n->GetD();
     m_delta = m - n->GetM();
@@ -2974,31 +2986,20 @@ void SearchWorker::DoBackupUpdateSingleNode(
   double d = 0.0;
   float m = 0.0f;
   uint32_t n_to_fix = 0;
-  float weight_to_fix = 0.0f;
+  double weight_to_fix = 0.0f;
   double v_delta = 0.0;
   double d_delta = 0.0;
   float m_delta = 0.0f;
 
-  float avg_weight;
-  if (nl) {
-    float e = nl->GetE();
-    n->SetE(e);
-    if (search_->use_uncertainty_weighting_) {
-      const float cap = search_->uncertainty_weighting_cap_;
-      const float coefficient = search_->uncertainty_weighting_coefficient_;
-      const float exponent = search_->uncertainty_weighting_exponent_;
-      avg_weight = fmin(cap, coefficient * pow(e, exponent));
-    } else
-      avg_weight = 1;
-  } else {
-    n->SetE(-1.0f);
-    avg_weight = 1;
-  }
-  
+  double avg_weight = 1.0;
+
   // Update the low node at the start of the backup path first, but only visit
   // it the first time that backup sees it.
   if (nl && nl->GetN() == 0) {
+    avg_weight = nl->GetWeight() + 1.0;
     nl->FinalizeScoreUpdate(nl->GetWL(), nl->GetD(), nl->GetM(), 1, avg_weight);
+  } else if (nl) {
+    avg_weight = nl->GetWeight() / nl->GetN() + 1.0;
   }
 
   if (nr >= 2) {
@@ -3008,9 +3009,9 @@ void SearchWorker::DoBackupUpdateSingleNode(
     v = 0.0f;
     d = 1.0f;
     m = 1;
-  } else if (!MaybeAdjustForTerminalOrTransposition(n, nl, v, d, m, n_to_fix, weight_to_fix,
-                                                    v_delta, d_delta, m_delta,
-                                                    update_parent_bounds)) {
+  } else if (!MaybeAdjustForTerminalOrTransposition(
+                 n, nl, v, d, m, n_to_fix, weight_to_fix, v_delta, d_delta,
+                 m_delta, update_parent_bounds)) {
     // If there is nothing better, use original NN values adjusted for node.
     v = -nl->GetWL();
     d = nl->GetD();
@@ -3022,7 +3023,8 @@ void SearchWorker::DoBackupUpdateSingleNode(
        /* ++it in the body */) {
     auto divisor = n->FinalizeScoreUpdate(v, d, m, 1, avg_weight);
     if (n_to_fix > 0 && !n->IsTerminal()) {
-      n->AdjustForTerminal(v_delta, d_delta, m_delta, divisor, n_to_fix, weight_to_fix);
+      n->AdjustForTerminal(v_delta, d_delta, m_delta, divisor, n_to_fix,
+                           weight_to_fix);
     }
 
     // Stop delta update on repetition "terminal" and propagate a draw above
@@ -3058,23 +3060,25 @@ void SearchWorker::DoBackupUpdateSingleNode(
     }
     divisor = pl->FinalizeScoreUpdate(v, d, m, 1, avg_weight);
     if (n_to_fix > 0) {
-      pl->AdjustForTerminal(v_delta, d_delta, m_delta, divisor, n_to_fix, weight_to_fix);
+      pl->AdjustForTerminal(v_delta, d_delta, m_delta, divisor, n_to_fix,
+                            weight_to_fix);
     }
 
     bool old_update_parent_bounds = update_parent_bounds;
     // Try setting parent bounds except the root or those already terminal.
-    update_parent_bounds =
-        update_parent_bounds && p != search_->root_node_ && !pl->IsTerminal() &&
-        MaybeSetBounds(p, m, &n_to_fix, &weight_to_fix, &v_delta, &d_delta, &m_delta);
+    update_parent_bounds = update_parent_bounds && p != search_->root_node_ &&
+                           !pl->IsTerminal() &&
+                           MaybeSetBounds(p, m, &n_to_fix, &weight_to_fix,
+                                          &v_delta, &d_delta, &m_delta);
 
     // Q will be flipped for opponent.
     v = -v;
     v_delta = -v_delta;
     m++;
 
-    MaybeAdjustForTerminalOrTransposition(p, pl, v, d, m, n_to_fix, weight_to_fix, v_delta,
-                                          d_delta, m_delta,
-                                          update_parent_bounds);
+    MaybeAdjustForTerminalOrTransposition(p, pl, v, d, m, n_to_fix,
+                                          weight_to_fix, v_delta, d_delta,
+                                          m_delta, update_parent_bounds);
 
     // Update the stats.
     // Best move.
@@ -3105,9 +3109,8 @@ void SearchWorker::DoBackupUpdateSingleNode(
 }
 
 bool SearchWorker::MaybeSetBounds(Node* p, float m, uint32_t* n_to_fix,
-                                  float* weight_to_fix,
-                                  double* v_delta, double* d_delta,
-                                  float* m_delta) const {
+                                  double* weight_to_fix, double* v_delta,
+                                  double* d_delta, float* m_delta) const {
   auto losing_m = 0.0f;
   auto prefer_tb = false;
 
@@ -3154,9 +3157,9 @@ bool SearchWorker::MaybeSetBounds(Node* p, float m, uint32_t* n_to_fix,
     // Search can stop at the parent if the bounds can't change anymore, so make
     // it terminal preferring shorter wins and longer losses.
     *n_to_fix = p->GetN();
-    *weight_to_fix = p->GetWeight();
+    *weight_to_fix = p->GetWeight() + p->GetN();
     assert(*n_to_fix > 0);
-    assert(*weight_to_fix > 0); 
+    assert(*weight_to_fix > 0);
     pl->MakeTerminal(
         upper, (upper == GameResult::BLACK_WON ? std::max(losing_m, m) : m),
         prefer_tb ? Terminal::Tablebase : Terminal::EndOfGame);

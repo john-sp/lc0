@@ -294,7 +294,7 @@ class Node {
 
   // Returns sum of policy priors which have had at least one playout.
   float GetVisitedPolicy() const;
-  float GetWeight() const { return weight_; }
+  double GetWeight() const { return weight_; }
   uint32_t GetN() const { return n_; }
   uint32_t GetNInFlight() const;
   uint32_t GetChildrenVisits() const;
@@ -308,9 +308,6 @@ class Node {
   double GetWL() const { return wl_; }
   double GetD() const { return d_; }
   float GetM() const { return m_; }
-  float GetE() const { return e_; }
-
-  void SetE(float e);
 
   // Returns whether the node is known to be draw/lose/win.
   bool IsTerminal() const { return terminal_type_ != Terminal::NonTerminal; }
@@ -340,10 +337,10 @@ class Node {
   // * N (+=multivisit)
   // * N-in-flight (-=multivisit)
   double FinalizeScoreUpdate(double v, double d, float m, uint32_t multivisit,
-                           float multiweight);
+                           double multiweight);
   // Like FinalizeScoreUpdate, but it updates n existing visits by delta amount.
   void AdjustForTerminal(double v, double d, float m, double divisor, uint32_t multivisit,
-                         float multiweight);
+                         double multiweight);
   // When search decides to treat one visit as several (in case of collisions
   // or visiting terminal nodes several times), it amplifies the visit by
   // incrementing n_in_flight.
@@ -449,8 +446,6 @@ class Node {
   // flipped depending on the side to move.
   double d_ = 0.0f;
 
-  double weight_ = 0.0;
-
   // 8 byte fields on 64-bit platforms, 4 byte on 32-bit.
   // Pointer to a next sibling. nullptr if there are no further siblings.
   atomic_unique_ptr<Node> sibling_;
@@ -458,7 +453,8 @@ class Node {
   // 4 byte fields.
   // Estimated remaining plies.
   float m_ = 0.0f;
-  float e_ = 0.0f;
+
+  float weight_ = 0.0;
   // How many completed visits this node had.
   uint32_t n_ = 0;
   // (AKA virtual loss.) How many threads currently process this node (started
@@ -486,7 +482,7 @@ class Node {
 };
 
 // Check that Node still fits into an expected cache line size.
-// static_assert(sizeof(Node) <= 64, "Node is too large");
+static_assert(sizeof(Node) <= 64, "Node is too large");
 
 class LowNode {
  public:
@@ -499,7 +495,6 @@ class LowNode {
       : wl_(p.wl_),
         d_(p.d_),
         m_(p.m_),
-        e_(p.e_),
         num_edges_(p.num_edges_),
         terminal_type_(Terminal::NonTerminal),
         lower_bound_(GameResult::BLACK_WON),
@@ -539,7 +534,7 @@ class LowNode {
     wl_ = eval->q;
     d_ = eval->d;
     m_ = eval->m;
-    e_ = std::sqrt(eval->e);
+    weight_ = eval->e - 1;
 
     assert(WLDMInvariantsHold());
   }
@@ -550,7 +545,7 @@ class LowNode {
   // Returns whether a node has children.
   bool HasChildren() const { return num_edges_ > 0; }
 
-  float GetWeight() const { return weight_; }
+  double GetWeight() const { return weight_; }
   uint32_t GetN() const { return n_; }
   uint32_t GetChildrenVisits() const { return n_ - 1; }
 
@@ -559,7 +554,6 @@ class LowNode {
   double GetWL() const { return wl_; }
   double GetD() const { return d_; }
   float GetM() const { return m_; }
-  float GetE() const { return e_; }
 
   // Returns whether the node is known to be draw/loss/win.
   bool IsTerminal() const { return terminal_type_ != Terminal::NonTerminal; }
@@ -585,9 +579,9 @@ class LowNode {
   // * Q (weighted average of all V in a subtree)
   // * N (+=multivisit)
   // * N-in-flight (-=multivisit)
-  double FinalizeScoreUpdate(double v, double d, float m, uint32_t multivisit, float multiweight);
+  double FinalizeScoreUpdate(double v, double d, float m, uint32_t multivisit, double multiweight);
   // Like FinalizeScoreUpdate, but it updates n existing visits by delta amount.
-  void AdjustForTerminal(double v, double d, float m, double divisor, uint32_t multivisi, float multiweightt);
+  void AdjustForTerminal(double v, double d, float m, double divisor, uint32_t multivisi, double multiweight);
 
   // Deletes all children.
   void ReleaseChildren();
@@ -648,8 +642,6 @@ class LowNode {
   // flipped depending on the side to move.
   double d_ = 0.0f;
 
-  double weight_ = 0.0f;
-
   // 8 byte fields on 64-bit platforms, 4 byte on 32-bit.
   // Array of edges.
   std::unique_ptr<Edge[]> edges_;
@@ -658,8 +650,9 @@ class LowNode {
 
   // 4 byte fields.
   // Estimated remaining plies.
+
+  float weight_ = 0.0f;
   float m_ = 0.0f;
-  float e_ = 0.0f;
   // How many completed visits this node had.
   uint32_t n_ = 0;
 
@@ -684,7 +677,7 @@ class LowNode {
 };
 
 // Check that LowNode still fits into an expected cache line size.
-// static_assert(sizeof(LowNode) <= 64, "LowNode is too large");
+static_assert(sizeof(LowNode) <= 64, "LowNode is too large");
 
 // Contains Edge and Node pair and set of proxy functions to simplify access
 // to them.
@@ -714,9 +707,6 @@ class EdgeAndNode {
   double GetD(double default_d) const {
     return (node_ && node_->GetN() > 0) ? node_->GetD() : default_d;
   }
-  float GetE() const {
-    return (node_ && node_->GetN() > 0) ? node_->GetE() : 0;
-  }
   float GetM(float default_m) const {
     return (node_ && node_->GetN() > 0) ? node_->GetM() : default_m;
   }
@@ -725,7 +715,7 @@ class EdgeAndNode {
   int GetNStarted() const { return node_ ? node_->GetNStarted() : 0; }
   uint32_t GetNInFlight() const { return node_ ? node_->GetNInFlight() : 0;}
 
-  float GetWeight() const { return node_ ? node_->GetWeight() : 0; }
+  double GetWeight() const { return node_ ? node_->GetWeight() : 0; }
 
   // Whether the node is known to be terminal.
   bool IsTerminal() const { return node_ ? node_->IsTerminal() : false; }

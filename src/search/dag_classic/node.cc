@@ -243,10 +243,11 @@ void LowNode::MakeNotTerminal(const Node* node) {
   if (node->GetNumEdges() > 0) {
     for (const auto& child : node->Edges()) {
       const auto n = child.GetN();
-      const auto weight = child.GetWeight();
+      auto weight = child.GetWeight();
       if (n > 0) {
         n_ += n;
         weight_ += weight;
+        weight += n;
         // Flip Q for opponent.
         // Default values don't matter as n is > 0.
         wl_ += child.GetWL(0.0f) * weight;
@@ -256,9 +257,10 @@ void LowNode::MakeNotTerminal(const Node* node) {
     }
 
     // Recompute with current eval (instead of network's) and children's eval.
-    wl_ /= weight_;
-    d_ /= weight_;
-    m_ /= weight_;
+    auto weight = weight_ + n_;
+    wl_ /= weight;
+    d_ /= weight;
+    m_ /= weight;
   }
 
   assert(WLDMInvariantsHold());
@@ -349,14 +351,16 @@ void Node::CancelScoreUpdate(uint32_t multivisit) {
 }
 
 double LowNode::FinalizeScoreUpdate(double v, double d, float m,
-                                  uint32_t multivisit, float multiweight) {
+                                    uint32_t multivisit, double multiweight) {
   assert(edges_);
   // Increment N.
+  if (n_ != 0) {
+    weight_ += multiweight - multivisit;
+  }
   n_ += multivisit;
-  weight_ += multiweight;
 
   // Recompute Q.
-  double divisor = 1.0 / weight_;
+  double divisor = 1.0 / (GetWeight() + n_);
   wl_ += multiweight * (v - wl_) * divisor;
   d_ += multiweight * (d - d_) * divisor;
   m_ += multiweight * (m - m_) * static_cast<float>(divisor);
@@ -366,7 +370,7 @@ double LowNode::FinalizeScoreUpdate(double v, double d, float m,
 }
 
 void LowNode::AdjustForTerminal(double v, double d, float m, double divisor,
-                                uint32_t multivisit, float multiweight) {
+                                uint32_t multivisit, double multiweight) {
   assert(static_cast<uint32_t>(multivisit) <= n_);
 
   // Recompute Q.
@@ -378,13 +382,13 @@ void LowNode::AdjustForTerminal(double v, double d, float m, double divisor,
 }
 
 double Node::FinalizeScoreUpdate(double v, double d, float m,
-                                uint32_t multivisit, float multiweight) {
+                                 uint32_t multivisit, double multiweight) {
   // Increment N.
   n_ += multivisit;
-  weight_ += multiweight;
+  weight_ += multiweight - multivisit;
 
   // Recompute Q.
-  double divisor = 1.0 / weight_;
+  double divisor = 1.0 / (GetWeight() + n_);
   wl_ += multiweight * (v - wl_) * divisor;
   d_ += multiweight * (d - d_) * divisor;
   m_ += multiweight * (m - m_) * static_cast<float>(divisor);
@@ -397,7 +401,7 @@ double Node::FinalizeScoreUpdate(double v, double d, float m,
 }
 
 void Node::AdjustForTerminal(double v, double d, float m, double divisor,
-                             uint32_t multivisit, float multiweight) {
+                             uint32_t multivisit, double multiweight) {
   assert(static_cast<uint32_t>(multivisit) <= n_);
 
   // Recompute Q.
@@ -411,8 +415,6 @@ void Node::AdjustForTerminal(double v, double d, float m, double divisor,
 void Node::IncrementNInFlight(uint32_t multivisit) {
   n_in_flight_.fetch_add(multivisit, std::memory_order_acq_rel);
 }
-
-void Node::SetE(float e) { e_ = e; }
 
 void LowNode::ReleaseChildren() {
   NodeGarbageCollector::Instance().AddToGcQueue(child_);
