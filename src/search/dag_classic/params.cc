@@ -52,9 +52,9 @@ void SearchParams::Populate(OptionsParser* options) {
   options->Add<BoolOption>(kUseUncertaintyWeightingId) = false;
   options->Add<FloatOption>(kUncertaintyWeightingCapId, 0.0f, 10.0f) = 1.0f;
   options->Add<FloatOption>(kUncertaintyWeightingCoefficientId, 0.0f, 10.0f) =
-      0.13f;
+      0.25f;
   options->Add<FloatOption>(kUncertaintyWeightingExponentId, -10.0f, 0.0f) =
-      -1.76f;
+      -0.25f;
 }
 
 SearchParams::SearchParams(const OptionsDict& options)
