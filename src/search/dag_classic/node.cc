@@ -183,7 +183,7 @@ std::string Node::DebugString() const {
       << " Index:" << index_ << " Move:" << GetMove().ToString(true)
       << " Sibling:" << sibling_.get() << " P:" << GetP() << " WL:" << wl_
       << " D:" << d_ << " M:" << m_ << " N:" << n_ << " N_:" << GetNInFlight()
-      << " Term:" << static_cast<int>(terminal_type_)
+      << " W:" << weight_ << " Term:" << static_cast<int>(terminal_type_)
       << " Bounds:" << static_cast<int>(lower_bound_) - 2 << ","
       << static_cast<int>(upper_bound_) - 2;
   return oss.str();
@@ -194,8 +194,8 @@ std::string LowNode::DebugString() const {
   oss << " <LowNode> This:" << this << " Edges:" << edges_.get()
       << " NumEdges:" << static_cast<int>(num_edges_)
       << " Child:" << child_.get() << " WL:" << wl_ << " D:" << d_
-      << " M:" << m_ << " N:" << n_ << " NP:" << num_parents_
-      << " Term:" << static_cast<int>(terminal_type_)
+      << " M:" << m_ << " N:" << n_ << " W:" << weight_
+      << " NP:" << num_parents_ << " Term:" << static_cast<int>(terminal_type_)
       << " Bounds:" << static_cast<int>(lower_bound_) - 2 << ","
       << static_cast<int>(upper_bound_) - 2;
   return oss.str();
