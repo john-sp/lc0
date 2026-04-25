@@ -1045,8 +1045,8 @@ std::vector<std::string> Search::GetVerboseStats(
   const float fpu = GetFpu(params_, node, is_root, draw_score);
   const float cpuct = ComputeCpuct(params_, node->GetTotalVisits(), is_root);
   const float U_coeff =
-      cpuct * std::sqrt(std::max(node->GetChildrenVisits(), 1u));
-  std::vector<std::tuple<uint32_t, float, EdgeAndNode>> edges;
+      cpuct * std::sqrt(std::max(node->GetChildrenVisits(), 1.0f));
+  std::vector<std::tuple<float, float, EdgeAndNode>> edges;
   edges.reserve(node->GetNumEdges());
   for (const auto& edge : node->Edges()) {
     edges.emplace_back(edge.GetN(),
@@ -1062,7 +1062,7 @@ std::vector<std::string> Search::GetVerboseStats(
     print(oss, "", label, " ", 5);
     print(oss, "(", i, ") ", 4);
     *oss << std::right;
-    print(oss, "N: ", n, " ", 7);
+    print(oss, "N: ", n, " ", 8);
     print(oss, "(+", f, ") ", 2);
     print(oss, "(P: ", p * 100, "%) ", 5, p >= 0.99995f ? 1 : 2);
   };
@@ -1081,7 +1081,6 @@ std::vector<std::string> Search::GetVerboseStats(
               ? 0
               : params_.GetWDLRescaleDiff() * params_.GetWDLEvalObjectivity(),
           is_perspective, true, params_.GetWDLMaxS());
-      print(oss, "(WGT: ", n->GetWeight(), ") ", 11, 3);
       print(oss, "(WL: ", wl, ") ", 8, 5);
       print(oss, "(D: ", d, ") ", 5, 3);
       print(oss, "(M: ", n->GetM(), ") ", 4, 1);
@@ -2223,7 +2222,7 @@ SearchWorker::PickNodesToExtendTask(int collision_limit, int tid,
   current_path.emplace_back(collision_limit, true, visit_root, stop_root, 0);
   // take base sqrt(2) logarithm of root node for large subbranch N limit. It is
   // used to split tasks.
-  const unsigned large_branch_limit = std::bit_width(search_->root_node_->GetN()) * 2;
+  const unsigned large_branch_limit = std::bit_width<uint32_t>(search_->root_node_->GetN()) * 2;
   while (current_path.size() > starting_path_size) {
     assert(!full_path.empty());
     int cur_limit = current_path.back().visits_;
@@ -2264,7 +2263,7 @@ SearchWorker::PickNodesToExtendTask(int collision_limit, int tid,
 
       // These 3 are 'filled on demand'.
       std::array<float, kMaxMovesInPosition> current_score;
-      std::array<int, kMaxMovesInPosition> current_nstarted;
+      std::array<float, kMaxMovesInPosition> current_nstarted;
       std::array<CurrentPath, kMaxMovesInPosition> visits_to_perform;
 
       if (is_root_node) {
@@ -2304,7 +2303,7 @@ SearchWorker::PickNodesToExtendTask(int collision_limit, int tid,
       const float cpuct =
           ComputeCpuct(params_, node->GetTotalVisits(), is_root_node);
       const float puct_mult =
-          cpuct * std::sqrt(std::max(node->GetChildrenVisits(), 1u));
+          cpuct * std::sqrt(std::max(node->GetChildrenVisits(), 1.0f));
       int cache_filled_idx = -1;
       int parent_max_limit = max_limit;
       int collision_left = cur_limit;
@@ -2327,7 +2326,7 @@ SearchWorker::PickNodesToExtendTask(int collision_limit, int tid,
             current_nstarted[idx] = cur_iters[idx].GetNStarted();
             visits_to_perform[idx] = CurrentPath(0, 0, 0, 0, idx);
           }
-          int nstarted = current_nstarted[idx];
+          float nstarted = current_nstarted[idx];
           const float util = current_util[idx];
           if (idx > cache_filled_idx) {
             current_score[idx] =
@@ -2870,7 +2869,7 @@ void SearchWorker::DoBackupUpdate() {
 
 bool SearchWorker::MaybeAdjustForTerminalOrTransposition(
     Node* n, const std::shared_ptr<LowNode>& nl, double& v, double& d, float& m,
-    uint32_t& n_to_fix, double& weight_to_fix, double& v_delta, double& d_delta,
+    double& weight_to_fix, double& v_delta, double& d_delta,
     float& m_delta, bool& update_parent_bounds) const {
   if (n->IsTerminal()) {
     v = n->GetWL();
@@ -2889,8 +2888,7 @@ bool SearchWorker::MaybeAdjustForTerminalOrTransposition(
     m = nl->GetM() + 1;
     // When starting at or going through a transposition/terminal, make sure to
     // use the information it has already acquired.
-    n_to_fix = n->GetN();
-    weight_to_fix = n->GetWeight() + n->GetN();
+    weight_to_fix = n->GetWeight();
     v_delta = v - n->GetWL();
     d_delta = d - n->GetD();
     m_delta = m - n->GetM();
@@ -2988,7 +2986,6 @@ void SearchWorker::DoBackupUpdateSingleNode(
   double v = 0.0;
   double d = 0.0;
   float m = 0.0f;
-  uint32_t n_to_fix = 0;
   double weight_to_fix = 0.0f;
   double v_delta = 0.0;
   double d_delta = 0.0;
@@ -2999,10 +2996,9 @@ void SearchWorker::DoBackupUpdateSingleNode(
   // Update the low node at the start of the backup path first, but only visit
   // it the first time that backup sees it.
   if (nl && nl->GetN() == 0) {
-    avg_weight = nl->GetWeight() + 1.0;
-    nl->FinalizeScoreUpdate(nl->GetWL(), nl->GetD(), nl->GetM(), 1, avg_weight);
-  } else if (nl) {
-    avg_weight = nl->GetWeight() / nl->GetN() + 1.0;
+    auto& eval = state_.eval_results_[node_to_process.eval_index];
+    avg_weight = eval.e;
+    nl->FinalizeScoreUpdate(nl->GetWL(), nl->GetD(), nl->GetM(), avg_weight);
   }
 
   if (nr >= 2) {
@@ -3013,7 +3009,7 @@ void SearchWorker::DoBackupUpdateSingleNode(
     d = 1.0f;
     m = 1;
   } else if (!MaybeAdjustForTerminalOrTransposition(
-                 n, nl, v, d, m, n_to_fix, weight_to_fix, v_delta, d_delta,
+                 n, nl, v, d, m, weight_to_fix, v_delta, d_delta,
                  m_delta, update_parent_bounds)) {
     // If there is nothing better, use original NN values adjusted for node.
     v = -nl->GetWL();
@@ -3024,9 +3020,9 @@ void SearchWorker::DoBackupUpdateSingleNode(
   // Backup V value up to a root. After 1 visit, V = Q.
   for (auto it = path.crbegin(); it != path.crend();
        /* ++it in the body */) {
-    auto divisor = n->FinalizeScoreUpdate(v, d, m, 1, avg_weight);
-    if (n_to_fix > 0 && !n->IsTerminal()) {
-      n->AdjustForTerminal(v_delta, d_delta, m_delta, divisor, n_to_fix,
+    auto divisor = n->FinalizeScoreUpdate(v, d, m, avg_weight);
+    if (weight_to_fix > 0 && !n->IsTerminal()) {
+      n->AdjustForTerminal(v_delta, d_delta, m_delta, divisor,
                            weight_to_fix);
     }
 
@@ -3040,7 +3036,6 @@ void SearchWorker::DoBackupUpdateSingleNode(
       m = nm + 1;
     }
     if (n->IsRepetition()) {
-      n_to_fix = 0;
       weight_to_fix = 0.0f;
     }
 
@@ -3058,12 +3053,11 @@ void SearchWorker::DoBackupUpdateSingleNode(
       v = pl->GetWL();
       d = pl->GetD();
       m = pl->GetM();
-      n_to_fix = 0;
       weight_to_fix = 0.0f;
     }
-    divisor = pl->FinalizeScoreUpdate(v, d, m, 1, avg_weight);
-    if (n_to_fix > 0) {
-      pl->AdjustForTerminal(v_delta, d_delta, m_delta, divisor, n_to_fix,
+    divisor = pl->FinalizeScoreUpdate(v, d, m, avg_weight);
+    if (weight_to_fix > 0) {
+      pl->AdjustForTerminal(v_delta, d_delta, m_delta, divisor,
                             weight_to_fix);
     }
 
@@ -3071,7 +3065,7 @@ void SearchWorker::DoBackupUpdateSingleNode(
     // Try setting parent bounds except the root or those already terminal.
     update_parent_bounds = update_parent_bounds && p != search_->root_node_ &&
                            !pl->IsTerminal() &&
-                           MaybeSetBounds(p, m, &n_to_fix, &weight_to_fix,
+                           MaybeSetBounds(p, m, &weight_to_fix,
                                           &v_delta, &d_delta, &m_delta);
 
     // Q will be flipped for opponent.
@@ -3079,7 +3073,7 @@ void SearchWorker::DoBackupUpdateSingleNode(
     v_delta = -v_delta;
     m++;
 
-    MaybeAdjustForTerminalOrTransposition(p, pl, v, d, m, n_to_fix,
+    MaybeAdjustForTerminalOrTransposition(p, pl, v, d, m,
                                           weight_to_fix, v_delta, d_delta,
                                           m_delta, update_parent_bounds);
 
@@ -3111,7 +3105,7 @@ void SearchWorker::DoBackupUpdateSingleNode(
   search_->max_depth_ = std::max(search_->max_depth_, (uint16_t)path.size());
 }
 
-bool SearchWorker::MaybeSetBounds(Node* p, float m, uint32_t* n_to_fix,
+bool SearchWorker::MaybeSetBounds(Node* p, float m,
                                   double* weight_to_fix, double* v_delta,
                                   double* d_delta, float* m_delta) const {
   auto losing_m = 0.0f;
@@ -3159,9 +3153,7 @@ bool SearchWorker::MaybeSetBounds(Node* p, float m, uint32_t* n_to_fix,
   } else if (lower == upper) {
     // Search can stop at the parent if the bounds can't change anymore, so make
     // it terminal preferring shorter wins and longer losses.
-    *n_to_fix = p->GetN();
-    *weight_to_fix = p->GetWeight() + p->GetN();
-    assert(*n_to_fix > 0);
+    *weight_to_fix = p->GetWeight();
     assert(*weight_to_fix > 0);
     pl->MakeTerminal(
         upper, (upper == GameResult::BLACK_WON ? std::max(losing_m, m) : m),

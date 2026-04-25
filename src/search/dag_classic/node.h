@@ -295,12 +295,12 @@ class Node {
   // Returns sum of policy priors which have had at least one playout.
   float GetVisitedPolicy() const;
   double GetWeight() const { return weight_; }
-  uint32_t GetN() const { return n_; }
+  float GetN() const { return weight_; }
   uint32_t GetNInFlight() const;
-  uint32_t GetChildrenVisits() const;
-  uint32_t GetTotalVisits() const;
+  float GetChildrenVisits() const;
+  float GetTotalVisits() const;
   // Returns n + n_in_flight.
-  int GetNStarted() const { return n_ + GetNInFlight(); }
+  float GetNStarted() const { return weight_ + GetNInFlight(); }
 
   double GetQ(double draw_score) const { return wl_ + draw_score * d_; }
   // Returns node eval, i.e. average subtree V for non-terminal node and -1/0/1
@@ -336,10 +336,9 @@ class Node {
   // * Q (weighted average of all V in a subtree)
   // * N (+=multivisit)
   // * N-in-flight (-=multivisit)
-  double FinalizeScoreUpdate(double v, double d, float m, uint32_t multivisit,
-                           double multiweight);
+  double FinalizeScoreUpdate(double v, double d, float m, double multiweight);
   // Like FinalizeScoreUpdate, but it updates n existing visits by delta amount.
-  void AdjustForTerminal(double v, double d, float m, double divisor, uint32_t multivisit,
+  void AdjustForTerminal(double v, double d, float m, double divisor,
                          double multiweight);
   // When search decides to treat one visit as several (in case of collisions
   // or visiting terminal nodes several times), it amplifies the visit by
@@ -446,6 +445,8 @@ class Node {
   // flipped depending on the side to move.
   double d_ = 0.0f;
 
+  double weight_ = 0.0;
+
   // 8 byte fields on 64-bit platforms, 4 byte on 32-bit.
   // Pointer to a next sibling. nullptr if there are no further siblings.
   atomic_unique_ptr<Node> sibling_;
@@ -454,9 +455,7 @@ class Node {
   // Estimated remaining plies.
   float m_ = 0.0f;
 
-  float weight_ = 0.0;
   // How many completed visits this node had.
-  uint32_t n_ = 0;
   // (AKA virtual loss.) How many threads currently process this node (started
   // but not finished). This value is added to n during selection which node
   // to pick in MCTS, and also when selecting the best move.
@@ -524,7 +523,7 @@ class LowNode {
   ~LowNode();
 
   void SetNNEval(const EvalResult* eval) {
-    assert(n_ == 0);
+    assert(weight_ == 0);
     assert(!child_);
 
     for (size_t idx = 0; idx < num_edges_; idx++) {
@@ -534,7 +533,6 @@ class LowNode {
     wl_ = eval->q;
     d_ = eval->d;
     m_ = eval->m;
-    weight_ = eval->e - 1;
 
     assert(WLDMInvariantsHold());
   }
@@ -546,8 +544,8 @@ class LowNode {
   bool HasChildren() const { return num_edges_ > 0; }
 
   double GetWeight() const { return weight_; }
-  uint32_t GetN() const { return n_; }
-  uint32_t GetChildrenVisits() const { return n_ - 1; }
+  float GetN() const { return weight_; }
+  float GetChildrenVisits() const { return weight_ - 1; }
 
   // Returns node eval, i.e. average subtree V for non-terminal node and -1/0/1
   // for terminal nodes.
@@ -579,9 +577,10 @@ class LowNode {
   // * Q (weighted average of all V in a subtree)
   // * N (+=multivisit)
   // * N-in-flight (-=multivisit)
-  double FinalizeScoreUpdate(double v, double d, float m, uint32_t multivisit, double multiweight);
+  double FinalizeScoreUpdate(double v, double d, float m, double multiweight);
   // Like FinalizeScoreUpdate, but it updates n existing visits by delta amount.
-  void AdjustForTerminal(double v, double d, float m, double divisor, uint32_t multivisi, double multiweight);
+  void AdjustForTerminal(double v, double d, float m, double divisor,
+                         double multiweight);
 
   // Deletes all children.
   void ReleaseChildren();
@@ -642,6 +641,9 @@ class LowNode {
   // flipped depending on the side to move.
   double d_ = 0.0f;
 
+  // How many completed visits this node had.
+  double weight_ = 0.0f;
+
   // 8 byte fields on 64-bit platforms, 4 byte on 32-bit.
   // Array of edges.
   std::unique_ptr<Edge[]> edges_;
@@ -651,10 +653,7 @@ class LowNode {
   // 4 byte fields.
   // Estimated remaining plies.
 
-  float weight_ = 0.0f;
   float m_ = 0.0f;
-  // How many completed visits this node had.
-  uint32_t n_ = 0;
 
   // 2 byte fields.
   // Number of parents.
@@ -711,9 +710,9 @@ class EdgeAndNode {
     return (node_ && node_->GetN() > 0) ? node_->GetM() : default_m;
   }
   // N-related getters, from Node (if exists).
-  uint32_t GetN() const { return node_ ? node_->GetN() : 0; }
-  int GetNStarted() const { return node_ ? node_->GetNStarted() : 0; }
-  uint32_t GetNInFlight() const { return node_ ? node_->GetNInFlight() : 0;}
+  float GetN() const { return node_ ? node_->GetN() : 0.0f; }
+  float GetNStarted() const { return node_ ? node_->GetNStarted() : 0.0f; }
+  uint32_t GetNInFlight() const { return node_ ? node_->GetNInFlight() : 0; }
 
   double GetWeight() const { return node_ ? node_->GetWeight() : 0; }
 
