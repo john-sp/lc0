@@ -44,7 +44,6 @@ message Weights {
       LINEAR16 = 1;
       FLOAT16 = 2;
       BFLOAT16 = 3;
-      FLOAT32 = 4;
     }
     optional Encoding encoding = 4;
     repeated uint32 dims = 5;
@@ -103,6 +102,8 @@ message Weights {
     optional Layer rpe_v = 12;
 
     // reserved 13 - 22 for int8 quantization
+    
+    optional Layer q_scale = 23;
   }
 
   message FFN {
@@ -110,6 +111,7 @@ message Weights {
     optional Layer dense1_b = 2;
     optional Layer dense2_w = 3;
     optional Layer dense2_b = 4;
+    optional Layer dense_gate_w = 11;
     // reserved 5 - 10 for int8 quantization
   }
 
@@ -138,6 +140,12 @@ message Weights {
     // Convolutions for legacy policy head.
     optional ConvBlock policy1 = 10;
     optional ConvBlock policy = 11;
+
+    // Simple policy head support.
+    optional Layer simple_ip1_pol_w = 12;
+    optional Layer simple_ip1_pol_b = 13;
+    optional Layer simple_ip2_pol_w = 14;
+    optional Layer simple_ip2_pol_b = 15;
   }
 
   message ValueHead {
@@ -154,6 +162,12 @@ message Weights {
 
     // Legacy value head support.
     optional ConvBlock value = 11;
+
+    // Simple value head support.
+    optional Layer simple_ip1_val_w = 12;
+    optional Layer simple_ip1_val_b = 13;
+    optional Layer simple_ip2_val_w = 14;
+    optional Layer simple_ip2_val_b = 15;
   }
 
   message PolicyHeadMap {
@@ -249,6 +263,13 @@ message Weights {
   optional ValueHeads value_heads = 44;
   optional PolicyHeads policy_heads = 45;
 
+  // Head premap for simple heads.
+  optional Layer ip_head_map_gate = 46;
+  optional Layer ip_head_map_1_w = 47;
+  optional Layer ip_head_map_1_b = 48;
+  optional Layer ip_head_map_2_w = 49;
+  optional Layer ip_head_map_2_b = 50;
+
   // Moves left head
   optional ConvBlock moves_left = 12;
   optional Layer ip_mov_w = 31;  // "embedding" for attention body moves left
@@ -284,6 +305,7 @@ message NetworkFormat {
     INPUT_112_WITH_CANONICALIZATION_V2 = 5;
     INPUT_112_WITH_CANONICALIZATION_V2_ARMAGEDDON = 133;
     INPUT_112_WITH_TACTICAL = 6;
+    INPUT_32_PLANE = 7;
   }
   optional InputFormat input = 1;
 
@@ -317,6 +339,7 @@ message NetworkFormat {
     POLICY_CLASSICAL = 1;
     POLICY_CONVOLUTION = 2;
     POLICY_ATTENTION = 3;
+    POLICY_SIMPLE = 4;
   }
   optional PolicyFormat policy = 4;
 
@@ -326,6 +349,7 @@ message NetworkFormat {
     VALUE_CLASSICAL = 1;
     VALUE_WDL = 2;
     VALUE_PARAM = 3;
+    VALUE_SIMPLE_WDL = 4;
   }
   optional ValueFormat value = 5;
 
@@ -333,6 +357,7 @@ message NetworkFormat {
   enum MovesLeftFormat {
     MOVES_LEFT_NONE = 0;
     MOVES_LEFT_V1 = 1;
+    MOVES_LEFT_SIMPLE = 2;
   }
   optional MovesLeftFormat moves_left = 6;
 
@@ -347,6 +372,7 @@ message NetworkFormat {
     ACTIVATION_SWISH = 7;
     ACTIVATION_RELU_2 = 8;
     ACTIVATION_SOFTMAX = 9;
+    ACTIVATION_SWIGLU = 10;
   }
 
   // Activation used everywhere except head outputs or otherwise specified.

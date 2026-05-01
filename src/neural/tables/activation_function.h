@@ -32,6 +32,7 @@ enum ActivationFunction {
   ACTIVATION_SWISH = 7,
   ACTIVATION_RELU_2 = 8,
   ACTIVATION_SOFTMAX = 9,
+  ACTIVATION_SWIGLU = 10,
 };
 
 struct Activations {

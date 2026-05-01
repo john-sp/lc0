@@ -65,6 +65,9 @@ inline float activate(float cVal, ActivationFunction activation) {
     case ACTIVATION_SWISH:
       cVal /= (1.0f + sycl::native::exp(-cVal));
       break;
+    case ACTIVATION_SWIGLU:
+      cVal /= (1.0f + sycl::native::exp(-cVal));
+      break;
   }
   return cVal;
 }

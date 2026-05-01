@@ -541,7 +541,19 @@ std::string Converter::MakeFFN(OnnxBuilder* builder,
       *GetWeghtsConverter(ffn.dense1_w, {embedding_size, dff_size}, {1, 0}));
   flow = builder->Add(name + "/ffn/dense1/b", flow,
                       *GetWeghtsConverter(ffn.dense1_b, {dff_size}));
-  flow = MakeActivation(builder, flow, name + "/ffn/dense1", activation);
+  if (activation == ACTIVATION_SWIGLU) {
+    if (ffn.dense_gate_w.empty()) {
+      throw Exception("SwiGLU FFN is missing gate weights in " + name);
+    }
+    auto gate = builder->MatMul(
+        name + "/ffn/gate/w", ffn_in,
+        *GetWeghtsConverter(ffn.dense_gate_w, {embedding_size, dff_size},
+                            {1, 0}));
+    gate = builder->Sigmoid(name + "/ffn/gate/sigmoid", gate);
+    flow = builder->Mul(name + "/ffn/gated", flow, gate);
+  } else {
+    flow = MakeActivation(builder, flow, name + "/ffn/dense1", activation);
+  }
   flow = builder->MatMul(
       name + "/ffn/dense2/w", flow,
       *GetWeghtsConverter(ffn.dense2_w, {dff_size, embedding_size}, {1, 0}));

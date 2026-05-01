@@ -190,6 +190,10 @@ void addBiasBatched(T* output, const T* input, const T* bias, int Batch, int N,
       addBiasBatched_kernel<T, ACTIVATION_SWISH>
           <<<gridDim, blockDim, 0, stream>>>(output, input, bias, N, C);
       break;
+    case ACTIVATION_SWIGLU:
+      addBiasBatched_kernel<T, ACTIVATION_SWIGLU>
+          <<<gridDim, blockDim, 0, stream>>>(output, input, bias, N, C);
+      break;
     case ACTIVATION_RELU_2:  // square relu
       addBiasBatched_kernel<T, ACTIVATION_RELU_2>
           <<<gridDim, blockDim, 0, stream>>>(output, input, bias, N, C);
@@ -292,6 +296,11 @@ void addBiasBatched(T* output, const T* input, const T* bias, int Batch, int N,
       break;
     case ACTIVATION_SWISH:
       addBiasBatched_kernel<T, ACTIVATION_SWISH>
+          <<<gridDim, blockDim, 0, stream>>>(output, input, bias, N, C,
+                                             Nstride);
+      break;
+    case ACTIVATION_SWIGLU:
+      addBiasBatched_kernel<T, ACTIVATION_SWIGLU>
           <<<gridDim, blockDim, 0, stream>>>(output, input, bias, N, C,
                                              Nstride);
       break;
@@ -1290,6 +1299,27 @@ void applyInputGating(T* output, const T* input, const T* mult, const T* add,
   ReportCUDAErrors(cudaGetLastError());
 }
 
+template <typename T>
+__global__ void swiglu_kernel(T* output, const T* input, const T* gate,
+                              int size) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= size) return;
+
+  const float gate_val = (float)gate[idx];
+  const float sigmoid = 1.0f / (1.0f + expf(-gate_val));
+  output[idx] = (T)((float)input[idx] * sigmoid);
+}
+
+template <typename T>
+void applySwiGLU(T* output, const T* input, const T* gate, int size,
+                 cudaStream_t stream) {
+  const int kBlockSize = 256;
+  const int blocks = DivUp(size, kBlockSize);
+  swiglu_kernel<T><<<blocks, kBlockSize, 0, stream>>>(output, input, gate,
+                                                      size);
+  ReportCUDAErrors(cudaGetLastError());
+}
+
 template <typename T, int kWorkPerThread>
 __global__ void genOffsetPointers_kernel(T** offsets, int heads, int block_size,
                                          int depth, int kv_heads, int k_stride,
@@ -1672,6 +1702,14 @@ template void applyInputGating<float>(float* output, const float* input,
                                       const float* mult, const float* add,
                                       int N, int C, int output_size,
                                       cudaStream_t stream);
+
+template void applySwiGLU<half>(half* output, const half* input,
+                                const half* gate, int size,
+                                cudaStream_t stream);
+
+template void applySwiGLU<float>(float* output, const float* input,
+                                 const float* gate, int size,
+                                 cudaStream_t stream);
 
 template void genOffsetPointers<float>(float** offsets, int heads,
                                        int max_batch, int depth, int kv_heads,

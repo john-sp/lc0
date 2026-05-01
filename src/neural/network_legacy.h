@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -89,6 +90,7 @@ struct BaseWeights {
     Vec dense1_b;
     Vec dense2_w;
     Vec dense2_b;
+    Vec dense_gate_w;
   };
 
   struct EncoderLayer {

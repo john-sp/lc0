@@ -58,6 +58,10 @@ void addBiasBatched(T* output, const T* input, const T* bias, int Batch, int N,
                     int C, int Nstride, ActivationFunction activation,
                     cudaStream_t stream);
 
+template <typename T>
+void applySwiGLU(T* output, const T* input, const T* gate, int size,
+                 cudaStream_t stream);
+
 // Add bias to convolution's output.
 template <typename T>
 void addBias_NCHW(T* c, T* a, T* b, int N, int C, int H, int W,

@@ -359,6 +359,7 @@ class EncoderBlock {
   DataType *ln1_gammas, *ln1_betas;
 
   DataType *ffn_dense1_w, *ffn_dense1_b;
+  DataType *ffn_dense_gate_w;
   DataType *ffn_dense2_w, *ffn_dense2_b;
 
   DataType *ln2_gammas, *ln2_betas;
@@ -386,6 +387,7 @@ class EncoderBlock {
   float default_eps_;  // value of epsilon where it wasn't specified in training
 
   const bool has_smolgen_;
+  const bool has_ffn_gate_;
   const ActivationFunction smolgen_activation_;
   const ActivationFunction ffn_activation_;
 
@@ -498,6 +500,7 @@ class AttentionBody : public BaseLayer<DataType> {
   DataType *ip_emb_ln_g_, *ip_emb_ln_b_;  // input embedding layernorm gamma and beta
   DataType *ip_mult_gate_, *ip_add_gate_;   // input gating
   DataType *ip_emb_ffn_d1_w_, *ip_emb_ffn_d1_b_;  // input embedding FFN dense1 weights
+  DataType *ip_emb_ffn_dg_w_;  // input embedding FFN gate weights
   DataType *ip_emb_ffn_d2_w_, *ip_emb_ffn_d2_b_;  // input embedding FFN dense2 weights
   DataType *ip_emb_ffn_ln_g_, *ip_emb_ffn_ln_b_;  // input embedding FFN layernorm gamma and beta
   DataType *smolgen_global_;  // global smolgen weights for all encoder layers
@@ -514,6 +517,7 @@ class AttentionBody : public BaseLayer<DataType> {
   int smolgen_global_size_;
   const bool has_gating_;
   const bool has_smolgen_;
+  const bool has_embedding_ffn_gate_;
   bool is_pe_dense_embedding_;  // flag for dense position encoding
   const bool use_fused_mha_;
 };
