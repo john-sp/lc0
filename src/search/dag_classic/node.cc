@@ -234,7 +234,6 @@ void LowNode::MakeNotTerminal(const Node* node) {
   terminal_type_ = Terminal::NonTerminal;
   lower_bound_ = GameResult::BLACK_WON;
   upper_bound_ = GameResult::WHITE_WON;
-  weight_ = 0;
   weight_ = 0.0;
   wl_ = 0.0;
   d_ = 0.0;

@@ -48,7 +48,7 @@ class SearchParams : public classic::BaseSearchParams {
   float GetUncertaintyWeightingCoefficient() const {
     return kUncertaintyWeightingCoefficient;
   }
-  float GetUncertaintyWeightingExponents() const {
+  float GetUncertaintyWeightingExponent() const {
     return kUncertaintyWeightingExponent;
   }
 

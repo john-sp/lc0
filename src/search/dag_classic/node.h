@@ -334,8 +334,8 @@ class Node {
   // Updates the node with newly computed value v.
   // Updates:
   // * Q (weighted average of all V in a subtree)
-  // * N (+=multivisit)
-  // * N-in-flight (-=multivisit)
+  // * W (+=multiweight)
+  // * N-in-flight (-=1)
   double FinalizeScoreUpdate(double v, double d, float m, double multiweight);
   // Like FinalizeScoreUpdate, but it updates n existing visits by delta amount.
   void AdjustForTerminal(double v, double d, float m, double divisor,
@@ -445,6 +445,8 @@ class Node {
   // flipped depending on the side to move.
   double d_ = 0.0f;
 
+  // W is completed visits adjusted by uncertainty. It is used to estimate
+  // confidence bounds of evaluation.
   double weight_ = 0.0;
 
   // 8 byte fields on 64-bit platforms, 4 byte on 32-bit.
@@ -575,8 +577,8 @@ class LowNode {
   // Updates the node with newly computed value v.
   // Updates:
   // * Q (weighted average of all V in a subtree)
-  // * N (+=multivisit)
-  // * N-in-flight (-=multivisit)
+  // * W (+=multiweight)
+  // * N-in-flight (-=1)
   double FinalizeScoreUpdate(double v, double d, float m, double multiweight);
   // Like FinalizeScoreUpdate, but it updates n existing visits by delta amount.
   void AdjustForTerminal(double v, double d, float m, double divisor,
