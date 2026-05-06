@@ -2993,7 +2993,9 @@ void SearchWorker::DoBackupUpdateSingleNode(
   double d_delta = 0.0;
   float m_delta = 0.0f;
 
-  double avg_weight = 1.0;
+  double avg_weight = params_.GetUseUncertaintyWeighting()
+                         ? params_.GetUncertaintyWeightingCap()
+                         : 1.0;
 
   // Update the low node at the start of the backup path first, but only visit
   // it the first time that backup sees it.
@@ -3001,6 +3003,8 @@ void SearchWorker::DoBackupUpdateSingleNode(
     auto& eval = state_.eval_results_[node_to_process.eval_index];
     avg_weight = eval.e;
     nl->FinalizeScoreUpdate(nl->GetWL(), nl->GetD(), nl->GetM(), avg_weight);
+  } else if (nl) {
+    avg_weight = std::min(avg_weight, nl->GetWeight());
   }
 
   if (nr >= 2) {
