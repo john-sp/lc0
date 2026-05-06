@@ -2299,7 +2299,9 @@ void SearchWorker::DoBackupUpdateSingleNode(
   float d_delta = 0.0f;
   float m_delta = 0.0f;
 
-  float avg_weight = params_.GetUncertaintyWeightingCap();
+  float avg_weight = params_.GetUseUncertaintyWeighting()
+                         ? params_.GetUncertaintyWeightingCap()
+                         : 1.0f;
 
   // Update the low node at the start of the backup path first, but only visit
   // it the first time that backup sees it.
