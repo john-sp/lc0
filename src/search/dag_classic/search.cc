@@ -2160,9 +2160,11 @@ void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process) {
   auto& eval = *node_to_process->eval.get();
   if (params_.GetUseUncertaintyWeighting()) {
     const float e = eval.e;
+    assert(e >= 0.0f);
+    assert(e <= 1.0f);
     const float cap = params_.GetUncertaintyWeightingCap();
     const float coefficient = params_.GetUncertaintyWeightingCoefficient();
-    const float exponent = params_.GetUncertaintyWeightingExponents();
+    const float exponent = params_.GetUncertaintyWeightingExponent();
     eval.e = std::min(cap, coefficient * FastExp(exponent * FastLog(e)));
   } else {
     eval.e = 1.0f;
