@@ -586,12 +586,12 @@ std::vector<std::string> Search::GetVerboseStats(
           EvalPosition{history.GetPositions(), {}});
       if (nneval) {
         v = -nneval->q;
-        e = nneval->e;
+        e = std::sqrt(nneval->e);
       }
     }
     if (v) {
-      print(oss, "(E: ", e, ") ", 7, 4);
       print(oss, "(V: ", sign * *v, ") ", 7, 4);
+      print(oss, "(E: ", e, ") ", 7, 4);
     } else {
       *oss << "(V:  -.----) ";
     }
@@ -2159,13 +2159,20 @@ void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process) {
   wdl_rescale();
   auto& eval = *node_to_process->eval.get();
   if (params_.GetUseUncertaintyWeighting()) {
-    const float e = eval.e;
-    assert(e >= 0.0f);
-    assert(e <= 1.0f);
+    assert(eval.e >= 0.0f);
+    assert(eval.e <= 1.0f);
+    const float e = std::sqrt(eval.e);
+    const float t0 = params_.GetUncertaintyWeightingMidPoint();
+    const float minus_r = params_.GetUncertaintyWeightingMinusExponent();
+    const float scale = params_.GetUncertaintyWeightingScale();
+    const float y0 = params_.GetUncertaintyWeightingBase();
     const float cap = params_.GetUncertaintyWeightingCap();
-    const float coefficient = params_.GetUncertaintyWeightingCoefficient();
-    const float exponent = params_.GetUncertaintyWeightingExponent();
-    eval.e = std::min(cap, coefficient * FastExp(exponent * FastLog(e)));
+    const float exponent = minus_r * (e - t0);
+    const float scaled = exponent < -20.0f ? scale
+                         : exponent > 20.0f
+                             ? 0.0f
+                             : scale / (1.0f + FastExp(exponent));
+    eval.e = std::min(y0 + scaled, cap);
   } else {
     eval.e = 1.0f;
   }
