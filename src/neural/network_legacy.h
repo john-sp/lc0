@@ -144,6 +144,13 @@ struct BaseWeights {
   Vec ip2_mov_w;
   Vec ip2_mov_b;
 
+  // Head premap for simple heads.
+  Vec ip_head_map_gate;
+  Vec ip_head_map_1_w;
+  Vec ip_head_map_1_b;
+  Vec ip_head_map_2_w;
+  Vec ip_head_map_2_b;
+
   // Smolgen global weights
   Vec smolgen_w;
   bool has_smolgen;
@@ -202,6 +209,11 @@ struct MultiHeadWeights : public BaseWeights {
     Vec ip3_pol_w;
     Vec ip3_pol_b;
     Vec ip4_pol_w;
+    // Simple policy head params.
+    Vec simple_ip1_pol_w;
+    Vec simple_ip1_pol_b;
+    Vec simple_ip2_pol_w;
+    Vec simple_ip2_pol_b;
     int pol_encoder_head_count;
     std::vector<EncoderLayer> pol_encoder;
   };
@@ -218,6 +230,13 @@ struct MultiHeadWeights : public BaseWeights {
     Vec ip2_val_b;
     Vec ip_val_err_w;
     Vec ip_val_err_b;
+    Vec ip_val_cat_w;
+    Vec ip_val_cat_b;
+    // Simple value head params.
+    Vec simple_ip1_val_w;
+    Vec simple_ip1_val_b;
+    Vec simple_ip2_val_w;
+    Vec simple_ip2_val_b;
   };
 
  private:

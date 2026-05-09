@@ -155,6 +155,12 @@ class Converter {
                                   const MultiHeadWeights& weights,
                                   const MultiHeadWeights::PolicyHead& head);
 
+  bool IsSimpleHeadsMode() const;
+
+  std::string MakeSimpleHeadPremap(OnnxBuilder* builder,
+                                   const std::string& input,
+                                   const MultiHeadWeights& weights);
+
   void MakePolicyHead(pblczero::OnnxModel* onnx, OnnxBuilder* builder,
                       const std::string& input,
                       const MultiHeadWeights& weights);
@@ -187,6 +193,13 @@ class Converter {
   const float default_eps_;
   bool se_reshape_init_ = false;
 };
+
+bool Converter::IsSimpleHeadsMode() const {
+  const auto& nf = src_.format().network_format();
+  return nf.policy() == pblczero::NetworkFormat::POLICY_SIMPLE &&
+         nf.value() == pblczero::NetworkFormat::VALUE_SIMPLE_WDL &&
+         nf.moves_left() == pblczero::NetworkFormat::MOVES_LEFT_SIMPLE;
+}
 
 pblczero::TensorProto::DataType Converter::GetDataType() const {
   switch (options_.data_type) {
@@ -918,6 +931,58 @@ std::string Converter::MakeAttentionBody(OnnxBuilder* builder,
   return flow;
 }
 
+std::string Converter::MakeSimpleHeadPremap(OnnxBuilder* builder,
+                                            const std::string& input,
+                                            const MultiHeadWeights& weights) {
+  if (NumEncBlocks() == 0) {
+    throw Exception("Simple heads require encoder output, but encoder is empty.");
+  }
+  const int embedding_size = weights.ip_emb_b.size();
+  if (weights.ip_head_map_1_b.empty() || weights.ip_head_map_1_w.empty() ||
+      weights.ip_head_map_2_b.empty() || weights.ip_head_map_2_w.empty()) {
+    throw Exception("Simple heads require ip_head_map_1/2 weights and biases.");
+  }
+  const int premap_hidden = weights.ip_head_map_1_b.size();
+  const int premap_input = weights.ip_head_map_1_w.size() / premap_hidden;
+  if (premap_input != embedding_size) {
+    throw Exception("ip_head_map_1_w has invalid shape for embedding size.");
+  }
+  const int premap_output = weights.ip_head_map_2_b.size();
+  const int premap_flatten = weights.ip_head_map_2_w.size() / premap_output;
+  if (premap_flatten != 64 * premap_hidden) {
+    throw Exception("ip_head_map_2_w has invalid shape for simple head premap.");
+  }
+
+  auto flow = input;
+  if (!weights.ip_head_map_gate.empty()) {
+    if (static_cast<int>(weights.ip_head_map_gate.size()) != embedding_size) {
+      throw Exception("ip_head_map_gate size must match embedding size.");
+    }
+    flow = builder->Mul("/headpremap/gate", flow,
+                        *GetWeghtsConverter(weights.ip_head_map_gate,
+                                            {embedding_size}));
+  }
+  flow = builder->MatMul(
+      "/headpremap/dense1/matmul", flow,
+      *GetWeghtsConverter(weights.ip_head_map_1_w,
+                          {embedding_size, premap_hidden}, {1, 0}));
+  flow = builder->Add("/headpremap/dense1/add", flow,
+                      *GetWeghtsConverter(weights.ip_head_map_1_b,
+                                          {premap_hidden}));
+  flow = builder->Reshape(
+      "/headpremap/flatten", flow,
+      builder->AddInitializer("/const/headpremap/flatten_shape",
+                              Int64OnnxConst({-1, 64 * premap_hidden}, {2})));
+  flow = builder->MatMul(
+      "/headpremap/dense2/matmul", flow,
+      *GetWeghtsConverter(weights.ip_head_map_2_w,
+                          {64 * premap_hidden, premap_output}, {1, 0}));
+  flow = builder->Add("/headpremap/dense2/add", flow,
+                      *GetWeghtsConverter(weights.ip_head_map_2_b,
+                                          {premap_output}));
+  return flow;
+}
+
 namespace {
 std::vector<int> MakePolicyMap(const short* map, int size) {
   std::vector<int> policy_map(1858);
@@ -1048,6 +1113,40 @@ void Converter::MakePolicyHead(pblczero::OnnxModel* onnx, OnnxBuilder* builder,
   }
   const MultiHeadWeights::PolicyHead& head =
       weights.policy_heads.at(options_.policy_head);
+  if (IsSimpleHeadsMode()) {
+    if (head.simple_ip1_pol_b.empty() || head.simple_ip1_pol_w.empty() ||
+        head.simple_ip2_pol_b.empty() || head.simple_ip2_pol_w.empty()) {
+      throw Exception("Simple policy head selected '" + options_.policy_head +
+                      "' is missing required tensors.");
+    }
+    if (head.simple_ip2_pol_b.size() != 1858) {
+      throw Exception("Simple policy head output size must be exactly 1858.");
+    }
+    const int simple_input = weights.ip_head_map_2_b.size();
+    const int hidden = head.simple_ip1_pol_b.size();
+    if (static_cast<int>(head.simple_ip1_pol_w.size()) != simple_input * hidden ||
+        static_cast<int>(head.simple_ip2_pol_w.size()) != hidden * 1858) {
+      throw Exception("Simple policy head tensors have invalid shape.");
+    }
+    auto flow = builder->MatMul(
+        "/policy/simple/dense1/matmul", input,
+        *GetWeghtsConverter(head.simple_ip1_pol_w,
+                            {simple_input, hidden},
+                            {1, 0}));
+    flow = builder->Add("/policy/simple/dense1/add", flow,
+                        *GetWeghtsConverter(head.simple_ip1_pol_b, {hidden}));
+    flow = MakeActivation(builder, flow, "/policy/simple/dense1",
+                          default_activation_);
+    flow = builder->MatMul(
+        "/policy/simple/dense2/matmul", flow,
+        *GetWeghtsConverter(head.simple_ip2_pol_w, {hidden, 1858}, {1, 0}));
+    auto output = builder->Add(options_.output_policy_head, flow,
+                               *GetWeghtsConverter(head.simple_ip2_pol_b,
+                                                   {1858}));
+    builder->AddOutput(output, {options_.batch_size, 1858}, GetDataType());
+    onnx->set_output_policy(output);
+    return;
+  }
   if (src_.format().network_format().policy() ==
       pblczero::NetworkFormat::POLICY_ATTENTION) {
     auto output = MakeAttentionPolicy(builder, input, weights, head);
@@ -1116,6 +1215,42 @@ void Converter::MakeValueHead(pblczero::OnnxModel* onnx, OnnxBuilder* builder,
   }
   const MultiHeadWeights::ValueHead& head =
       weights.value_heads.at(options_.value_head);
+  if (IsSimpleHeadsMode()) {
+    if (head.simple_ip1_val_b.empty() || head.simple_ip1_val_w.empty() ||
+        head.simple_ip2_val_b.empty() || head.simple_ip2_val_w.empty()) {
+      throw Exception("Simple value head selected '" + options_.value_head +
+                      "' is missing required tensors.");
+    }
+    if (head.simple_ip2_val_b.size() != 3) {
+      throw Exception("Simple value head output size must be exactly 3 (WDL).");
+    }
+    const int simple_input = weights.ip_head_map_2_b.size();
+    const int hidden = head.simple_ip1_val_b.size();
+    if (static_cast<int>(head.simple_ip1_val_w.size()) != simple_input * hidden ||
+        static_cast<int>(head.simple_ip2_val_w.size()) != hidden * 3) {
+      throw Exception("Simple value head tensors have invalid shape.");
+    }
+    auto flow = builder->MatMul(
+        "/value/simple/dense1/matmul", input,
+        *GetWeghtsConverter(head.simple_ip1_val_w,
+                            {simple_input, hidden},
+                            {1, 0}));
+    flow = builder->Add("/value/simple/dense1/add", flow,
+                        *GetWeghtsConverter(head.simple_ip1_val_b, {hidden}));
+    flow = MakeActivation(builder, flow, "/value/simple/dense1",
+                          default_activation_);
+    flow = builder->MatMul(
+        "/value/simple/dense2/matmul", flow,
+        *GetWeghtsConverter(head.simple_ip2_val_w, {hidden, 3}, {1, 0}));
+    flow = builder->Add("/value/simple/dense2/add", flow,
+                        *GetWeghtsConverter(head.simple_ip2_val_b, {3}));
+    if (!options_.no_wdl_softmax) {
+      flow = builder->Softmax(options_.output_wdl, flow);
+    }
+    builder->AddOutput(flow, {options_.batch_size, 3}, GetDataType());
+    onnx->set_output_wdl(flow);
+    return;
+  }
   if (head.ip1_val_b.empty()) {
     throw Exception("The value head selected '" + options_.value_head + "'" +
                     " is empty.");
@@ -1175,6 +1310,36 @@ void Converter::MakeMovesLeftHead(pblczero::OnnxModel* onnx,
                                   OnnxBuilder* builder,
                                   const std::string& input,
                                   const MultiHeadWeights& weights) {
+  if (IsSimpleHeadsMode()) {
+    if (weights.ip1_mov_b.empty() || weights.ip1_mov_w.empty() ||
+        weights.ip2_mov_b.empty() || weights.ip2_mov_w.empty()) {
+      throw Exception("Simple moves-left head is missing required tensors.");
+    }
+    const int simple_input = weights.ip_head_map_2_b.size();
+    const int hidden = weights.ip1_mov_b.size();
+    if (static_cast<int>(weights.ip1_mov_w.size()) != simple_input * hidden ||
+        static_cast<int>(weights.ip2_mov_w.size()) != hidden) {
+      throw Exception("Simple moves-left head tensors have invalid shape.");
+    }
+    auto flow = builder->MatMul(
+        "/mlh/simple/dense1/matmul", input,
+        *GetWeghtsConverter(weights.ip1_mov_w,
+                            {simple_input, hidden},
+                            {1, 0}));
+    flow = builder->Add("/mlh/simple/dense1/add", flow,
+                        *GetWeghtsConverter(weights.ip1_mov_b, {hidden}));
+    flow = MakeActivation(builder, flow, "/mlh/simple/dense1",
+                          default_activation_);
+    flow = builder->MatMul(
+        "/mlh/simple/dense2/matmul", flow,
+        *GetWeghtsConverter(weights.ip2_mov_w, {hidden, 1}, {1, 0}));
+    flow = builder->Add("/mlh/simple/dense2/add", flow,
+                        *GetWeghtsConverter(weights.ip2_mov_b, {1}));
+    auto output = builder->Relu(options_.output_mlh, flow);
+    builder->AddOutput(output, {options_.batch_size, 1}, GetDataType());
+    onnx->set_output_mlh(output);
+    return;
+  }
   if (src_.format().network_format().moves_left() !=
       pblczero::NetworkFormat::MOVES_LEFT_V1) {
     return;
@@ -1254,12 +1419,17 @@ void Converter::GenerateOnnx(pblczero::OnnxModel* onnx) {
     flow = MakeAttentionBody(&builder, flow, weights);
   }
 
+  auto heads_input = flow;
+  if (IsSimpleHeadsMode()) {
+    heads_input = MakeSimpleHeadPremap(&builder, flow, weights);
+  }
+
   // Policy head.
-  MakePolicyHead(onnx, &builder, flow, weights);
+  MakePolicyHead(onnx, &builder, heads_input, weights);
   // Value head.
-  MakeValueHead(onnx, &builder, flow, weights);
+  MakeValueHead(onnx, &builder, heads_input, weights);
   // Moves left head.
-  MakeMovesLeftHead(onnx, &builder, flow, weights);
+  MakeMovesLeftHead(onnx, &builder, heads_input, weights);
 
   onnx->set_model(builder.OutputAsString());
 }
@@ -1299,6 +1469,7 @@ void CheckSrcFormat(const pblczero::NetworkFormat& nf) {
     case pblczero::NetworkFormat::POLICY_CLASSICAL:
     case pblczero::NetworkFormat::POLICY_CONVOLUTION:
     case pblczero::NetworkFormat::POLICY_ATTENTION:
+    case pblczero::NetworkFormat::POLICY_SIMPLE:
       break;
     default:
       throw Exception("Policy format " +
@@ -1308,11 +1479,36 @@ void CheckSrcFormat(const pblczero::NetworkFormat& nf) {
   switch (nf.value()) {
     case pblczero::NetworkFormat::VALUE_CLASSICAL:
     case pblczero::NetworkFormat::VALUE_WDL:
+    case pblczero::NetworkFormat::VALUE_SIMPLE_WDL:
       break;
     default:
       throw Exception("Value format " +
                       pblczero::NetworkFormat::ValueFormat_Name(nf.value()) +
                       " is not supported by the ONNX converter.");
+  }
+  switch (nf.moves_left()) {
+    case pblczero::NetworkFormat::MOVES_LEFT_NONE:
+    case pblczero::NetworkFormat::MOVES_LEFT_V1:
+    case pblczero::NetworkFormat::MOVES_LEFT_SIMPLE:
+      break;
+    default:
+      throw Exception("Moves-left format " +
+                      pblczero::NetworkFormat::MovesLeftFormat_Name(
+                          nf.moves_left()) +
+                      " is not supported by the ONNX converter.");
+  }
+  const bool simple_mode =
+      nf.policy() == pblczero::NetworkFormat::POLICY_SIMPLE ||
+      nf.value() == pblczero::NetworkFormat::VALUE_SIMPLE_WDL ||
+      nf.moves_left() == pblczero::NetworkFormat::MOVES_LEFT_SIMPLE;
+  const bool simple_tuple =
+      nf.policy() == pblczero::NetworkFormat::POLICY_SIMPLE &&
+      nf.value() == pblczero::NetworkFormat::VALUE_SIMPLE_WDL &&
+      nf.moves_left() == pblczero::NetworkFormat::MOVES_LEFT_SIMPLE;
+  if (simple_mode && !simple_tuple) {
+    throw Exception(
+        "Simple heads require exact tuple: POLICY_SIMPLE + VALUE_SIMPLE_WDL + "
+        "MOVES_LEFT_SIMPLE.");
   }
   switch (nf.default_activation()) {
     case pblczero::NetworkFormat::DEFAULT_ACTIVATION_RELU:

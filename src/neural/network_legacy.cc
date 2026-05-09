@@ -52,6 +52,11 @@ BaseWeights::BaseWeights(const pblczero::Weights& weights)
       ip1_mov_b(LayerAdapter(weights.ip1_mov_b()).as_vector()),
       ip2_mov_w(LayerAdapter(weights.ip2_mov_w()).as_vector()),
       ip2_mov_b(LayerAdapter(weights.ip2_mov_b()).as_vector()),
+      ip_head_map_gate(LayerAdapter(weights.ip_head_map_gate()).as_vector()),
+      ip_head_map_1_w(LayerAdapter(weights.ip_head_map_1_w()).as_vector()),
+      ip_head_map_1_b(LayerAdapter(weights.ip_head_map_1_b()).as_vector()),
+      ip_head_map_2_w(LayerAdapter(weights.ip_head_map_2_w()).as_vector()),
+      ip_head_map_2_b(LayerAdapter(weights.ip_head_map_2_b()).as_vector()),
       smolgen_w(LayerAdapter(weights.smolgen_w()).as_vector()),
       has_smolgen(weights.has_smolgen_w()) {
   for (const auto& res : weights.residual()) {
@@ -187,7 +192,12 @@ MultiHeadWeights::PolicyHead::PolicyHead(
       ip2_pol_b(LayerAdapter(policyhead.ip2_pol_b()).as_vector()),
       ip3_pol_w(LayerAdapter(policyhead.ip3_pol_w()).as_vector()),
       ip3_pol_b(LayerAdapter(policyhead.ip3_pol_b()).as_vector()),
-      ip4_pol_w(LayerAdapter(policyhead.ip4_pol_w()).as_vector()) {
+      ip4_pol_w(LayerAdapter(policyhead.ip4_pol_w()).as_vector()),
+      simple_ip1_pol_w(LayerAdapter(policyhead.simple_ip1_pol_w()).as_vector()),
+      simple_ip1_pol_b(LayerAdapter(policyhead.simple_ip1_pol_b()).as_vector()),
+      simple_ip2_pol_w(LayerAdapter(policyhead.simple_ip2_pol_w()).as_vector()),
+      simple_ip2_pol_b(
+          LayerAdapter(policyhead.simple_ip2_pol_b()).as_vector()) {
   pol_encoder_head_count = policyhead.pol_headcount();
   for (const auto& enc : policyhead.pol_encoder()) {
     pol_encoder.emplace_back(enc);
@@ -204,7 +214,14 @@ MultiHeadWeights::ValueHead::ValueHead(
       ip2_val_w(LayerAdapter(valuehead.ip2_val_w()).as_vector()),
       ip2_val_b(LayerAdapter(valuehead.ip2_val_b()).as_vector()),
       ip_val_err_w(LayerAdapter(valuehead.ip_val_err_w()).as_vector()),
-      ip_val_err_b(LayerAdapter(valuehead.ip_val_err_b()).as_vector()) {}
+      ip_val_err_b(LayerAdapter(valuehead.ip_val_err_b()).as_vector()),
+      ip_val_cat_w(LayerAdapter(valuehead.ip_val_cat_w()).as_vector()),
+      ip_val_cat_b(LayerAdapter(valuehead.ip_val_cat_b()).as_vector()),
+      simple_ip1_val_w(LayerAdapter(valuehead.simple_ip1_val_w()).as_vector()),
+      simple_ip1_val_b(LayerAdapter(valuehead.simple_ip1_val_b()).as_vector()),
+      simple_ip2_val_w(LayerAdapter(valuehead.simple_ip2_val_w()).as_vector()),
+      simple_ip2_val_b(
+          LayerAdapter(valuehead.simple_ip2_val_b()).as_vector()) {}
 
 LegacyWeights::LegacyWeights(const pblczero::Weights& weights)
     : BaseWeights(weights),
