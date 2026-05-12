@@ -1970,7 +1970,7 @@ void SearchWorker::GatherMinibatch() {
   int cur_n = 0;
 
   // Collision use atomic operations. We can cancel them outside the lock.
-  absl::Cleanup cancel_collsions = [&] {
+  absl::Cleanup cancel_collsions = [this] {
     ScheduleCancelTask(0, state_.collisions_.size(), true);
   };
   // We take the nodes_mutex_ only once to avoid bouncing between this thread
@@ -2265,13 +2265,13 @@ SearchWorker::PickNodesToExtendTask(int collision_limit, int tid,
       std::array<float, kMaxMovesInPosition> current_score;
       std::array<float, kMaxMovesInPosition> current_nstarted;
       std::array<CurrentPath, kMaxMovesInPosition> visits_to_perform;
-
       if (is_root_node) {
         // Root node is again special - needs its n in flight updated separately
         // as its not handled on the path to it, since there isn't one.
         node->IncrementNInFlight(cur_limit);
       }
 
+      // Create visits_to_perform new back entry for this level.
       int vtp_last_filled = -1;
 
       // Cache all constant UCT parameters.
