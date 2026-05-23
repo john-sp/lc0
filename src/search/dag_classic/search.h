@@ -625,6 +625,7 @@ class SearchWorker {
   bool MaybeAdjustForTerminalOrTransposition(Node* n,
                                              const std::shared_ptr<LowNode>& nl,
                                              double& v, double& d, float& m,
+                                             double avg_weight,
                                              double& weight_to_fix, double& v_delta,
                                              double& d_delta, float& m_delta,
                                              bool& update_parent_bounds) const;

@@ -1024,7 +1024,7 @@ inline float GetFpu(const SearchParams& params, const Node* node,
              : -node->GetQ(-draw_score) - value * std::sqrt(visited_pol);
 }
 
-inline float ComputeCpuct(const SearchParams& params, uint32_t N,
+inline float ComputeCpuct(const SearchParams& params, float N,
                           bool is_root_node) {
   const float init = params.GetCpuct(is_root_node);
   const float k = params.GetCpuctFactor(is_root_node);
@@ -1108,12 +1108,13 @@ std::vector<std::string> Search::GetVerboseStats(
           EvalPosition{history.GetPositions(), {}});
       if (nneval) {
         v = -nneval->q;
-        e = nneval->e;
+        e = std::sqrt(nneval->e);
       }
     }
     if (v) {
       print(oss, "(E: ", e, ") ", 7, 4);
       print(oss, "(V: ", sign * *v, ") ", 7, 4);
+      print(oss, "(E: ", e, ") ", 7, 4);
     } else {
       *oss << "(V:  -.----) ";
     }
@@ -2222,7 +2223,8 @@ SearchWorker::PickNodesToExtendTask(int collision_limit, int tid,
   current_path.emplace_back(collision_limit, true, visit_root, stop_root, 0);
   // take base sqrt(2) logarithm of root node for large subbranch N limit. It is
   // used to split tasks.
-  const unsigned large_branch_limit = std::bit_width<uint32_t>(search_->root_node_->GetN()) * 2;
+  const unsigned large_branch_limit =
+      std::bit_width<uint32_t>(search_->root_node_->GetN()) * 2;
   while (current_path.size() > starting_path_size) {
     assert(!full_path.empty());
     int cur_limit = current_path.back().visits_;
@@ -2330,7 +2332,7 @@ SearchWorker::PickNodesToExtendTask(int collision_limit, int tid,
           const float util = current_util[idx];
           if (idx > cache_filled_idx) {
             current_score[idx] =
-                cur_iters[idx].GetP() * puct_mult / (1 + nstarted) + util;
+                cur_iters[idx].GetP() * puct_mult / (1.0f + nstarted) + util;
             cache_filled_idx++;
           }
           if (is_root_node) {
@@ -2376,11 +2378,11 @@ SearchWorker::PickNodesToExtendTask(int collision_limit, int tid,
         if (second_best_edge) {
           int estimated_visits_to_change_best = std::numeric_limits<int>::max();
           if (best_without_u < second_best) {
-            const auto n1 = current_nstarted[best_idx] + 1;
+            const auto n1 = current_nstarted[best_idx] + 1.0f;
             estimated_visits_to_change_best = static_cast<int>(
                 std::max(1.0f, std::min(cur_iters[best_idx].GetP() * puct_mult /
                                                 (second_best - best_without_u) -
-                                            n1 + 1,
+                                            n1 + 1.0f,
                                         1e9f)));
           }
           second_best_edge.Reset();
@@ -2431,7 +2433,7 @@ SearchWorker::PickNodesToExtendTask(int collision_limit, int tid,
             current_nstarted[best_idx] += new_visits;
           }
           current_score[best_idx] = cur_iters[best_idx].GetP() * puct_mult /
-                                        (1 + current_nstarted[best_idx]) +
+                                        (1.0f + current_nstarted[best_idx]) +
                                     current_util[best_idx];
         } else {
           // We found a collision. Remaining visits go here.
@@ -2809,13 +2811,20 @@ void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process,
   };
   wdl_rescale();
   if (params_.GetUseUncertaintyWeighting()) {
-    const float e = eval.e;
-    assert(e >= 0.0f);
-    assert(e <= 1.0f);
+    assert(eval.e >= 0.0f);
+    assert(eval.e <= 1.0f);
+    const float e = std::sqrt(eval.e);
+    const float t0 = params_.GetUncertaintyWeightingMidPoint();
+    const float minus_r = params_.GetUncertaintyWeightingMinusExponent();
+    const float scale = params_.GetUncertaintyWeightingScale();
+    const float y0 = params_.GetUncertaintyWeightingBase();
     const float cap = params_.GetUncertaintyWeightingCap();
-    const float coefficient = params_.GetUncertaintyWeightingCoefficient();
-    const float exponent = params_.GetUncertaintyWeightingExponent();
-    eval.e = std::min(cap, coefficient * FastExp(exponent * FastLog(e)));
+    const float exponent = minus_r * (e - t0);
+    const float scaled = exponent < -20.0f ? scale
+                         : exponent > 20.0f
+                             ? 0.0f
+                             : scale / (1.0f + FastExp(exponent));
+    eval.e = std::min(y0 + scaled, cap);
   } else {
     eval.e = 1.0f;
   }
@@ -2871,7 +2880,7 @@ void SearchWorker::DoBackupUpdate() {
 
 bool SearchWorker::MaybeAdjustForTerminalOrTransposition(
     Node* n, const std::shared_ptr<LowNode>& nl, double& v, double& d, float& m,
-    double& weight_to_fix, double& v_delta, double& d_delta,
+    double avg_weight, double& weight_to_fix, double& v_delta, double& d_delta,
     float& m_delta, bool& update_parent_bounds) const {
   if (n->IsTerminal()) {
     v = n->GetWL();
@@ -2882,7 +2891,8 @@ bool SearchWorker::MaybeAdjustForTerminalOrTransposition(
   }
 
   // Use information from transposition or a new terminal.
-  if (nl->IsTransposition() || nl->IsTerminal() || n->GetN() + 1 < nl->GetN()) {
+  if (nl->IsTransposition() || nl->IsTerminal() ||
+      n->GetWeight() + avg_weight < nl->GetWeight()) {
     // Adapt information from low node to node by flipping Q sign, bounds,
     // result and incrementing m.
     v = -nl->GetWL();
@@ -3015,7 +3025,7 @@ void SearchWorker::DoBackupUpdateSingleNode(
     d = 1.0f;
     m = 1;
   } else if (!MaybeAdjustForTerminalOrTransposition(
-                 n, nl, v, d, m, weight_to_fix, v_delta, d_delta,
+                 n, nl, v, d, m, avg_weight, weight_to_fix, v_delta, d_delta,
                  m_delta, update_parent_bounds)) {
     // If there is nothing better, use original NN values adjusted for node.
     v = -nl->GetWL();
@@ -3079,7 +3089,7 @@ void SearchWorker::DoBackupUpdateSingleNode(
     v_delta = -v_delta;
     m++;
 
-    MaybeAdjustForTerminalOrTransposition(p, pl, v, d, m,
+    MaybeAdjustForTerminalOrTransposition(p, pl, v, d, m, avg_weight,
                                           weight_to_fix, v_delta, d_delta,
                                           m_delta, update_parent_bounds);
 

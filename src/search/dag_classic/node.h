@@ -300,7 +300,9 @@ class Node {
   float GetChildrenVisits() const;
   float GetTotalVisits() const;
   // Returns n + n_in_flight.
-  float GetNStarted() const { return weight_ + GetNInFlight(); }
+  float GetNStarted() const {
+    return weight_ + static_cast<float>(GetNInFlight());
+  }
 
   double GetQ(double draw_score) const { return wl_ + draw_score * d_; }
   // Returns node eval, i.e. average subtree V for non-terminal node and -1/0/1
@@ -547,7 +549,7 @@ class LowNode {
 
   double GetWeight() const { return weight_; }
   float GetN() const { return weight_; }
-  float GetChildrenVisits() const { return weight_ - 1; }
+  float GetChildrenVisits() const { return weight_ - 1.0; }
 
   // Returns node eval, i.e. average subtree V for non-terminal node and -1/0/1
   // for terminal nodes.
@@ -737,7 +739,7 @@ class EdgeAndNode {
   // Returns U = numerator * p / N.
   // Passed numerator is expected to be equal to (cpuct * sqrt(N[parent])).
   float GetU(float numerator) const {
-    return numerator * GetP() / (1 + GetNStarted());
+    return numerator * GetP() / (1.0f + GetNStarted());
   }
 
   std::string DebugString() const;
