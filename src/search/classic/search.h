@@ -96,7 +96,7 @@ class Search {
 
   // Return processed visit distribution and original policy
   std::vector<std::tuple<float, float>> GetVisitDistribution(
-      const std::vector<Move>& legal_moves) const;
+      const std::vector<Move>& legal_moves, Move best_move) const;
 
  private:
   // Computes the best move, maybe with temperature (according to the settings).

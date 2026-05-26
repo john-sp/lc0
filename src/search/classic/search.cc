@@ -675,27 +675,21 @@ std::int64_t Search::GetTotalPlayouts() const {
 }
 
 std::vector<std::tuple<float, float>> Search::GetVisitDistribution(
-    const std::vector<Move>& legal_moves) const {
+    const std::vector<Move>& legal_moves, Move best_move) const {
   std::vector<std::tuple<float, float>> distribution;
   std::vector<std::tuple<Move, double, double, double, double, float>> visits;
   visits.reserve(legal_moves.size());
   distribution.reserve(legal_moves.size());
   const float draw_score = GetDrawScore(false);
   float U_coeff;
-  Move best_move;
   {
     SharedMutex::SharedLock lock(nodes_mutex_);
-    Mutex::Lock counters_lock(counters_mutex_);
     float fpu = GetFpu(params_, root_node_, true, draw_score);
     float cpuct = ComputeCpuct(params_, root_node_->GetN(), true);
     U_coeff = cpuct * std::sqrt(std::max(root_node_->GetChildrenVisits(), 1u));
     MEvaluator m_evaluator = backend_attributes_.has_mlh
                                  ? MEvaluator(params_, root_node_)
                                  : MEvaluator();
-    best_move = final_bestmove_;
-    if (played_history_.IsBlackToMove()) {
-      best_move.Flip();
-    }
     for (const auto& edge : root_node_->Edges()) {
       const float Q = edge.GetQ(fpu, draw_score);
       const double N =
@@ -704,6 +698,9 @@ std::vector<std::tuple<float, float>> Search::GetVisitDistribution(
                           m_evaluator.GetMUtility(edge, Q), edge.GetU(U_coeff),
                           edge.GetP());
     }
+  }
+  if (played_history_.IsBlackToMove()) {
+    best_move.Flip();
   }
   auto best_iter = std::find_if(
       visits.begin(), visits.end(),
