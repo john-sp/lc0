@@ -247,7 +247,7 @@ void V6TrainingDataArray::Add(
   result.played_m = played_eval.ml;
   result.orig_m = orig_eval.ml;
 
-  result.visits = total_n;
+  result.visits = static_cast<uint32_t>(total_n);
   if (position.IsBlackToMove()) {
     best_move.Flip();
     played_move.Flip();

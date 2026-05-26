@@ -224,7 +224,7 @@ const OptionId BaseSearchParams::kForcedExplorationFactorId{
      .help_text =
          "Force minimum visits at root based on policy which can include "
          "noise. This aims to overcome a problem if the first visit to a child "
-         "evaluates it incorrectly which would suppress futher visits even "
+         "evaluates it incorrectly which would suppress further visits even "
          "when noised policy wants to explore it."}};
 const OptionId BaseSearchParams::kTwoFoldDrawsId{
     "two-fold-draws", "TwoFoldDraws",

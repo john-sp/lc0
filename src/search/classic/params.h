@@ -173,7 +173,7 @@ class BaseSearchParams {
   static const OptionId kCpuctFactorId;
   static const OptionId kCpuctFactorAtRootId;
   static const OptionId kRootHasOwnCpuctParamsId;
-  static const OptionId kForcedExplorationFactorId;;
+  static const OptionId kForcedExplorationFactorId;
   static const OptionId kTwoFoldDrawsId;
   static const OptionId kTemperatureId;
   static const OptionId kTempDecayMovesId;

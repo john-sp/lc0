@@ -697,9 +697,11 @@ std::vector<std::tuple<float, float>> Search::GetVisitDistribution(
     }
     for (const auto& edge : root_node_->Edges()) {
       const float Q = edge.GetQ(fpu, draw_score);
-      visits.emplace_back(edge.GetMove(false),
-                          edge.GetN(), Q, m_evaluator.GetMUtility(edge, Q),
-                          edge.GetU(U_coeff), edge.GetP());
+      const double N =
+          legal_moves.size() == 1 ? std::max(edge.GetN(), 1u) : edge.GetN();
+      visits.emplace_back(edge.GetMove(false), N, Q,
+                          m_evaluator.GetMUtility(edge, Q), edge.GetU(U_coeff),
+                          edge.GetP());
     }
   }
   auto best_iter = std::find_if(
@@ -723,14 +725,14 @@ std::vector<std::tuple<float, float>> Search::GetVisitDistribution(
     if (pos == visits.end()) {
       throw Exception("Legal moves don't match the root node.");
     }
+    double N = std::get<1>(*pos);
     double utility = std::get<2>(*pos) + std::get<3>(*pos);
     double U = std::get<4>(*pos);
-    double visits = std::get<1>(*pos);
     float P = std::get<5>(*pos);
     // Remove visits that shouldn't have happened based on the value at the end
     // of search.
     if (utility + U < best_utility) {
-      visits = std::max(U_coeff * P / (best_utility - utility) - 1, 0.0);
+      N = std::max(U_coeff * P / (best_utility - utility) - 1, 0.0);
     }
     float nn_policy = 0.0f;
     if (nneval) {
@@ -740,7 +742,7 @@ std::vector<std::tuple<float, float>> Search::GetVisitDistribution(
       // Undo the temperature that was applied to the policy.
       nn_policy = std::pow(*policy_iter++, policy_temp);
     }
-    distribution.emplace_back(visits, nn_policy);
+    distribution.emplace_back(N, nn_policy);
   }
 
   return distribution;
@@ -1355,14 +1357,14 @@ int AddForcedExploration(const SearchParams& params, Node* node,
                          int& nstarted) {
   const float factor = params.GetForcedExplorationFactor();
   if (factor == 0.0f) {
-    return false;
+    return 0;
   }
 
   int minimum_visits = GetForcedExploration(
       policy, node->GetChildrenVisits() + node->GetNInFlight(), factor);
 
   if (nstarted >= minimum_visits) {
-    return false;
+    return 0;
   }
 
   Node* child_node = iter.GetOrSpawnNode(/* parent */ node);
