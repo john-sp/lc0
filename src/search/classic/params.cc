@@ -218,6 +218,14 @@ const OptionId BaseSearchParams::kRootHasOwnCpuctParamsId{
          "parameters. Otherwise, they are the same as for the rest of nodes. "
          "Temporary flag for transition to a new version.",
      .visibility = OptionId::kProOnly}};
+const OptionId BaseSearchParams::kForcedExplorationFactorId{
+    {.long_flag = "forced-exploration-factor",
+     .uci_option = "ForcedExplorationFactor",
+     .help_text =
+         "Force minimum visits at root based on policy which can include "
+         "noise. This aims to overcome a problem if the first visit to a child "
+         "evaluates it incorrectly which would suppress futher visits even "
+         "when noised policy wants to explore it."}};
 const OptionId BaseSearchParams::kTwoFoldDrawsId{
     "two-fold-draws", "TwoFoldDraws",
     "Evaluates twofold repetitions in the search tree as draws. Visits to "
@@ -551,6 +559,7 @@ void BaseSearchParams::Populate(OptionsParser* options) {
   options->Add<FloatOption>(kCpuctFactorId, 0.0f, 1000.0f) = 3.894f;
   options->Add<FloatOption>(kCpuctFactorAtRootId, 0.0f, 1000.0f) = 3.894f;
   options->Add<BoolOption>(kRootHasOwnCpuctParamsId) = false;
+  options->Add<FloatOption>(kForcedExplorationFactorId, 0.0f, 100.0f) = 0.0f;
   options->Add<BoolOption>(kTwoFoldDrawsId) = true;
   options->Add<FloatOption>(kTemperatureId, 0.0f, 100.0f) = 0.0f;
   options->Add<IntOption>(kTempDecayMovesId, 0, 640) = 0;
@@ -653,6 +662,7 @@ BaseSearchParams::BaseSearchParams(const OptionsDict& options)
       kCpuctFactorAtRoot(options.Get<float>(
           options.Get<bool>(kRootHasOwnCpuctParamsId) ? kCpuctFactorAtRootId
                                                       : kCpuctFactorId)),
+      kForcedExplorationFactor(options.Get<float>(kForcedExplorationFactorId)),
       kTwoFoldDraws(options.Get<bool>(kTwoFoldDrawsId)),
       kNoiseEpsilon(options.Get<float>(kNoiseEpsilonId)),
       kNoiseAlpha(options.Get<float>(kNoiseAlphaId)),

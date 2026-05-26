@@ -1345,6 +1345,35 @@ int CalculateCollisionsLeft(int64_t nodes, const SearchParams& params) {
                            params.GetMaxCollisionVisitsScalingStart()),
                       params.GetMaxCollisionVisitsScalingPower()));
 }
+
+float GetForcedExploration(float policy, float total_visits, float factor) {
+  return std::sqrt(policy * total_visits * factor);
+}
+
+int AddForcedExploration(const SearchParams& params, Node* node,
+                         Node::Iterator& iter, int& cur_limit, float policy,
+                         int& nstarted) {
+  const float factor = params.GetForcedExplorationFactor();
+  if (factor == 0.0f) {
+    return false;
+  }
+
+  int minimum_visits = GetForcedExploration(
+      policy, node->GetChildrenVisits() + node->GetNInFlight(), factor);
+
+  if (nstarted >= minimum_visits) {
+    return false;
+  }
+
+  Node* child_node = iter.GetOrSpawnNode(/* parent */ node);
+  int new_visits = std::min(minimum_visits - nstarted, cur_limit);
+  cur_limit -= new_visits;
+  nstarted += new_visits;
+  child_node->IncrementNInFlight(new_visits);
+
+  return new_visits;
+}
+
 }  // namespace
 
 void SearchWorker::GatherMinibatch() {
@@ -1779,6 +1808,37 @@ void SearchWorker::PickNodesToExtendTask(
       const float puct_mult =
           cpuct * std::sqrt(std::max(node->GetChildrenVisits(), 1u));
       int cache_filled_idx = -1;
+      if (is_root_node && params_.GetForcedExplorationFactor() > 0.0f) {
+        // Add forced exploration based on policy
+        for (; cache_filled_idx + 1 < max_needed && cur_limit > 0;
+             ++cache_filled_idx) {
+          int idx = cache_filled_idx + 1;
+          if (idx == 0) {
+            cur_iters[idx] = node->Edges();
+          } else {
+            cur_iters[idx] = cur_iters[idx - 1];
+            ++cur_iters[idx];
+          }
+          current_nstarted[idx] = cur_iters[idx].GetNStarted();
+          (*visits_to_perform.back())[idx] = 0;
+
+          if (cur_iters[idx].GetN() == 0) {
+            // If child hasn't been visited yet, we don't force any exploration.
+            ++cache_filled_idx;
+            break;
+          }
+
+          if (cur_iters[idx].IsTerminal()) {
+            // If child is already terminal, we don't force any exploration.
+            continue;
+          }
+
+          (*visits_to_perform.back())[idx] =
+              AddForcedExploration(params_, node, cur_iters[idx], cur_limit,
+                                   current_pol[idx], current_nstarted[idx]);
+        }
+        vtp_last_filled.back() = cache_filled_idx;
+      }
       while (cur_limit > 0) {
         // Perform UCT for current node.
         float best = std::numeric_limits<float>::lowest();
