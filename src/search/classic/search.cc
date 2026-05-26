@@ -674,6 +674,78 @@ std::int64_t Search::GetTotalPlayouts() const {
   return total_playouts_;
 }
 
+std::vector<std::tuple<float, float>> Search::GetVisitDistribution(
+    const std::vector<Move>& legal_moves) const {
+  std::vector<std::tuple<float, float>> distribution;
+  std::vector<std::tuple<Move, double, double, double, double, float>> visits;
+  visits.reserve(legal_moves.size());
+  distribution.reserve(legal_moves.size());
+  const float draw_score = GetDrawScore(false);
+  float U_coeff;
+  Move best_move;
+  {
+    SharedMutex::SharedLock lock(nodes_mutex_);
+    float fpu = GetFpu(params_, root_node_, true, draw_score);
+    float cpuct = ComputeCpuct(params_, root_node_->GetN(), true);
+    U_coeff = cpuct * std::sqrt(std::max(root_node_->GetChildrenVisits(), 1u));
+    MEvaluator m_evaluator = backend_attributes_.has_mlh
+                                 ? MEvaluator(params_, root_node_)
+                                 : MEvaluator();
+    best_move = final_bestmove_;
+    if (played_history_.IsBlackToMove()) {
+      best_move.Flip();
+    }
+    for (const auto& edge : root_node_->Edges()) {
+      const float Q = edge.GetQ(fpu, draw_score);
+      visits.emplace_back(edge.GetMove(false),
+                          edge.GetN(), Q, m_evaluator.GetMUtility(edge, Q),
+                          edge.GetU(U_coeff), edge.GetP());
+    }
+  }
+  auto best_iter = std::find_if(
+      visits.begin(), visits.end(),
+      [&best_move](const auto& m) { return std::get<0>(m) == best_move; });
+  if (best_iter == visits.end()) {
+    throw Exception("Best move not found among root node's children.");
+  }
+  const double best_utility = std::get<2>(*best_iter) +
+                              std::get<3>(*best_iter) + std::get<4>(*best_iter);
+  std::optional<EvalResult> nneval = backend_->GetCachedEvaluation(
+      EvalPosition{played_history_.GetPositions(), legal_moves});
+  auto policy_iter =
+      nneval ? nneval->p.begin() : std::vector<float>::iterator();
+
+  const float policy_temp = params_.GetPolicySoftmaxTemp();
+  for (const auto& move : legal_moves) {
+    auto pos =
+        std::find_if(visits.begin(), visits.end(),
+                     [&move](const auto& m) { return std::get<0>(m) == move; });
+    if (pos == visits.end()) {
+      throw Exception("Legal moves don't match the root node.");
+    }
+    double utility = std::get<2>(*pos) + std::get<3>(*pos);
+    double U = std::get<4>(*pos);
+    double visits = std::get<1>(*pos);
+    float P = std::get<5>(*pos);
+    // Remove visits that shouldn't have happened based on the value at the end
+    // of search.
+    if (utility + U < best_utility) {
+      visits = std::max(U_coeff * P / (best_utility - utility) - 1, 0.0);
+    }
+    float nn_policy = 0.0f;
+    if (nneval) {
+      if (policy_iter == nneval->p.end()) {
+        throw Exception("Not enough policy values returned by the network.");
+      }
+      // Undo the temperature that was applied to the policy.
+      nn_policy = std::pow(*policy_iter++, policy_temp);
+    }
+    distribution.emplace_back(visits, nn_policy);
+  }
+
+  return distribution;
+}
+
 void Search::ResetBestMove() {
   SharedMutex::Lock nodes_lock(nodes_mutex_);
   Mutex::Lock lock(counters_mutex_);

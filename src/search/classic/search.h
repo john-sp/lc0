@@ -94,6 +94,10 @@ class Search {
   // from temperature having been applied again.
   void ResetBestMove();
 
+  // Return processed visit distribution and original policy
+  std::vector<std::tuple<float, float>> GetVisitDistribution(
+      const std::vector<Move>& legal_moves) const;
+
  private:
   // Computes the best move, maybe with temperature (according to the settings).
   void EnsureBestMoveKnown();
