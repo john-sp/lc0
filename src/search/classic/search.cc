@@ -685,6 +685,7 @@ std::vector<std::tuple<float, float>> Search::GetVisitDistribution(
   Move best_move;
   {
     SharedMutex::SharedLock lock(nodes_mutex_);
+    Mutex::Lock counters_lock(counters_mutex_);
     float fpu = GetFpu(params_, root_node_, true, draw_score);
     float cpuct = ComputeCpuct(params_, root_node_->GetN(), true);
     U_coeff = cpuct * std::sqrt(std::max(root_node_->GetChildrenVisits(), 1u));
