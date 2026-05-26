@@ -145,6 +145,12 @@ void V6TrainingDataArray::Add(
                                   [](float sum, const auto& child) {
                                     return sum + std::get<0>(child);
                                   });
+  // Prevent garbage/invalid training data from being uploaded to server.
+  // It's possible to have N=0 when there is only one legal move in position
+  // (due to smart pruning).
+  if (total_n == 0 && node->GetNumEdges() != 1) {
+    throw Exception("Search generated invalid data!");
+  }
   auto move_iter = legal_moves.begin();
   for (const auto& child : visits) {
     if (move_iter == legal_moves.end()) {
