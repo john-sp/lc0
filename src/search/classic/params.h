@@ -308,13 +308,21 @@ class SearchParams : public BaseSearchParams {
     return options_.Get<int>(kMaxPrefetchBatchId);
   }
   int GetSolidTreeThreshold() const { return kSolidTreeThreshold; }
+  bool UsePolicyPostProcessing() const { return kUsePolicyPostProcessing; }
+  float GetPolicyTargetPruningMinimum() const {
+    return kPolicyTargetPruningMinimum;
+  }
 
   // Search parameter IDs.
   static const OptionId kMaxPrefetchBatchId;
   static const OptionId kSolidTreeThresholdId;
+  static const OptionId kUsePolicyPostProcessingId;
+  static const OptionId kPolicyTargetPruningMinimumId;
 
  private:
   const int kSolidTreeThreshold;
+  const bool kUsePolicyPostProcessing;
+  const float kPolicyTargetPruningMinimum;
 };
 }  // namespace classic
 }  // namespace lczero

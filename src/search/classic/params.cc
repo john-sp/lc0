@@ -547,6 +547,14 @@ const OptionId SearchParams::kSolidTreeThresholdId{
     "solid-tree-threshold", "SolidTreeThreshold",
     "Only nodes with at least this number of visits will be considered for "
     "solidification for improved cache locality."};
+const OptionId SearchParams::kUsePolicyPostProcessingId{
+    {.long_flag = "use-policy-post-processing",
+     .uci_option = "UsePolicyPostProcessing",
+     .help_text = "Apply post-processing to the policy training targets."}};
+const OptionId SearchParams::kPolicyTargetPruningMinimumId{
+    {.long_flag = "policy-target-pruning-minimum",
+     .uci_option = "PolicyTargetPruningMinimum",
+     .help_text = "Minimum value for the policy target after pruning."}};
 
 void BaseSearchParams::Populate(OptionsParser* options) {
   // Here the uci optimized defaults" are set.
@@ -646,6 +654,9 @@ void SearchParams::Populate(OptionsParser* options) {
   BaseSearchParams::Populate(options);
   options->Add<IntOption>(kMaxPrefetchBatchId, 0, 1024) = DEFAULT_MAX_PREFETCH;
   options->Add<IntOption>(kSolidTreeThresholdId, 1, 2000000000) = 100;
+  options->Add<BoolOption>(kUsePolicyPostProcessingId) = true;
+  options->Add<FloatOption>(kPolicyTargetPruningMinimumId, 0.0f, 100.0f) =
+      0.0f;
 }
 
 BaseSearchParams::BaseSearchParams(const OptionsDict& options)
@@ -739,6 +750,9 @@ BaseSearchParams::BaseSearchParams(const OptionsDict& options)
 
 SearchParams::SearchParams(const OptionsDict& options)
     : BaseSearchParams(options),
-      kSolidTreeThreshold(options.Get<int>(kSolidTreeThresholdId)) {}
+      kSolidTreeThreshold(options.Get<int>(kSolidTreeThresholdId)),
+      kUsePolicyPostProcessing(options.Get<bool>(kUsePolicyPostProcessingId)),
+      kPolicyTargetPruningMinimum(
+          options.Get<float>(kPolicyTargetPruningMinimumId)) {}
 }  // namespace classic
 }  // namespace lczero

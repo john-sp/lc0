@@ -716,6 +716,7 @@ std::vector<std::tuple<float, float>> Search::GetVisitDistribution(
       nneval ? nneval->p.begin() : std::vector<float>::iterator();
 
   const float policy_temp = params_.GetPolicySoftmaxTemp();
+  double worst_child = std::get<1>(*best_iter);
   for (const auto& move : legal_moves) {
     auto pos =
         std::find_if(visits.begin(), visits.end(),
@@ -729,8 +730,8 @@ std::vector<std::tuple<float, float>> Search::GetVisitDistribution(
     float P = std::get<5>(*pos);
     // Remove visits that shouldn't have happened based on the value at the end
     // of search.
-    if (utility + U < best_utility) {
-      N = std::max(U_coeff * P / (best_utility - utility) - 1, 0.0);
+    if (utility + U < best_utility && params_.UsePolicyPostProcessing()) {
+      N = U_coeff * P / (best_utility - utility) - 1;
     }
     float nn_policy = 0.0f;
     if (nneval) {
@@ -740,7 +741,17 @@ std::vector<std::tuple<float, float>> Search::GetVisitDistribution(
       // Undo the temperature that was applied to the policy.
       nn_policy = std::pow(*policy_iter++, policy_temp);
     }
+    worst_child = std::min(worst_child, N);
     distribution.emplace_back(N, nn_policy);
+  }
+
+  if (params_.UsePolicyPostProcessing() &&
+      worst_child < params_.GetPolicyTargetPruningMinimum()) {
+    const double worst_diff =
+        params_.GetPolicyTargetPruningMinimum() - worst_child;
+    for (auto& [N, nn_policy] : distribution) {
+      N += worst_diff;
+    }
   }
 
   return distribution;
