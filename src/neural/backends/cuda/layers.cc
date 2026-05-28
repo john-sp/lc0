@@ -1777,12 +1777,8 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
   if (use_fused_mha_) {
     // TODO: check if we need skip in a different tensor than same tensor as
     // output!
-    bool success =
-        fusedMHA(buffer2, mha_q, mha_k, mha_v, has_smolgen_ ? buffer2 : nullptr,
-                 N, encoder_heads_, depth, stream);
-
-    ReportCUDAErrors(cudaGetLastError());
-    if (!success) throw Exception("Some error running fused MHA");
+    fusedMHA(buffer2, mha_q, mha_k, mha_v, has_smolgen_ ? buffer2 : nullptr, N,
+             encoder_heads_, depth, stream);
   } else
 #endif
   // matmul_qk = tf.matmul(q, k, transpose_b=True)
@@ -2065,8 +2061,7 @@ AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,
                                        int num_res_blocks, int input_c,
                                        int max_batch_size,
                                        bool is_pe_dense_embedding,
-                                       bool use_gemm_ex,
-                                       bool fused_mha)
+                                       bool use_gemm_ex, bool fused_mha)
     : BaseLayer<DataType>(weights.ip_emb_b.size(), 8, 8, nullptr, false,
                           use_gemm_ex),
       embedding_op_size_(weights.ip_emb_b.size()),
@@ -2324,13 +2319,14 @@ template <typename DataType>
 ValueHead<DataType>::ValueHead(BaseLayer<DataType>* ip,
                                const MultiHeadWeights::ValueHead& weights,
                                void* scratch, bool attention_body, bool wdl,
-                               ActivationFunction act, int /*max_batch_size*/,
-                               bool use_gemm_ex)
+                               bool wdl_err, ActivationFunction act,
+                               int /*max_batch_size*/, bool use_gemm_ex)
     : BaseLayer<DataType>(weights.ip_val_b.size(), 8, 8, ip),
       embedding_size_(attention_body ? weights.ip_val_b.size()
                                      : weights.value.biases.size()),
       value_hidden_size_(weights.ip1_val_b.size()),
       wdl_(wdl),
+      wdl_err_(wdl_err),
       attention_body_(attention_body),
       act_(act) {
   if (attention_body_) {
@@ -2349,6 +2345,11 @@ ValueHead<DataType>::ValueHead(BaseLayer<DataType>* ip,
 
   allocAndUpload<DataType>(&ip2_val_w_, weights.ip2_val_w, scratch);
   allocAndUpload<DataType>(&ip2_val_b_, weights.ip2_val_b, scratch);
+
+  if (wdl_err_) {
+    allocAndUpload<DataType>(&ip_val_err_w_, weights.ip_val_err_w, scratch);
+    allocAndUpload<DataType>(&ip_val_err_b_, weights.ip_val_err_b, scratch);
+  }
 }
 
 template <typename DataType>
@@ -2361,6 +2362,10 @@ ValueHead<DataType>::~ValueHead() {
   ReportCUDAErrors(cudaFree(ip1_val_b_));
   ReportCUDAErrors(cudaFree(ip2_val_w_));
   ReportCUDAErrors(cudaFree(ip2_val_b_));
+  if (wdl_err_) {
+    ReportCUDAErrors(cudaFree(ip_val_err_w_));
+    ReportCUDAErrors(cudaFree(ip_val_err_b_));
+  }
 }
 
 template <typename DataType>
@@ -2402,7 +2407,7 @@ void ValueHead<DataType>::Eval(int N, DataType* output, const DataType* input,
                              num_outputs, act_, stream);
   }
 
-  {
+  if (!wdl_err_) {
     // Value dense 2
     const int num_inputs = value_hidden_size_;
     const int num_outputs = wdl_ ? 3 : 1;
@@ -2415,6 +2420,17 @@ void ValueHead<DataType>::Eval(int N, DataType* output, const DataType* input,
     addVectors(layer_out, layer_out, ip2_val_b_, num_outputs * batch,
                num_outputs * batch, num_outputs,
                wdl_ ? ACTIVATION_NONE : ACTIVATION_TANH, stream);
+  } else {
+    // Value error dense
+    const int num_inputs = value_hidden_size_;
+    const int num_outputs = 1;
+    const int batch = N;
+    cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch,
+                          num_inputs, 1.0f, (const DataType*)ip_val_err_w_,
+                          num_inputs, (DataType*)scratch, num_inputs, 0.0f,
+                          output, num_outputs);
+    addVectors(output, output, ip_val_err_b_, N, N, 1, ACTIVATION_SIGMOID,
+               stream);
   }
 }
 

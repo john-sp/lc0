@@ -115,6 +115,9 @@ class Converter {
   std::string MakeSwish(OnnxBuilder* builder, const std::string& input,
                         const std::string& name);
 
+  std::string MakeSelu(OnnxBuilder* builder, const std::string& input,
+                       const std::string& name);
+
   std::string MakeActivation(OnnxBuilder* builder, const std::string& input,
                              const std::string& name,
                              ActivationFunction activation);
@@ -154,6 +157,10 @@ class Converter {
 
   void MakeValueHead(pblczero::OnnxModel* onnx, OnnxBuilder* builder,
                      const std::string& input, const MultiHeadWeights& weights);
+
+  std::string ValueHeadBody(OnnxBuilder* builder, const std::string& input,
+                            std::string name,
+                            const MultiHeadWeights::ValueHead& head);
 
   void MakeMovesLeftHead(pblczero::OnnxModel* onnx, OnnxBuilder* builder,
                          const std::string& input,
@@ -250,10 +257,10 @@ std::string Converter::EndOptionalBf16Fix(OnnxBuilder* builder,
 
 std::string Converter::MakeMish(OnnxBuilder* builder, const std::string& input,
                                 const std::string& name) {
-  if (!options_.alt_mish || options_.opset < 9) {
+  if (!options_.alt_mish) {
     std::string flow = input;
     flow = StartOptionalBf16Fix(builder, flow, name);
-    if (options_.opset >= 18) {
+    if (options_.opset >= 18 && options_.real_mish) {
       flow = builder->Mish(name, flow);
       return EndOptionalBf16Fix(builder, flow, name);
     }
@@ -263,22 +270,14 @@ std::string Converter::MakeMish(OnnxBuilder* builder, const std::string& input,
     return builder->Mul(name, flow, input);
   } else {
     auto in = input;
-    if (options_.data_type !=
-        WeightsToOnnxConverterOptions::DataType::kFloat32) {
-      in = builder->Cast(name + "/to_float", in, pblczero::TensorProto::FLOAT);
-    }
-    auto one = builder->AddInitializer(name + "/one", FloatOnnxConst({1}, {1}));
-    auto two = builder->AddInitializer(name + "/two", FloatOnnxConst({2}, {1}));
+    auto one = builder->AddInitializer(name + "/one", *GetScalarConverter(1));
+    auto two = builder->AddInitializer(name + "/two", *GetScalarConverter(2));
     auto e = builder->Exp(name + "/e", in);
     auto flow = builder->Add(name + "/e+2", e, two);
     flow = builder->Mul(name + "/e*e+2e", e, flow);
     flow = builder->Div(name + "/2/(e*e+2e)", two, flow);
     flow = builder->Add(name + "/1+2/(e*e+2e)", flow, one);
     flow = builder->Div(name + "/in/(1+2/(e*e+2e))", in, flow);
-    if (options_.data_type !=
-        WeightsToOnnxConverterOptions::DataType::kFloat32) {
-      flow = builder->Cast(name + "/to_data_type", flow, GetDataType());
-    }
     return flow;
   }
 }
@@ -287,6 +286,20 @@ std::string Converter::MakeSwish(OnnxBuilder* builder, const std::string& input,
                                  const std::string& name) {
   auto flow = builder->Sigmoid(name + "/sigmoid", input);
   return builder->Mul(name, flow, input);
+}
+
+std::string Converter::MakeSelu(OnnxBuilder* builder, const std::string& input,
+                                const std::string& name) {
+  auto flow = input;
+  flow = StartOptionalBf16Fix(builder, flow, name);
+  if (!options_.alt_selu) {
+    flow = builder->Selu(name + "/selu", flow);
+  } else {
+    flow = builder->Elu(name + "/selu/elu", flow, 1.6732632423543772f);
+    flow = builder->Mul(name + "/selu/mul", flow,
+                        *GetScalarConverter(1.0507009873554805f));
+  }
+  return EndOptionalBf16Fix(builder, flow, name);
 }
 
 std::string Converter::MakeActivation(OnnxBuilder* builder,
@@ -298,12 +311,8 @@ std::string Converter::MakeActivation(OnnxBuilder* builder,
       return builder->Relu(name + "/relu", input);
     case ACTIVATION_MISH:
       return MakeMish(builder, input, name + "/mish");
-    case ACTIVATION_SELU: {
-      auto flow = input;
-      flow = StartOptionalBf16Fix(builder, flow, name);
-      flow = builder->Selu(name + "/selu", flow);
-      return EndOptionalBf16Fix(builder, flow, name);
-    }
+    case ACTIVATION_SELU:
+      return MakeSelu(builder, input, name + "/selu");
     case ACTIVATION_SWISH:
       return MakeSwish(builder, input, name + "/swish");
     case ACTIVATION_RELU_2: {
@@ -774,8 +783,13 @@ std::string Converter::MakeAttentionBody(OnnxBuilder* builder,
   float alpha = std::pow(2.0f * NumEncBlocks(), -0.25f);
 
   if (input_embedding == network_format::INPUT_EMBEDDING_PE_DENSE) {
-    flow = MakeFFN(builder, weights.ip_emb_ffn, embedding_size, flow,
-                   "/attn_body", default_activation_, alpha);
+    const auto ffn_activation = static_cast<ActivationFunction>(
+        src_.format().network_format().ffn_activation());
+    flow =
+        MakeFFN(builder, weights.ip_emb_ffn, embedding_size, flow, "/attn_body",
+                ffn_activation == ACTIVATION_DEFAULT ? default_activation_
+                                                     : ffn_activation,
+                alpha);
     flow = MakeLayerNorm(
         builder, flow, "/attn_body/ln2",
         *GetWeghtsConverter(weights.ip_emb_ffn_ln_gammas, {embedding_size}),
@@ -979,6 +993,36 @@ void Converter::MakePolicyHead(pblczero::OnnxModel* onnx, OnnxBuilder* builder,
   }
 }
 
+std::string Converter::ValueHeadBody(OnnxBuilder* builder,
+                                     const std::string& input, std::string name,
+                                     const MultiHeadWeights::ValueHead& head) {
+  std::string flow;
+  const int val_channels = NumEncBlocks() > 0 ? head.ip_val_b.size() : 32;
+  if (NumEncBlocks() > 0) {
+    int embedding_size = head.ip_val_w.size() / val_channels;
+    flow = builder->MatMul(
+        name + "/embed/matmul", input,
+        *GetWeghtsConverter(head.ip_val_w, {embedding_size, val_channels},
+                            {1, 0}));
+    flow = builder->Add(name + "/embed/add", flow,
+                        *GetWeghtsConverter(head.ip_val_b, {val_channels}));
+    flow = MakeActivation(builder, flow, name + "/embed", default_activation_);
+  } else {
+    flow = MakeConvBlock(builder, head.value, NumFilters(), val_channels, input,
+                         name + "/conv", nullptr, "", true, 1);
+  }
+  flow = builder->Reshape(
+      name + "/reshape", flow,
+      builder->AddInitializer(name + "/shape",
+                              Int64OnnxConst({-1, val_channels * 8 * 8}, {2})));
+  flow = builder->MatMul(
+      name + "/dense/matmul", flow,
+      *GetWeghtsConverter(head.ip1_val_w, {val_channels * 8 * 8, 128}, {1, 0}));
+  flow = builder->Add(name + "/dense/add", flow,
+                      *GetWeghtsConverter(head.ip1_val_b, {128}));
+  return MakeActivation(builder, flow, name + "/dense", default_activation_);
+}
+
 void Converter::MakeValueHead(pblczero::OnnxModel* onnx, OnnxBuilder* builder,
                               const std::string& input,
                               const MultiHeadWeights& weights) {
@@ -993,39 +1037,17 @@ void Converter::MakeValueHead(pblczero::OnnxModel* onnx, OnnxBuilder* builder,
     throw Exception("The value head selected '" + options_.value_head + "'" +
                     " is empty.");
   }
-  std::string flow;
-  const int val_channels = NumEncBlocks() > 0 ? head.ip_val_b.size() : 32;
-  if (NumEncBlocks() > 0) {
-    int embedding_size = weights.ip_emb_b.size();
-    flow = builder->MatMul(
-        "/value/embed/matmul", input,
-        *GetWeghtsConverter(head.ip_val_w, {embedding_size, val_channels},
-                            {1, 0}));
-    flow = builder->Add("/value/embed/add", flow,
-                        *GetWeghtsConverter(head.ip_val_b, {val_channels}));
-    flow = MakeActivation(builder, flow, "/value/embed", default_activation_);
-  } else {
-    flow = MakeConvBlock(builder, head.value, NumFilters(), val_channels, input,
-                         "/value/conv", nullptr, "", true, 1);
-  }
-  flow = builder->Reshape(
-      "/value/reshape", flow,
-      builder->AddInitializer("/const/value_shape",
-                              Int64OnnxConst({-1, val_channels * 8 * 8}, {2})));
-  flow = builder->MatMul(
-      "/value/dense1/matmul", flow,
-      *GetWeghtsConverter(head.ip1_val_w, {val_channels * 8 * 8, 128}, {1, 0}));
-  flow = builder->Add("/value/dense1/add", flow,
-                      *GetWeghtsConverter(head.ip1_val_b, {128}));
-  flow = MakeActivation(builder, flow, "/value/dense1", default_activation_);
+  std::string name = "/" + options_.value_head;
+  std::string flow = ValueHeadBody(builder, input, name, head);
 
-  const bool wdl = src_.format().network_format().value() ==
-                   pblczero::NetworkFormat::VALUE_WDL;
+  auto flow2 = flow;
+
+  const bool wdl = head.ip2_val_b.size() == 3;
   if (wdl) {
     flow =
-        builder->MatMul("/value/dense2/matmul", flow,
+        builder->MatMul(name + "/value/matmul", flow,
                         *GetWeghtsConverter(head.ip2_val_w, {128, 3}, {1, 0}));
-    flow = builder->Add("/value/dense2/add", flow,
+    flow = builder->Add(name + "/value/add", flow,
                         *GetWeghtsConverter(head.ip2_val_b, {3}));
     if (!options_.no_wdl_softmax) {
       flow = builder->Softmax(options_.output_wdl, flow);
@@ -1034,13 +1056,34 @@ void Converter::MakeValueHead(pblczero::OnnxModel* onnx, OnnxBuilder* builder,
     onnx->set_output_wdl(flow);
   } else {
     flow =
-        builder->MatMul("/value/dense2/matmul", flow,
+        builder->MatMul(name + "/value/matmul", flow,
                         *GetWeghtsConverter(head.ip2_val_w, {128, 1}, {1, 0}));
-    flow = builder->Add("/value/dense2/add", flow,
+    flow = builder->Add(name + "/value/add", flow,
                         *GetWeghtsConverter(head.ip2_val_b, {1}));
     auto output = builder->Tanh(options_.output_value, flow);
     builder->AddOutput(output, {options_.batch_size, 1}, GetDataType());
     onnx->set_output_value(output);
+  }
+
+  if (weights.value_heads.contains(options_.error_head)) {
+    const MultiHeadWeights::ValueHead& error_head =
+        weights.value_heads.at(options_.error_head);
+    if (error_head.ip_val_err_b.empty()) {
+      throw Exception("The error head selected '" + options_.error_head + "'" +
+                      " has no error weights.");
+    }
+    if (options_.error_head != options_.value_head) {
+      name = "/" + options_.error_head;
+      flow2 = ValueHeadBody(builder, input, name, error_head);
+    }
+    flow2 = builder->MatMul(
+        name + "/error/matmul", flow2,
+        *GetWeghtsConverter(error_head.ip_val_err_w, {128, 1}, {1, 0}));
+    flow2 = builder->Add(name + "/error/add", flow2,
+                         *GetWeghtsConverter(error_head.ip_val_err_b, {1}));
+    auto error_out = builder->Sigmoid(options_.output_error, flow2);
+    builder->AddOutput(error_out, {options_.batch_size, 1}, GetDataType());
+    onnx->set_output_err(error_out);
   }
 }
 

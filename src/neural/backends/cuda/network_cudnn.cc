@@ -723,8 +723,11 @@ class CudnnNetwork : public Network {
   void GraphLaunch(InputsOutputs<DataType>* io, int batchSize) {
     UploadInputs(io, batchSize);
 
+    // cudaGraphUpload was added in CUDA 11.1
+#if CUDART_VERSION >= 11010
     // Make sure graph has completed upload before launching it.
     ReportCUDAErrors(cudaStreamSynchronize(io->exec_stream_));
+#endif
 
     io->cuda_graphs_[batchSize - 1].Launch(compute_stream_);
     ReportCUDAErrors(
@@ -977,7 +980,11 @@ class CudnnNetwork : public Network {
   std::unique_ptr<NetworkComputation> NewComputation() override {
     // Set correct gpu id for this computation (as it might have been called
     // from a different thread).
-    ReportCUDAErrors(cudaSetDevice(gpu_id_));
+    int device = -1;
+    ReportCUDAErrors(cudaGetDevice(&device));
+    if (device != gpu_id_) {
+      ReportCUDAErrors(cudaSetDevice(gpu_id_));
+    }
     return std::make_unique<CudnnNetworkComputation<DataType>>(this, wdl_,
                                                                moves_left_);
   }
@@ -985,7 +992,7 @@ class CudnnNetwork : public Network {
   std::unique_ptr<InputsOutputs<DataType>> GetInputsOutputs() {
     std::lock_guard<std::mutex> lock(inputs_outputs_lock_);
     if (free_inputs_outputs_.empty()) {
-      return std::make_unique<InputsOutputs<DataType>>(max_batch_size_, wdl_,
+      return std::make_unique<InputsOutputs<DataType>>(max_batch_size_, wdl_, false,
                                                        moves_left_);
     } else {
       std::unique_ptr<InputsOutputs<DataType>> resource =
@@ -1173,7 +1180,7 @@ void CudnnNetworkComputation<DataType>::CaptureGraph(
 
 template <typename DataType>
 void CudnnNetworkComputation<DataType>::ComputeBlocking() {
-  assert(GetBatchSize() >= 1);
+  if (GetBatchSize() == 0) return;
   if (inputs_outputs_->cuda_graphs_[GetBatchSize() - 1]) {
     std::unique_lock<std::mutex> lock = network_->LockEval();
     network_->GraphLaunch(inputs_outputs_.get(), GetBatchSize());

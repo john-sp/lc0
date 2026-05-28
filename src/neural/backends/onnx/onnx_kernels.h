@@ -1,6 +1,6 @@
 /*
   This file is part of Leela Chess Zero.
-  Copyright (C) 2021 The LCZero Authors
+  Copyright (C) 2025 The LCZero Authors
 
   Leela Chess is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -27,37 +27,23 @@
 
 #pragma once
 
-#include "trainingdata/trainingdata.h"
-#include "trainingdata/trainingdata_v7.h"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
 
 namespace lczero {
+namespace onnx {
 
-// Constructs InputPlanes from training data.
-//
-// NOTE: If the training data is a cannonical type, the canonicalization
-// transforms are reverted before returning, since it is assumed that the data
-// will be used with DecodeMoveFromInput or PopulateBoard which assume the
-// InputPlanes are not transformed.
-InputPlanes PlanesFromTrainingData(const V6TrainingData& data);
-InputPlanes PlanesFromTrainingData(const V7TrainingData& data);
+// Expand input planes from bitmask to floating point tensors. It is used as a
+// preprocessing step of ONNX models.
+template <typename DataType>
+void expandPlanesOnnx(DataType* output, const void* input, unsigned n,
+                      cudaStream_t stream);
 
-class TrainingDataReader {
- public:
-  // Opens the given file to read chunk data from.
-  TrainingDataReader(std::string filename);
+#define ReportCUDAErrors(status) CudaError(status, __FILE__, __LINE__)
+void CudaError(cudaError_t status, const char* file, int line);
 
-  ~TrainingDataReader();
+inline int DivUp(int a, int b) { return (a + b - 1) / b; }
 
-  // Reads a chunk. Returns true if a chunk was read.
-  bool ReadChunk(V6TrainingData* data);
-
-  // Gets full filename of the file being read.
-  std::string GetFileName() const { return filename_; }
-
- private:
-  std::string filename_;
-  gzFile fin_;
-  bool format_v6 = false;
-};
-
+}  // namespace onnx
 }  // namespace lczero

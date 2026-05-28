@@ -319,7 +319,7 @@ class Search {
   // Returns the draw score at the root of the search. At odd depth pass true to
   // the value of @is_odd_depth to change the sign of the draw score.
   // Depth of a root node is 0 (even number).
-  float GetDrawScore(bool is_odd_depth) const;
+  double GetDrawScore(bool is_odd_depth) const;
 
   SearchCachedState& state_;
   mutable Mutex counters_mutex_ ACQUIRED_AFTER(nodes_mutex_);
@@ -400,47 +400,38 @@ using TaskVector = std::vector<TaskType, IterationMemoryAllocator<TaskType>>;
 // variable. Packed value stores required visit infromation which can be
 // pushed into the current_path stack.
 struct CurrentPath {
-  struct Bits {
-    uint32_t visits_ : 21;       // <= collision limit
+    uint32_t visits_ : 20;       // <= collision limit
+    uint32_t large_branch_ : 1;  // bool
     uint32_t last_child_ : 1;    // bool
     uint32_t visit_child_ : 1;   // bool
     uint32_t stop_picking_ : 1;  // bool
     uint32_t index_ : 8;         // < 218
-    Bits(unsigned visits, bool last, bool visit, bool stop, unsigned index)
-        : visits_(visits),
+  CurrentPath(unsigned visits, bool last, bool visit, bool stop, unsigned index)
+      : visits_(visits),
+          large_branch_(0),
           last_child_(last),
           visit_child_(visit),
           stop_picking_(stop),
           index_(index) {}
-  };
-  union {
-    Bits bits_;
-    uint32_t value_;
-  };
-  CurrentPath(unsigned visits, bool last, bool visit, bool stop, unsigned index)
-      : bits_(visits, last, visit, stop, index) {}
   // Implicit conversion from int to allow comparing to a visit integer.
-  CurrentPath(int visits) : bits_(visits, 0, 0, 0, 0) {}
+  CurrentPath(int visits) : visits_(visits), large_branch_(0), last_child_(0), visit_child_(0), stop_picking_(0), index_(0) {}
   CurrentPath() {}
 
   auto operator<=>(CurrentPath b) const {
-    return (uint32_t)bits_.visits_ <=> (uint32_t)b.bits_.visits_;
+    return (uint32_t)visits_ <=> (uint32_t)b.visits_;
   }
   bool operator==(CurrentPath b) const {
-    return (uint32_t)bits_.visits_ == (uint32_t)b.bits_.visits_;
+    return (uint32_t)visits_ == (uint32_t)b.visits_;
   }
-  explicit operator bool() const { return !!bits_.visits_; }
+  explicit operator bool() const { return !!visits_; }
 
   CurrentPath& operator+=(unsigned visits) {
-    CurrentPath temp(*this);
-    std::ignore = temp;
-    assert(temp.bits_.visits_ += visits == visits + bits_.visits_);
-    value_ += visits;
+    visits_ += visits;
     return *this;
   }
   CurrentPath& operator-=(unsigned visits) {
-    assert(bits_.visits_ >= visits);
-    value_ -= visits;
+    assert(visits_ >= visits);
+    visits_ -= visits;
     return *this;
   }
 };
@@ -633,15 +624,16 @@ class SearchWorker {
   // Return true if adjustment happened.
   bool MaybeAdjustForTerminalOrTransposition(Node* n,
                                              const std::shared_ptr<LowNode>& nl,
-                                             float& v, float& d, float& m,
-                                             uint32_t& n_to_fix, float& v_delta,
-                                             float& d_delta, float& m_delta,
+                                             double& v, double& d, float& m,
+                                             double avg_weight,
+                                             double& weight_to_fix, double& v_delta,
+                                             double& d_delta, float& m_delta,
                                              bool& update_parent_bounds) const;
   void DoBackupUpdateSingleNode(const NodeToProcess& node_to_process,
                                 const BackupPath& path);
   // Returns whether a node's bounds were set based on its children.
-  bool MaybeSetBounds(Node* p, float m, uint32_t* n_to_fix, float* v_delta,
-                      float* d_delta, float* m_delta) const;
+  bool MaybeSetBounds(Node* p, float m, double* weight_to_fix, double* v_delta,
+                      double* d_delta, float* m_delta) const;
   std::tuple<int, int> PickNodesToExtend(int collision_limit);
   void ScheduleCancelTask(int start, int end, bool stop);
   int ExpandCollision(int idenx, int collisions_left);

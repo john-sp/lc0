@@ -71,6 +71,7 @@ void NetworkComputationRequest::ProcessResult(const NetworkComputation& computat
                                        int sample, const float temperature) {
   if (result.q) *result.q = computation.GetQVal(sample);
   if (result.d) *result.d = computation.GetDVal(sample);
+  if (result.e) *result.e = computation.GetEVal(sample);
   if (result.m) *result.m = computation.GetMVal(sample);
   if (!result.p.empty()) {
     SoftmaxPolicy(result.p, computation, sample, legal_moves, transform,
@@ -151,8 +152,8 @@ class NetworkAsBackendComputation : public BackendComputation {
   void ComputeBlocking(ComputationCallback callback) override {
     for (auto& entry : entries_) computation_->AddInput(std::move(entry.input));
     computation_->ComputeBlocking();
-    LCTRACE_FUNCTION_SCOPE;
     callback(ComputationEvent::FIRST_BACKEND_IDLE);
+    LCTRACE_FUNCTION_SCOPE;
     for (size_t i = 0; i < entries_.size(); ++i) {
       entries_[i].ProcessResult(*computation_, i,
                                backend_->softmax_policy_temperature_);
