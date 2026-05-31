@@ -551,10 +551,20 @@ const OptionId SearchParams::kUsePolicyPostProcessingId{
     {.long_flag = "use-policy-post-processing",
      .uci_option = "UsePolicyPostProcessing",
      .help_text = "Apply post-processing to the policy training targets."}};
-const OptionId SearchParams::kPolicyTargetPruningMinimumId{
-    {.long_flag = "policy-target-pruning-minimum",
-     .uci_option = "PolicyTargetPruningMinimum",
-     .help_text = "Minimum value for the policy target after pruning."}};
+const OptionId SearchParams::kPolicyPostProcessingUtilityAlphaId{
+    {.long_flag = "policy-post-processing-utility-alpha",
+     .uci_option = "PolicyPostProcessingUtilityAlpha",
+     .help_text = "Controls how sharp the resulting policy will be. Lower "
+                  "values result to a sharper policy. It should be changed "
+                  "together with weight temperature."}};
+const OptionId SearchParams::kPolicyPostProcessingWeightTemperatureId{
+    {.long_flag = "policy-post-processing-weight-temperature",
+     .uci_option = "PolicyPostProcessingWeightTemperature",
+     .help_text =
+         "Softmax temperature for weighted variance. It controls how policy "
+         "sharpness is adjusted for different positions. Lower values mean "
+         "variance focuses more towards good moves. Lower values add extra "
+         "sharpness towards sharp positions."}};
 
 void BaseSearchParams::Populate(OptionsParser* options) {
   // Here the uci optimized defaults" are set.
@@ -655,8 +665,10 @@ void SearchParams::Populate(OptionsParser* options) {
   options->Add<IntOption>(kMaxPrefetchBatchId, 0, 1024) = DEFAULT_MAX_PREFETCH;
   options->Add<IntOption>(kSolidTreeThresholdId, 1, 2000000000) = 100;
   options->Add<BoolOption>(kUsePolicyPostProcessingId) = true;
-  options->Add<FloatOption>(kPolicyTargetPruningMinimumId, 0.0f, 100.0f) =
-      0.0f;
+  options->Add<FloatOption>(kPolicyPostProcessingUtilityAlphaId, 0.00001f,
+                            100.0f) = 0.42f;
+  options->Add<FloatOption>(kPolicyPostProcessingWeightTemperatureId, 0.0001f,
+                            1000.0f) = 0.07f;
 }
 
 BaseSearchParams::BaseSearchParams(const OptionsDict& options)
@@ -752,7 +764,9 @@ SearchParams::SearchParams(const OptionsDict& options)
     : BaseSearchParams(options),
       kSolidTreeThreshold(options.Get<int>(kSolidTreeThresholdId)),
       kUsePolicyPostProcessing(options.Get<bool>(kUsePolicyPostProcessingId)),
-      kPolicyTargetPruningMinimum(
-          options.Get<float>(kPolicyTargetPruningMinimumId)) {}
+      kPolicyPostProcessingUtilityAlpha(
+          options.Get<float>(kPolicyPostProcessingUtilityAlphaId)),
+      kPolicyPostProcessingWeightTemperature(
+          options.Get<float>(kPolicyPostProcessingWeightTemperatureId)) {}
 }  // namespace classic
 }  // namespace lczero

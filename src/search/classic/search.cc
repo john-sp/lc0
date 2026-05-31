@@ -675,48 +675,83 @@ std::int64_t Search::GetTotalPlayouts() const {
 }
 
 std::vector<std::tuple<float, float>> Search::GetVisitDistribution(
-    const std::vector<Move>& legal_moves, Move best_move) const {
+    const std::vector<Move>& legal_moves) const {
   std::vector<std::tuple<float, float>> distribution;
-  std::vector<std::tuple<Move, double, double, double, double, float>> visits;
+  std::vector<std::tuple<Move, uint32_t, double>> visits;
   visits.reserve(legal_moves.size());
   distribution.reserve(legal_moves.size());
   const float draw_score = GetDrawScore(false);
-  float U_coeff;
+  double QM_max = -std::numeric_limits<double>::infinity();
   {
     SharedMutex::SharedLock lock(nodes_mutex_);
-    float fpu = GetFpu(params_, root_node_, true, draw_score);
-    float cpuct = ComputeCpuct(params_, root_node_->GetN(), true);
-    U_coeff = cpuct * std::sqrt(std::max(root_node_->GetChildrenVisits(), 1u));
+    float fpu = 0;
     MEvaluator m_evaluator = backend_attributes_.has_mlh
                                  ? MEvaluator(params_, root_node_)
                                  : MEvaluator();
     for (const auto& edge : root_node_->Edges()) {
-      const float Q = edge.GetQ(fpu, draw_score);
-      const double N =
-          legal_moves.size() == 1 ? std::max(edge.GetN(), 1u) : edge.GetN();
-      visits.emplace_back(edge.GetMove(false), N, Q,
-                          m_evaluator.GetMUtility(edge, Q), edge.GetU(U_coeff),
-                          edge.GetP());
+      const uint32_t N = edge.GetN();
+      const double Q = edge.GetQ(fpu, draw_score);
+      const double M = m_evaluator.GetMUtility(edge, Q);
+      const double QM =
+          edge.GetN() > 0 ? Q + M : std::numeric_limits<double>::lowest();
+      // TODO: Do we need to adjust QM if it is terminal?
+      visits.emplace_back(edge.GetMove(false), N, QM);
+      QM_max = std::max(QM_max, Q + M);
     }
   }
-  if (played_history_.IsBlackToMove()) {
-    best_move.Flip();
-  }
-  auto best_iter = std::find_if(
-      visits.begin(), visits.end(),
-      [&best_move](const auto& m) { return std::get<0>(m) == best_move; });
-  if (best_iter == visits.end()) {
-    throw Exception("Best move not found among root node's children.");
-  }
-  const double best_utility = std::get<2>(*best_iter) +
-                              std::get<3>(*best_iter) + std::get<4>(*best_iter);
+  auto is_QM_valid = [](double QM) {
+    return QM != std::numeric_limits<double>::lowest();
+  };
   std::optional<EvalResult> nneval = backend_->GetCachedEvaluation(
       EvalPosition{played_history_.GetPositions(), legal_moves});
   auto policy_iter =
       nneval ? nneval->p.begin() : std::vector<float>::iterator();
 
+  // Use Softmax weighted variance to measure the spread of the move values.
+  // Alpha will be scaled based on the variance.
+  std::vector<double> softmax_weights;
+  softmax_weights.reserve(visits.size());
+  const double variance_weight_temp =
+      1.0 / params_.GetPolicyPostProcessingWeightTemperature();
+  double softmax_sum = 0.0;
+  for (const auto& v : visits) {
+    const double QM = std::get<2>(v);
+    if (!is_QM_valid(QM)) {
+      softmax_weights.emplace_back(0.0);
+      continue;
+    }
+    softmax_weights.emplace_back(
+        std::exp(variance_weight_temp * (QM - QM_max)));
+    softmax_sum += softmax_weights.back();
+  }
+
+  for (auto& w : softmax_weights) {
+    w /= softmax_sum;
+  }
+
+  double mean = 0.0;
+  for (size_t i = 0; i < visits.size(); ++i) {
+    const double QM = std::get<2>(visits[i]);
+    if (!is_QM_valid(QM)) continue;
+    mean += softmax_weights[i] * QM;
+  }
+  double variance = 0.0;
+  for (size_t i = 0; i < visits.size(); ++i) {
+    const double QM = std::get<2>(visits[i]);
+    if (!is_QM_valid(QM)) continue;
+    double diff = QM - mean;
+    variance += softmax_weights[i] * diff * diff;
+  }
+
   const float policy_temp = params_.GetPolicySoftmaxTemp();
-  double worst_child = std::get<1>(*best_iter);
+  // Avoid division by zero and NaNs.
+  variance = std::max(variance, 1e-9);
+  // Scale alpha based on weighted variance to match old policy sharpness for
+  // different positions.
+  const double alpha_param = params_.GetPolicyPostProcessingUtilityAlpha();
+  const double alpha = alpha_param * std::sqrt(variance);
+  float policy_sum = 0.0f;
+  double N_sum = 0.0;
   for (const auto& move : legal_moves) {
     auto pos =
         std::find_if(visits.begin(), visits.end(),
@@ -724,33 +759,44 @@ std::vector<std::tuple<float, float>> Search::GetVisitDistribution(
     if (pos == visits.end()) {
       throw Exception("Legal moves don't match the root node.");
     }
-    double N = std::get<1>(*pos);
-    double utility = std::get<2>(*pos) + std::get<3>(*pos);
-    double U = std::get<4>(*pos);
-    float P = std::get<5>(*pos);
-    // Remove visits that shouldn't have happened based on the value at the end
-    // of search.
-    if (utility + U < best_utility && params_.UsePolicyPostProcessing()) {
-      N = U_coeff * P / (best_utility - utility) - 1;
-    }
+
+    double QM = std::get<2>(*pos);
     float nn_policy = 0.0f;
+
+    // Calculate visit count using uniform prior policy to control policy
+    // sharpness and value impact. If it causes training problems we would need
+    // to mix prior policy using KL divergence.
+    double N = params_.UsePolicyPostProcessing()
+                   ? is_QM_valid(QM) ? 1.0 / (alpha + QM_max - QM) : 0.0
+                   : std::get<1>(*pos);
+
     if (nneval) {
       if (policy_iter == nneval->p.end()) {
         throw Exception("Not enough policy values returned by the network.");
       }
       // Undo the temperature that was applied to the policy.
       nn_policy = std::pow(*policy_iter++, policy_temp);
+      policy_sum += nn_policy;
     }
-    worst_child = std::min(worst_child, N);
     distribution.emplace_back(N, nn_policy);
+    N_sum += N;
   }
 
-  if (params_.UsePolicyPostProcessing() &&
-      worst_child < params_.GetPolicyTargetPruningMinimum()) {
-    const double worst_diff =
-        params_.GetPolicyTargetPruningMinimum() - worst_child;
+  if (nneval) {
+    double visited_pol = 0.0;
     for (auto& [N, nn_policy] : distribution) {
-      N += worst_diff;
+      nn_policy /= policy_sum;
+      if (N != 0) {
+        visited_pol += nn_policy;
+      }
+    }
+    // Preserve the policy for unvisited moves.
+    for (auto& [N, nn_policy] : distribution) {
+      if (N != 0) {
+        N = visited_pol * N / N_sum;
+      } else {
+        N = nn_policy;
+      }
     }
   }
 

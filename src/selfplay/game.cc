@@ -254,8 +254,7 @@ void SelfPlayGame::Play(int white_threads, int black_threads, bool training,
                                           .Last()
                                           .GetBoard()
                                           .GenerateLegalMoves();
-      std::vector<std::tuple<float, float>> root_visits =
-          search_->GetVisitDistribution(legal_moves, best_move);
+      auto root_visits = search_->GetVisitDistribution(legal_moves);
       std::optional<EvalResult> nneval =
           options_[idx].backend->GetCachedEvaluation(EvalPosition{
               tree_[idx]->GetPositionHistory().GetPositions(), legal_moves});

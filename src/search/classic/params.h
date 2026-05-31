@@ -309,20 +309,25 @@ class SearchParams : public BaseSearchParams {
   }
   int GetSolidTreeThreshold() const { return kSolidTreeThreshold; }
   bool UsePolicyPostProcessing() const { return kUsePolicyPostProcessing; }
-  float GetPolicyTargetPruningMinimum() const {
-    return kPolicyTargetPruningMinimum;
+  float GetPolicyPostProcessingUtilityAlpha() const {
+    return options_.Get<float>(kPolicyPostProcessingUtilityAlphaId);
+  }
+  float GetPolicyPostProcessingWeightTemperature() const {
+    return options_.Get<float>(kPolicyPostProcessingWeightTemperatureId);
   }
 
   // Search parameter IDs.
   static const OptionId kMaxPrefetchBatchId;
   static const OptionId kSolidTreeThresholdId;
   static const OptionId kUsePolicyPostProcessingId;
-  static const OptionId kPolicyTargetPruningMinimumId;
+  static const OptionId kPolicyPostProcessingUtilityAlphaId;
+  static const OptionId kPolicyPostProcessingWeightTemperatureId;
 
  private:
   const int kSolidTreeThreshold;
   const bool kUsePolicyPostProcessing;
-  const float kPolicyTargetPruningMinimum;
+  const float kPolicyPostProcessingUtilityAlpha;
+  const float kPolicyPostProcessingWeightTemperature;
 };
 }  // namespace classic
 }  // namespace lczero
