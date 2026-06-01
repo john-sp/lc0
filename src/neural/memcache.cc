@@ -28,7 +28,6 @@
 #include "neural/memcache.h"
 
 #include "neural/shared_params.h"
-#include "search/classic/params.h"
 #include "utils/atomic.h"
 #include "utils/atomic_vector.h"
 #include "utils/cache.h"
@@ -67,14 +66,12 @@ void CachedValueToEvalResult(const CachedValue& cv, const EvalResultPtr& ptr) {
 
 class MemCache : public CachingBackend {
  public:
-  MemCache(std::unique_ptr<Backend> wrapped, const OptionsDict& options)
+  MemCache(std::unique_ptr<Backend> wrapped, const OptionsDict& options, float max_out_of_order_evals_factor)
       : wrapped_backend_(std::move(wrapped)),
         cache_(options.Get<int>(SharedBackendParams::kNNCacheSizeId)),
         max_batch_size_(
             wrapped_backend_->GetAttributes().maximum_batch_size *
-            (1.0f +
-             options.Get<float>(
-                 classic::BaseSearchParams::kMaxOutOfOrderEvalsFactorId))) {}
+            (1.0f + max_out_of_order_evals_factor)) {}
 
   BackendAttributes GetAttributes() const override {
     return wrapped_backend_->GetAttributes();
@@ -264,9 +261,11 @@ std::optional<EvalResult> MemCache::GetCachedEvaluation(
 
 }  // namespace
 
-std::unique_ptr<CachingBackend> CreateMemCache(std::unique_ptr<Backend> wrapped,
-                                               const OptionsDict& options) {
-  return std::make_unique<MemCache>(std::move(wrapped), options);
+std::unique_ptr<CachingBackend> CreateMemCache(
+    std::unique_ptr<Backend> wrapped, const OptionsDict& options,
+    float max_out_of_order_evals_factor) {
+  return std::make_unique<MemCache>(std::move(wrapped), options,
+                                    max_out_of_order_evals_factor);
 }
 
 }  // namespace lczero
