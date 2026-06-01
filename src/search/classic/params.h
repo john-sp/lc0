@@ -63,7 +63,6 @@ class BaseSearchParams {
   float GetCpuctFactor(bool at_root) const {
     return at_root ? kCpuctFactorAtRoot : kCpuctFactor;
   }
-  float GetForcedExplorationFactor() const { return kForcedExplorationFactor; }
   bool GetTwoFoldDraws() const { return kTwoFoldDraws; }
   float GetTemperature() const { return options_.Get<float>(kTemperatureId); }
   float GetTemperatureVisitOffset() const {
@@ -173,7 +172,6 @@ class BaseSearchParams {
   static const OptionId kCpuctFactorId;
   static const OptionId kCpuctFactorAtRootId;
   static const OptionId kRootHasOwnCpuctParamsId;
-  static const OptionId kForcedExplorationFactorId;
   static const OptionId kTwoFoldDrawsId;
   static const OptionId kTemperatureId;
   static const OptionId kTempDecayMovesId;
@@ -250,7 +248,6 @@ class BaseSearchParams {
   const float kCpuctBaseAtRoot;
   const float kCpuctFactor;
   const float kCpuctFactorAtRoot;
-  const float kForcedExplorationFactor;
   const bool kTwoFoldDraws;
   const float kNoiseEpsilon;
   const float kNoiseAlpha;
@@ -309,6 +306,8 @@ class SearchParams : public BaseSearchParams {
   }
   int GetSolidTreeThreshold() const { return kSolidTreeThreshold; }
   bool UsePolicyPostProcessing() const { return kUsePolicyPostProcessing; }
+  float GetForcedExplorationFactor() const { return kForcedExplorationFactor; }
+  float GetSingleChildForcedBoost() const { return kSingleChildForcedBoost; }
   float GetPolicyPostProcessingUtilityAlpha() const {
     return options_.Get<float>(kPolicyPostProcessingUtilityAlphaId);
   }
@@ -319,6 +318,8 @@ class SearchParams : public BaseSearchParams {
   // Search parameter IDs.
   static const OptionId kMaxPrefetchBatchId;
   static const OptionId kSolidTreeThresholdId;
+  static const OptionId kForcedExplorationFactorId;
+  static const OptionId kSingleChildForcedBoostId;
   static const OptionId kUsePolicyPostProcessingId;
   static const OptionId kPolicyPostProcessingUtilityAlphaId;
   static const OptionId kPolicyPostProcessingWeightTemperatureId;
@@ -326,6 +327,8 @@ class SearchParams : public BaseSearchParams {
  private:
   const int kSolidTreeThreshold;
   const bool kUsePolicyPostProcessing;
+  const float kForcedExplorationFactor;
+  const float kSingleChildForcedBoost;
   const float kPolicyPostProcessingUtilityAlpha;
   const float kPolicyPostProcessingWeightTemperature;
 };

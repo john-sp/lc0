@@ -55,12 +55,18 @@ std::optional<float> StoppersHints::GetEstimatedNps() const {
   return estimated_nps_;
 }
 
+void StoppersHints::UpdateNodeLimit(int64_t v) {
+  node_limit_ = v;
+}
+int64_t StoppersHints::GetNodeLimit() const { return node_limit_; }
+
 void StoppersHints::Reset() {
   // Slightly more than 3 years.
   remaining_time_ms_ = 100000000000;
   // Type for N in nodes is currently uint32_t, so set limit in order not to
   // overflow it.
   remaining_playouts_ = 4000000000;
+  node_limit_ = remaining_playouts_;
   // NPS is not known.
   estimated_nps_.reset();
 }

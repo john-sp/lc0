@@ -61,6 +61,7 @@ bool VisitsStopper::ShouldStop(const IterationStats& stats,
   if (populate_remaining_playouts_) {
     hints->UpdateEstimatedRemainingPlayouts(nodes_limit_ - stats.total_nodes);
   }
+  hints->UpdateNodeLimit(nodes_limit_);
   if (stats.total_nodes >= nodes_limit_) {
     LOGFILE << "Stopped search: Reached visits limit: " << stats.total_nodes
             << ">=" << nodes_limit_;
@@ -79,6 +80,8 @@ bool PlayoutsStopper::ShouldStop(const IterationStats& stats,
     hints->UpdateEstimatedRemainingPlayouts(nodes_limit_ -
                                             stats.nodes_since_movestart);
   }
+  hints->UpdateNodeLimit(nodes_limit_ +
+                         (stats.total_nodes - stats.nodes_since_movestart));
   if (stats.nodes_since_movestart >= nodes_limit_) {
     LOGFILE << "Stopped search: Reached playouts limit: "
             << stats.nodes_since_movestart << ">=" << nodes_limit_;
@@ -238,6 +241,9 @@ bool SmartPruningStopper::ShouldStop(const IterationStats& stats,
   // May overflow if (nps/smart_pruning_factor) > 180 000 000, but that's not
   // very realistic.
   hints->UpdateEstimatedRemainingPlayouts(remaining_playouts);
+  hints->UpdateNodeLimit(std::min<int64_t>(
+      hints->GetNodeLimit(),
+      remaining_playouts + (stats.total_nodes - stats.nodes_since_movestart)));
   if (stats.batches_since_movestart < minimum_batches_) return false;
 
   uint32_t largest_n = 0;

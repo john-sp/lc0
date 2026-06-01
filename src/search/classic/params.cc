@@ -218,14 +218,6 @@ const OptionId BaseSearchParams::kRootHasOwnCpuctParamsId{
          "parameters. Otherwise, they are the same as for the rest of nodes. "
          "Temporary flag for transition to a new version.",
      .visibility = OptionId::kProOnly}};
-const OptionId BaseSearchParams::kForcedExplorationFactorId{
-    {.long_flag = "forced-exploration-factor",
-     .uci_option = "ForcedExplorationFactor",
-     .help_text =
-         "Force minimum visits at root based on policy which can include "
-         "noise. This aims to overcome a problem if the first visit to a child "
-         "evaluates it incorrectly which would suppress further visits even "
-         "when noised policy wants to explore it."}};
 const OptionId BaseSearchParams::kTwoFoldDrawsId{
     "two-fold-draws", "TwoFoldDraws",
     "Evaluates twofold repetitions in the search tree as draws. Visits to "
@@ -551,6 +543,21 @@ const OptionId SearchParams::kUsePolicyPostProcessingId{
     {.long_flag = "use-policy-post-processing",
      .uci_option = "UsePolicyPostProcessing",
      .help_text = "Apply post-processing to the policy training targets."}};
+const OptionId SearchParams::kForcedExplorationFactorId{
+    {.long_flag = "forced-exploration-factor",
+     .uci_option = "ForcedExplorationFactor",
+     .help_text =
+         "Force minimum visits at root based on policy which can include "
+         "noise. This aims to overcome a problem if the first visit to a child "
+         "evaluates it incorrectly which would suppress further visits even "
+         "when noised policy wants to explore it."}};
+const OptionId SearchParams::kSingleChildForcedBoostId{
+    {.long_flag = "single-child-forced-boost",
+     .uci_option = "SingleChildForcedBoost",
+     .help_text =
+         "Give one random low policy move extra forced visits. This parameter "
+         "defines the policy value this move gets for forced visits "
+         "only."}};
 const OptionId SearchParams::kPolicyPostProcessingUtilityAlphaId{
     {.long_flag = "policy-post-processing-utility-alpha",
      .uci_option = "PolicyPostProcessingUtilityAlpha",
@@ -561,7 +568,8 @@ const OptionId SearchParams::kPolicyPostProcessingWeightTemperatureId{
     {.long_flag = "policy-post-processing-weight-temperature",
      .uci_option = "PolicyPostProcessingWeightTemperature",
      .help_text =
-         "Softmax temperature for weighted variance. It controls how policy "
+         "Softmax temperature for weighted variance. It controls how "
+         "policy "
          "sharpness is adjusted for different positions. Lower values mean "
          "variance focuses more towards good moves. Lower values add extra "
          "sharpness towards sharp positions."}};
@@ -577,7 +585,6 @@ void BaseSearchParams::Populate(OptionsParser* options) {
   options->Add<FloatOption>(kCpuctFactorId, 0.0f, 1000.0f) = 3.894f;
   options->Add<FloatOption>(kCpuctFactorAtRootId, 0.0f, 1000.0f) = 3.894f;
   options->Add<BoolOption>(kRootHasOwnCpuctParamsId) = false;
-  options->Add<FloatOption>(kForcedExplorationFactorId, 0.0f, 100.0f) = 0.0f;
   options->Add<BoolOption>(kTwoFoldDrawsId) = true;
   options->Add<FloatOption>(kTemperatureId, 0.0f, 100.0f) = 0.0f;
   options->Add<IntOption>(kTempDecayMovesId, 0, 640) = 0;
@@ -665,6 +672,8 @@ void SearchParams::Populate(OptionsParser* options) {
   options->Add<IntOption>(kMaxPrefetchBatchId, 0, 1024) = DEFAULT_MAX_PREFETCH;
   options->Add<IntOption>(kSolidTreeThresholdId, 1, 2000000000) = 100;
   options->Add<BoolOption>(kUsePolicyPostProcessingId) = true;
+  options->Add<FloatOption>(kForcedExplorationFactorId, 0.0f, 100.0f) = 0.0f;
+  options->Add<FloatOption>(kSingleChildForcedBoostId, 0.0f, 100.0f) = 5.0f;
   options->Add<FloatOption>(kPolicyPostProcessingUtilityAlphaId, 0.00001f,
                             100.0f) = 0.42f;
   options->Add<FloatOption>(kPolicyPostProcessingWeightTemperatureId, 0.0001f,
@@ -685,7 +694,6 @@ BaseSearchParams::BaseSearchParams(const OptionsDict& options)
       kCpuctFactorAtRoot(options.Get<float>(
           options.Get<bool>(kRootHasOwnCpuctParamsId) ? kCpuctFactorAtRootId
                                                       : kCpuctFactorId)),
-      kForcedExplorationFactor(options.Get<float>(kForcedExplorationFactorId)),
       kTwoFoldDraws(options.Get<bool>(kTwoFoldDrawsId)),
       kNoiseEpsilon(options.Get<float>(kNoiseEpsilonId)),
       kNoiseAlpha(options.Get<float>(kNoiseAlphaId)),
@@ -764,6 +772,8 @@ SearchParams::SearchParams(const OptionsDict& options)
     : BaseSearchParams(options),
       kSolidTreeThreshold(options.Get<int>(kSolidTreeThresholdId)),
       kUsePolicyPostProcessing(options.Get<bool>(kUsePolicyPostProcessingId)),
+      kForcedExplorationFactor(options.Get<float>(kForcedExplorationFactorId)),
+      kSingleChildForcedBoost(options.Get<float>(kSingleChildForcedBoostId) / 100.0f),
       kPolicyPostProcessingUtilityAlpha(
           options.Get<float>(kPolicyPostProcessingUtilityAlphaId)),
       kPolicyPostProcessingWeightTemperature(

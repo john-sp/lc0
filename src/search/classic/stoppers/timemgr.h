@@ -75,10 +75,13 @@ class StoppersHints {
   int64_t GetEstimatedRemainingPlayouts() const;
   void UpdateEstimatedNps(float v);
   std::optional<float> GetEstimatedNps() const;
+  void UpdateNodeLimit(int64_t v);
+  int64_t GetNodeLimit() const;
 
  private:
   int64_t remaining_time_ms_;
   int64_t remaining_playouts_;
+  int64_t node_limit_;
   std::optional<float> estimated_nps_;
 };
 

@@ -199,7 +199,30 @@ Search::Search(const NodeTree& tree, Backend* backend,
 }
 
 namespace {
-void ApplyDirichletNoise(Node* node, float eps, double alpha) {
+int SelectChildForExtraForcedVisits(Node* node, float child_boost) {
+  if (child_boost == 0) {
+    return -1;
+  }
+  int rv = -1;
+  // Choose one low policy child to get extra exploration.
+  node->SortEdges();
+  std::vector<float> policy;
+  bool has_nonzero_policy = false;
+  for (const auto& edge : node->Edges()) {
+    // Transform the policy to probability distribution and only considre
+    // policies which are less than 2.5%.
+    policy.push_back(std::max(0.0f, 1.0f / edge.GetP() - 40.0f));
+    has_nonzero_policy = has_nonzero_policy || policy.back() > 0.0f;
+  }
+
+  if (has_nonzero_policy) {
+    rv = Random::Get().GetDiscrete(policy.begin(), policy.end());
+  }
+  return rv;
+}
+
+int ApplyDirichletNoise(Node* node, float eps, double alpha,
+                        float child_boost) {
   float total = 0;
   std::vector<float> noise;
 
@@ -209,13 +232,16 @@ void ApplyDirichletNoise(Node* node, float eps, double alpha) {
     total += eta;
   }
 
-  if (total < std::numeric_limits<float>::min()) return;
+  if (total < std::numeric_limits<float>::min()) {
+    return SelectChildForExtraForcedVisits(node, child_boost);
+  }
 
   int noise_idx = 0;
   for (const auto& child : node->Edges()) {
     auto* edge = child.edge();
     edge->SetP(edge->GetP() * (1 - eps) + eps * noise[noise_idx++] / total);
   }
+  return SelectChildForExtraForcedVisits(node, child_boost);
 }
 }  // namespace
 
@@ -1407,28 +1433,22 @@ float GetForcedExploration(float policy, float total_visits, float factor) {
   return std::sqrt(policy * total_visits * factor);
 }
 
-int AddForcedExploration(const SearchParams& params, Node* node,
-                         Node::Iterator& iter, int& cur_limit, float policy,
-                         int& nstarted) {
+int AddForcedExploration(const SearchParams& params, Node::Iterator& iter,
+                         int node_limit, float policy, int& nstarted) {
   const float factor = params.GetForcedExplorationFactor();
   if (factor == 0.0f) {
     return 0;
   }
 
-  int minimum_visits = GetForcedExploration(
-      policy, node->GetChildrenVisits() + node->GetNInFlight(), factor);
-
-  if (nstarted >= minimum_visits) {
+  if (iter.GetN() > 0 && iter.IsTerminal()) {
     return 0;
   }
 
-  Node* child_node = iter.GetOrSpawnNode(/* parent */ node);
-  int new_visits = std::min(minimum_visits - nstarted, cur_limit);
-  cur_limit -= new_visits;
-  nstarted += new_visits;
-  child_node->IncrementNInFlight(new_visits);
-
-  return new_visits;
+  int minimum_visits = GetForcedExploration(policy, node_limit, factor);
+  if (iter.GetN() == 0) {
+    minimum_visits = std::min(minimum_visits, 1);
+  }
+  return std::max(0, minimum_visits - nstarted);
 }
 
 }  // namespace
@@ -1833,7 +1853,8 @@ void SearchWorker::PickNodesToExtendTask(
       // visited policy without having to cache it in the node (allowing the
       // node to stay at 64 bytes).
       int max_needed = node->GetNumEdges();
-      if (!is_root_node || root_move_filter.empty()) {
+      if (!is_root_node || (root_move_filter.empty() &&
+                            params_.GetForcedExplorationFactor() == 0.0f)) {
         max_needed = std::min(max_needed, node->GetNStarted() + cur_limit + 2);
       }
       node->CopyPolicy(max_needed, current_pol.data());
@@ -1865,52 +1886,18 @@ void SearchWorker::PickNodesToExtendTask(
       const float puct_mult =
           cpuct * std::sqrt(std::max(node->GetChildrenVisits(), 1u));
       int cache_filled_idx = -1;
-      if (is_root_node && params_.GetForcedExplorationFactor() > 0.0f) {
-        // Add forced exploration based on policy
-        for (; cache_filled_idx + 1 < max_needed && cur_limit > 0;
-             ++cache_filled_idx) {
-          int idx = cache_filled_idx + 1;
-          if (idx == 0) {
-            cur_iters[idx] = node->Edges();
-          } else {
-            cur_iters[idx] = cur_iters[idx - 1];
-            ++cur_iters[idx];
-          }
-          current_nstarted[idx] = cur_iters[idx].GetNStarted();
-          (*visits_to_perform.back())[idx] = 0;
-          current_score[idx] =
-              current_pol[idx] * puct_mult / (1 + current_nstarted[idx]) +
-              current_util[idx];
-
-          if (cur_iters[idx].GetN() == 0) {
-            // If child hasn't been visited yet, we don't force any exploration.
-            ++cache_filled_idx;
-            break;
-          }
-
-          if (cur_iters[idx].IsTerminal()) {
-            // If child is already terminal, we don't force any exploration.
-            continue;
-          }
-
-          (*visits_to_perform.back())[idx] =
-              AddForcedExploration(params_, node, cur_iters[idx], cur_limit,
-                                   current_pol[idx], current_nstarted[idx]);
-          current_score[idx] =
-              current_pol[idx] * puct_mult / (1 + current_nstarted[idx]) +
-              current_util[idx];
-        }
-        vtp_last_filled.back() = cache_filled_idx;
-      }
+      bool has_forced_visits = false;
       while (cur_limit > 0) {
         // Perform UCT for current node.
         float best = std::numeric_limits<float>::lowest();
         int best_idx = -1;
+        int new_visits = 0;
         float best_without_u = std::numeric_limits<float>::lowest();
         float second_best = std::numeric_limits<float>::lowest();
         bool can_exit = false;
         best_edge.Reset();
-        for (int idx = 0; idx < max_needed; ++idx) {
+        for (int idx = has_forced_visits ? cache_filled_idx + 1 : 0;
+             idx < max_needed; ++idx) {
           if (idx > cache_filled_idx) {
             if (idx == 0) {
               cur_iters[idx] = node->Edges();
@@ -1944,6 +1931,56 @@ void SearchWorker::PickNodesToExtendTask(
                           cur_iters[idx].GetMove()) == root_move_filter.end()) {
               continue;
             }
+            if (params_.GetForcedExplorationFactor() > 0.0f) {
+              // Do forced visits before other visits.
+              new_visits = AddForcedExploration(
+                  params_, cur_iters[idx],
+                  latest_time_manager_hints_.GetNodeLimit(),
+                  idx == search_->forced_boost_index_
+                      ? params_.GetSingleChildForcedBoost()
+                      : current_pol[idx],
+                  current_nstarted[idx]);
+
+              if (!has_forced_visits && new_visits > 0) {
+                has_forced_visits = true;
+                second_best_edge.Reset();
+              }
+
+              if (has_forced_visits) {
+                int nstarted = node->GetNInFlight();
+                new_visits = std::min<int>(new_visits,
+                                           target_minibatch_size_ - nstarted);
+                if (idx + 1 == max_needed ||
+                    nstarted + new_visits == target_minibatch_size_) {
+                  // Stop node picking after forced visits has been distributed.
+                  if (new_visits != 0) {
+                    // We need to stup without normal visits because the last
+                    // child needs forced visits.
+                    node->CancelScoreUpdate(cur_limit);
+                    cur_limit = 0;
+                  } else {
+                    // Send remaining visits to the top policy move because the
+                    // last child doesn't need forced visits.
+                    int reimaining_visits = target_minibatch_size_ - nstarted;
+                    if (cur_limit > reimaining_visits) {
+                      node->CancelScoreUpdate(cur_limit - reimaining_visits);
+                      cur_limit = reimaining_visits;
+                    }
+                    best_idx = 0;
+                    best_edge = cur_iters[0];
+                  }
+                }
+                if (new_visits == 0) {
+                  continue;
+                } else {
+                  // We expand the limit if we have forced visits.
+                  node->IncrementNInFlight(new_visits);
+                  best_idx = idx;
+                  best_edge = cur_iters[idx];
+                  break;
+                }
+              }
+            }
           }
 
           float score = current_score[idx];
@@ -1966,7 +2003,6 @@ void SearchWorker::PickNodesToExtendTask(
             can_exit = true;
           }
         }
-        int new_visits = 0;
         if (second_best_edge) {
           int estimated_visits_to_change_best = std::numeric_limits<int>::max();
           if (best_without_u < second_best) {
@@ -1980,7 +2016,7 @@ void SearchWorker::PickNodesToExtendTask(
           second_best_edge.Reset();
           max_limit = std::min(max_limit, estimated_visits_to_change_best);
           new_visits = std::min(cur_limit, estimated_visits_to_change_best);
-        } else {
+        } else if (new_visits == 0) {
           // No second best - only one edge, so everything goes in here.
           new_visits = cur_limit;
         }
@@ -1990,7 +2026,9 @@ void SearchWorker::PickNodesToExtendTask(
                     vtp_array + best_idx + 1, 0);
         }
         (*visits_to_perform.back())[best_idx] += new_visits;
-        cur_limit -= new_visits;
+        if (!has_forced_visits || cache_filled_idx + 1 == max_needed) {
+          cur_limit -= new_visits;
+        }
         Node* child_node = best_edge.GetOrSpawnNode(/* parent */ node);
 
         // Probably best place to check for two-fold draws consistently.
@@ -2372,10 +2410,13 @@ void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process) {
   }
   // Add Dirichlet noise if enabled and at root.
   if (params_.GetNoiseEpsilon() && node == search_->root_node_) {
-    ApplyDirichletNoise(node, params_.GetNoiseEpsilon(),
-                        params_.GetNoiseAlpha());
+    int idx = ApplyDirichletNoise(node, params_.GetNoiseEpsilon(),
+                                  params_.GetNoiseAlpha(),
+                                  params_.GetSingleChildForcedBoost());
+    search_->forced_boost_index_ = idx;
+  } else {
+    node->SortEdges();
   }
-  node->SortEdges();
 }
 
 // 6. Propagate the new nodes' information to all their parents in the tree.
