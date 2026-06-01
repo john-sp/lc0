@@ -1964,7 +1964,7 @@ void SearchWorker::PickNodesToExtendTask(
               }
 
               if (has_forced_visits) {
-                int nstarted = node->GetNInFlight();
+                int nstarted = node->GetNInFlight() - cur_limit;
                 new_visits = std::min<int>(new_visits,
                                            target_minibatch_size_ - nstarted);
                 if (idx + 1 == max_needed ||
