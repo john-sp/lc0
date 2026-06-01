@@ -983,8 +983,14 @@ EdgeAndNode Search::GetBestRootChildWithTemperature(float temperature) const {
   float max_n = 0.0;
   const float offset = params_.GetTemperatureVisitOffset();
   float max_eval = -1.0f;
+  float best_S = 0.0f;
   const float fpu =
       GetFpu(params_, root_node_, /* is_root= */ true, draw_score);
+  MEvaluator m_evaluator = backend_attributes_.has_mlh
+                               ? MEvaluator(params_, root_node_)
+                               : MEvaluator();
+  const float U_coeff = ComputeCpuct(params_, root_node_->GetN(), /* is_root_node= */ true) *
+                    std::sqrt(std::max(root_node_->GetChildrenVisits(), 1u));
 
   for (auto& edge : root_node_->Edges()) {
     if (!root_move_filter_.empty() &&
@@ -995,6 +1001,7 @@ EdgeAndNode Search::GetBestRootChildWithTemperature(float temperature) const {
     if (edge.GetN() + offset > max_n) {
       max_n = edge.GetN() + offset;
       max_eval = edge.GetQ(fpu, draw_score);
+      best_S = max_eval + m_evaluator.GetMUtility(edge, max_eval) + edge.GetU(U_coeff);
     }
   }
 
@@ -1007,12 +1014,22 @@ EdgeAndNode Search::GetBestRootChildWithTemperature(float temperature) const {
                   edge.GetMove()) == root_move_filter_.end()) {
       continue;
     }
-    if (edge.GetQ(fpu, draw_score) < min_eval) continue;
+    float Q = edge.GetQ(fpu, draw_score);
+    if (Q < min_eval) continue;
+    float N = edge.GetN();
+    // remove forced visits from N
+    if (params_.GetForcedExplorationFactor() > 0.0f) {
+      float M = m_evaluator.GetMUtility(edge, Q);
+      float U = edge.GetU(U_coeff);
+      if (N > 0.0f && Q + M + U < best_S) {
+        N = std::max(1.0f, std::ceil(U_coeff / (best_S - Q - M) - 1));
+      }
+    }
     sum += std::pow(
         std::max(0.0f,
                  (max_n <= 0.0f
                       ? edge.GetP()
-                      : ((static_cast<float>(edge.GetN()) + offset) / max_n))),
+                      : (N + offset) / max_n)),
         1 / temperature);
     cumulative_sums.push_back(sum);
   }
