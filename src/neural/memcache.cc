@@ -129,7 +129,7 @@ class MemCacheComputation : public BackendComputation {
     auto value = std::make_unique<CachedValue>();
     EvalResultPtr result_ptr;
     value->num_moves = pos.legal_moves.size();
-    memcache_->cache_.Insert(hash, value);
+    memcache_->cache_.Insert(hash, std::move(value));
     HashKeyedCacheLock<CachedValue> lock(&memcache_->cache_, hash);
     // Sometimes search queries NN without passing the legal moves. It is
     // still cached in this case, but in subsequent queries we only return it
@@ -139,10 +139,6 @@ class MemCacheComputation : public BackendComputation {
                                (lock->num_moves == pos.legal_moves.size()))) {
       value.reset();
       auto state = lock->state.load(std::memory_order_acquire);
-      if (state == CachedValue::READY) {
-        CachedValueToEvalResult(**lock, result);
-        return AddInputResult::FETCHED_IMMEDIATELY;
-      }
       while (state == CachedValue::NOT_QUEUED) {
         if (lock->state.compare_exchange_weak(state, CachedValue::NO_WAITERS,
                                               std::memory_order_acq_rel)) {
@@ -156,6 +152,10 @@ class MemCacheComputation : public BackendComputation {
                       : std::span<float>{}};
           break;
         }
+      }
+      if (state == CachedValue::READY) {
+        CachedValueToEvalResult(**lock, result);
+        return AddInputResult::FETCHED_IMMEDIATELY;
       }
     } else {
       // No space, hash collision, or value was removed after insert.
@@ -187,16 +187,18 @@ class MemCacheComputation : public BackendComputation {
     if (wrapped_computation_->UsedBatchSize() == 0) return;
     wrapped_computation_->ComputeBlocking();
     for (auto& entry : entries_) {
-      if (entry.fetched) {
+      if (entry.queued_for_eval) {
         if (entry.value) {
           // There is no cache entry.
           CachedValueToEvalResult(*entry.value, entry.result_ptr);
         } else {
+          // There is a cache entry.
           auto& lock = entry.lock;
           assert(lock.holds_value());
           CachedValueToEvalResult(**lock, entry.result_ptr);
           auto state = lock->state.exchange(CachedValue::READY,
                                             std::memory_order_release);
+          // Wake up waiters if there are any,
           if (state == CachedValue::WAITERS) {
             lock->state.notify_all();
           }
@@ -204,7 +206,7 @@ class MemCacheComputation : public BackendComputation {
       }
     }
     for (auto& entry : entries_) {
-      if (!entry.fetched) {
+      if (!entry.queued_for_eval) {
         auto& lock = entry.lock;
         assert(lock.holds_value());
         auto state = lock->state.load(std::memory_order_acquire);
@@ -226,7 +228,7 @@ class MemCacheComputation : public BackendComputation {
     HashKeyedCacheLock<CachedValue> lock;
     std::unique_ptr<CachedValue> value;
     EvalResultPtr result_ptr;
-    bool fetched = false;
+    bool queued_for_eval = false;
   };
 
   std::unique_ptr<BackendComputation> wrapped_computation_;
@@ -243,8 +245,9 @@ std::optional<EvalResult> MemCache::GetCachedEvaluation(
   const uint64_t hash = ComputeEvalPositionHash(pos);
   HashKeyedCacheLock<CachedValue> lock(&cache_, hash);
   if (!lock.holds_value() ||
+      lock->state.load(std::memory_order_acquire) != CachedValue::READY ||
       (!pos.legal_moves.empty() &&
-       !(lock->p && lock->num_moves == pos.legal_moves.size()))) {
+       !(lock->num_moves == pos.legal_moves.size()))) {
     return std::nullopt;
   }
   EvalResult result;
