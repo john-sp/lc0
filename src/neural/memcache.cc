@@ -123,7 +123,7 @@ class MemCacheComputation : public BackendComputation {
 
  private:
   size_t UsedBatchSize() const override {
-    return wrapped_computation_->UsedBatchSize();
+    return entries_.size();
   }
   virtual AddInputResult AddInput(const EvalPosition& pos,
                                   EvalResultPtr result) override {
@@ -189,8 +189,9 @@ class MemCacheComputation : public BackendComputation {
   }
 
   virtual void ComputeBlocking() override {
-    if (wrapped_computation_->UsedBatchSize() == 0) return;
-    wrapped_computation_->ComputeBlocking();
+    if (wrapped_computation_->UsedBatchSize() != 0) {
+      wrapped_computation_->ComputeBlocking();
+    }
     // Process results from our branch.
     for (auto& entry : entries_) {
       if (entry.queued_for_eval) {
