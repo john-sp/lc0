@@ -43,11 +43,17 @@ uint64_t ComputeEvalPositionHash(const EvalPosition& pos) {
 }
 
 struct CachedValue {
+  // State transitions happen atomically using release and aquire sematics for
+  // dependant reads and writes. The state progresses in order. Each transition
+  // must happen only once which requires compare and exchange. Secondary
+  // readers must wait for READY state to read the cached value.
   enum State {
-    NOT_QUEUED,
-    NO_WAITERS,
-    WAITERS,
-    READY,
+    NOT_QUEUED, // Initial state before NN submision.
+    NO_WAITERS, // One thread has taken this position to be evaluated. None is
+                // yet waiting for the result.
+    WAITERS,    // Another thread is waiting for results. Setting READY state
+                // must be folled by notify_all to wake up waiters.
+    READY,      // The value is ready. Waiters can read the value and proceed.
   };
   WaitableAtomic<State> state = NOT_QUEUED;
   float q;
@@ -61,6 +67,7 @@ void CachedValueToEvalResult(const CachedValue& cv, const EvalResultPtr& ptr) {
   if (ptr.d) *ptr.d = cv.d;
   if (ptr.q) *ptr.q = cv.q;
   if (ptr.m) *ptr.m = cv.m;
+  assert(cv.num_moves >= ptr.p.size());
   std::copy(cv.p.get(), cv.p.get() + ptr.p.size(), ptr.p.begin());
 }
 
@@ -184,6 +191,7 @@ class MemCacheComputation : public BackendComputation {
   virtual void ComputeBlocking() override {
     if (wrapped_computation_->UsedBatchSize() == 0) return;
     wrapped_computation_->ComputeBlocking();
+    // Process results from our branch.
     for (auto& entry : entries_) {
       if (entry.queued_for_eval) {
         if (entry.value) {
@@ -203,6 +211,8 @@ class MemCacheComputation : public BackendComputation {
         }
       }
     }
+    // Process results from other batches which we got through cache before
+    // results were ready.
     for (auto& entry : entries_) {
       if (!entry.queued_for_eval) {
         auto& lock = entry.lock;
