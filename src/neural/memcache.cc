@@ -126,27 +126,24 @@ class MemCacheComputation : public BackendComputation {
     auto value = std::make_unique<CachedValue>();
     EvalResultPtr result_ptr;
     value->num_moves = pos.legal_moves.size();
+    value->p.reset(pos.legal_moves.empty()
+        ? nullptr
+        : new float[pos.legal_moves.size()]);
     memcache_->cache_.Insert(hash, std::move(value));
+
     HashKeyedCacheLock<CachedValue> lock(&memcache_->cache_, hash);
     // Sometimes search queries NN without passing the legal moves. It is
     // still cached in this case, but in subsequent queries we only return it
     // if legal moves are not passed again. Otherwise check the size to guard
     // against hash collisions.
     if (lock.holds_value() && (pos.legal_moves.empty() ||
-                               (lock->num_moves == pos.legal_moves.size()))) {
+                               (lock->p && lock->num_moves == pos.legal_moves.size()))) {
       value.reset();
       auto state = lock->state.load(std::memory_order_acquire);
       while (state == CachedValue::NOT_QUEUED) {
         if (lock->state.compare_exchange_weak(state, CachedValue::NO_WAITERS,
                                               std::memory_order_acq_rel)) {
           to_be_queued = true;
-          lock->p.reset(pos.legal_moves.empty()
-                            ? nullptr
-                            : new float[pos.legal_moves.size()]);
-          result_ptr = EvalResultPtr{
-              &lock->q, &lock->d, &lock->m,
-              lock->p ? std::span<float>{lock->p.get(), pos.legal_moves.size()}
-                      : std::span<float>{}};
           break;
         }
       }
@@ -154,16 +151,20 @@ class MemCacheComputation : public BackendComputation {
         CachedValueToEvalResult(**lock, result);
         return AddInputResult::FETCHED_IMMEDIATELY;
       }
+      result_ptr = EvalResultPtr{
+        &lock->q, &lock->d, &lock->m,
+          lock->p ? std::span<float>{lock->p.get(), pos.legal_moves.size()}
+        : std::span<float>{}};
     } else {
       // No space, hash collision, or value was removed after insert.
       lock = HashKeyedCacheLock<CachedValue>();  // release the lock
       if (!value) {
         value = std::make_unique<CachedValue>();
         value->num_moves = pos.legal_moves.size();
+        value->p.reset(pos.legal_moves.empty()
+            ? nullptr
+            : new float[pos.legal_moves.size()]);
       }
-      value->p.reset(pos.legal_moves.empty()
-                         ? nullptr
-                         : new float[pos.legal_moves.size()]);
       to_be_queued = true;
       result_ptr = EvalResultPtr{
           &value->q, &value->d, &value->m,
@@ -244,7 +245,7 @@ std::optional<EvalResult> MemCache::GetCachedEvaluation(
   if (!lock.holds_value() ||
       lock->state.load(std::memory_order_acquire) != CachedValue::READY ||
       (!pos.legal_moves.empty() &&
-       !(lock->num_moves == pos.legal_moves.size()))) {
+       !(lock->p && lock->num_moves == pos.legal_moves.size()))) {
     return std::nullopt;
   }
   EvalResult result;
