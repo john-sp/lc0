@@ -516,6 +516,7 @@ Ort::IoBinding OnnxComputation<DataType>::PrepareInputs(int start,
   return binding;
 }
 
+#ifdef USE_ONNX_CUDART
 template <typename DataType>
 void OnnxComputation<DataType>::CaptureCudaGraph(std::unique_lock<std::mutex>&& lock) {
   cudaGraph_t graph = nullptr;
@@ -535,6 +536,7 @@ void OnnxComputation<DataType>::CaptureCudaGraph(std::unique_lock<std::mutex>&& 
                       inputs_outputs_->exec_stream_));
   ReportCUDAErrors(cudaGraphDestroy(graph));
 }
+#endif
 
 template <typename DataType>
 void OnnxComputation<DataType>::ComputeBlocking() {
