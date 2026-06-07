@@ -317,7 +317,8 @@ std::tuple<int, int, int> ReadTaskCount(T& task_count) {
 // a little random false sharing when a writer happens to target the same cache
 // line as a reader.
 template <typename TasksArray>
-typename TasksArray::value_type& PickingTaskIndex(TasksArray& tasks, unsigned index) {
+typename TasksArray::value_type& PickingTaskIndex(TasksArray& tasks,
+                                                  unsigned index) {
   const unsigned number_of_cache_lines = sizeof(tasks) / kCacheLineSize;
   const unsigned buckets_per_cache_line = tasks.size() / number_of_cache_lines;
   unsigned cache_line = index % number_of_cache_lines;
@@ -828,7 +829,7 @@ inline double WDLRescale(T& v, T& d, float wdl_rescale_ratio,
 }  // namespace
 
 void Search::SendUciInfo(const classic::IterationStats& stats)
-                         REQUIRES(nodes_mutex_) REQUIRES(counters_mutex_) {
+    REQUIRES(nodes_mutex_) REQUIRES(counters_mutex_) {
   const auto max_pv = params_.GetMultiPv();
   const auto edges = GetBestChildrenNoTemperature(root_node_, max_pv, 0);
   const auto score_type = params_.GetScoreType();
@@ -1210,8 +1211,9 @@ void Search::MaybeTriggerStop(const classic::IterationStats& stats,
     if (stopper_->ShouldStop(stats, hints)) {
       FireStopInternal();
     } else if (!gc_started_ &&
-        stats.time_since_movestart > delay *
-        (stats.time_since_movestart + hints->GetEstimatedRemainingTimeMs())) {
+               stats.time_since_movestart >
+                   delay * (stats.time_since_movestart +
+                            hints->GetEstimatedRemainingTimeMs())) {
       NodeGarbageCollector::Instance().Start();
       gc_started_ = true;
     }
@@ -1241,8 +1243,7 @@ Eval Search::GetBestEval(Move* move, bool* is_terminal) const {
   float parent_wl = -root_node_->GetWL();
   float parent_d = root_node_->GetD();
   float parent_m = root_node_->GetM();
-  if (!root_node_->HasChildren())
-    return {parent_wl, parent_d, parent_m, 0.0f};
+  if (!root_node_->HasChildren()) return {parent_wl, parent_d, parent_m, 0.0f};
   EdgeAndNode best_edge = GetBestChildNoTemperature(root_node_, 0);
   if (move) *move = best_edge.GetMove(played_history_.IsBlackToMove());
   if (is_terminal) *is_terminal = best_edge.IsTerminal();
@@ -1742,7 +1743,9 @@ SearchWorker::SearchWorker(int tid, SearchWorkerCachedState& state,
   int total_workers =
       search_->state_.task_queue_.Size() + search_->total_workers_;
   iteration_memory_managers_.resize(total_workers);
-  state_.StartANewSearch(params_, target_minibatch_size_, max_out_of_order_);
+  state_.StartANewSearch(params_,
+                         search_->backend_attributes_.maximum_batch_size,
+                         max_out_of_order_);
 }
 
 SearchWorker::~SearchWorker() {
@@ -2027,14 +2030,21 @@ void SearchWorker::GatherMinibatch() {
 
     auto [local_collisions, expandable_collision] = PickNodesToExtend(
         std::min({collisions_left, target_minibatch_size_ - minibatch_size,
-                  max_out_of_order_ - number_out_of_order_}));
+                  max_out_of_order_ - number_out_of_order_,
+                  static_cast<int>(state_.minibatch_.capacity()) -
+                      static_cast<int>(state_.minibatch_.size())}));
     collisions_left = AddCollisions(local_collisions);
 
     // Count the non-collisions.
     int new_end = state_.minibatch_.size();
     int collisions_end = state_.collisions_.size();
     int non_collisions = new_end - new_start;
-    minibatch_size += non_collisions;
+    minibatch_size +=
+        non_collisions - std::count_if(state_.minibatch_.begin() + new_start,
+                                       state_.minibatch_.begin() + new_end,
+                                       [](const auto& item) {
+                                         return item.is_delayed_cache_hit;
+                                       });
 
     if (!state_.ooobatch_.empty()) {
       // If there was any OOO, revert 'all' new collisions - it isn't possible
@@ -2483,15 +2493,16 @@ SearchWorker::PickNodesToExtendTask(int collision_limit, int tid,
 
         auto IsBranchWorthSplitting = [&](CurrentPath v) {
           bool is_large_branch = v.large_branch_;
-          return !v.stop_picking_ && ((is_large_main_branch && is_large_branch) ||
-              ((is_large_main_branch || is_large_branch) && v > kMinimumSize) ||
-              v >= params_.GetMinimumRemainingWorkSizeForPicking());
+          return !v.stop_picking_ &&
+                 ((is_large_main_branch && is_large_branch) ||
+                  ((is_large_main_branch || is_large_branch) &&
+                   v > kMinimumSize) ||
+                  v >= params_.GetMinimumRemainingWorkSizeForPicking());
         };
 
         int task_count = std::count_if(
-            visits_to_perform.begin() + 1, end, [=](CurrentPath v) {
-              return IsBranchWorthSplitting(v);
-            });
+            visits_to_perform.begin() + 1, end,
+            [=](CurrentPath v) { return IsBranchWorthSplitting(v); });
 
         TaskArray<PickTaskGather> tasks(task_count);
 
@@ -2748,13 +2759,22 @@ void SearchWorker::ExtendNode(NodeToProcess& picked_node,
       eval.p.reserve(60);
     }
     eval.p.resize(legal_moves.size());
-    picked_node.is_cache_hit =
-        computation_->AddInput(
-            EvalPosition{
-                .pos = history.GetPositions(),
-                .legal_moves = legal_moves,
-            },
-            eval.AsPtr()) == BackendComputation::FETCHED_IMMEDIATELY;
+    auto cache_result = computation_->AddInput(
+        EvalPosition{
+            .pos = history.GetPositions(),
+            .legal_moves = legal_moves,
+        },
+        eval.AsPtr());
+    switch (cache_result) {
+      case BackendComputation::ENQUEUED_FOR_EVAL:
+        break;
+      case BackendComputation::FETCHED_IMMEDIATELY:
+        picked_node.is_cache_hit = true;
+        break;
+      case BackendComputation::FETCHED_DELAYED:
+        picked_node.is_delayed_cache_hit = true;
+        break;
+    }
   }
 }
 
@@ -2762,7 +2782,8 @@ void SearchWorker::ExtendNode(NodeToProcess& picked_node,
 // ~~~~~~~~~~~~~~~~~~~~~~
 void SearchWorker::RunNNComputation() {
   if (computation_->UsedBatchSize() > 0) {
-    int old = search_->backend_waiting_counter_.fetch_add(1, std::memory_order_relaxed);
+    int old = search_->backend_waiting_counter_.fetch_add(
+        1, std::memory_order_relaxed);
     assert(old <= search_->total_workers_);
     std::ignore = old;
     computation_->ComputeBlocking([&](ComputationEvent event) {
@@ -2855,8 +2876,8 @@ void SearchWorker::DoBackupUpdate() {
     // Watchdog thread must be excluded.
     int total = search_->total_workers_;
     if (total != count && count != 0) {
-      while (count > 0 && !tc.compare_exchange_weak(
-                               count, total, std::memory_order_relaxed));
+      while (count > 0 && !tc.compare_exchange_weak(count, total,
+                                                    std::memory_order_relaxed));
 #ifndef NO_STD_ATOMIC_WAIT
       search_->thread_count_.notify_all();
 #else
@@ -3004,8 +3025,8 @@ void SearchWorker::DoBackupUpdateSingleNode(
   float m_delta = 0.0f;
 
   double avg_weight = params_.GetUseUncertaintyWeighting()
-                         ? params_.GetUncertaintyWeightingCap()
-                         : 1.0;
+                          ? params_.GetUncertaintyWeightingCap()
+                          : 1.0;
 
   // Update the low node at the start of the backup path first, but only visit
   // it the first time that backup sees it.
@@ -3038,8 +3059,7 @@ void SearchWorker::DoBackupUpdateSingleNode(
        /* ++it in the body */) {
     auto divisor = n->FinalizeScoreUpdate(v, d, m, avg_weight);
     if (weight_to_fix > 0 && !n->IsTerminal()) {
-      n->AdjustForTerminal(v_delta, d_delta, m_delta, divisor,
-                           weight_to_fix);
+      n->AdjustForTerminal(v_delta, d_delta, m_delta, divisor, weight_to_fix);
     }
 
     // Stop delta update on repetition "terminal" and propagate a draw above
@@ -3073,16 +3093,14 @@ void SearchWorker::DoBackupUpdateSingleNode(
     }
     divisor = pl->FinalizeScoreUpdate(v, d, m, avg_weight);
     if (weight_to_fix > 0) {
-      pl->AdjustForTerminal(v_delta, d_delta, m_delta, divisor,
-                            weight_to_fix);
+      pl->AdjustForTerminal(v_delta, d_delta, m_delta, divisor, weight_to_fix);
     }
 
     bool old_update_parent_bounds = update_parent_bounds;
     // Try setting parent bounds except the root or those already terminal.
-    update_parent_bounds = update_parent_bounds && p != search_->root_node_ &&
-                           !pl->IsTerminal() &&
-                           MaybeSetBounds(p, m, &weight_to_fix,
-                                          &v_delta, &d_delta, &m_delta);
+    update_parent_bounds =
+        update_parent_bounds && p != search_->root_node_ && !pl->IsTerminal() &&
+        MaybeSetBounds(p, m, &weight_to_fix, &v_delta, &d_delta, &m_delta);
 
     // Q will be flipped for opponent.
     v = -v;
@@ -3114,16 +3132,17 @@ void SearchWorker::DoBackupUpdateSingleNode(
     nm = pm;
   }
   search_->total_playouts_ += 1;
-  if (node_to_process.nn_queried && !node_to_process.is_cache_hit) {
+  if (node_to_process.nn_queried && !node_to_process.is_cache_hit &&
+      !node_to_process.is_delayed_cache_hit) {
     search_->network_evaluations_++;
   }
   search_->cum_depth_ += path.size();
   search_->max_depth_ = std::max(search_->max_depth_, (uint16_t)path.size());
 }
 
-bool SearchWorker::MaybeSetBounds(Node* p, float m,
-                                  double* weight_to_fix, double* v_delta,
-                                  double* d_delta, float* m_delta) const {
+bool SearchWorker::MaybeSetBounds(Node* p, float m, double* weight_to_fix,
+                                  double* v_delta, double* d_delta,
+                                  float* m_delta) const {
   auto losing_m = 0.0f;
   auto prefer_tb = false;
 

@@ -579,10 +579,11 @@ class SearchWorker {
 
     // The node to extend.
     int eval_index = -1;
-    bool nn_queried = false;
-    bool is_tt_hit = false;
-    bool is_cache_hit = false;
-    bool is_black_to_move = false;
+    bool nn_queried : 1 = false;
+    bool is_tt_hit : 1 = false;
+    bool is_cache_hit : 1  = false;
+    bool is_black_to_move : 1 = false;
+    bool is_delayed_cache_hit : 1 = false;
 
     // Details that are filled in as we go.
     uint64_t hash;
