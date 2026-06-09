@@ -1022,14 +1022,14 @@ EdgeAndNode Search::GetBestRootChildWithTemperature(float temperature) const {
       float M = m_evaluator.GetMUtility(edge, Q);
       float U = edge.GetU(U_coeff);
       if (N > 0.0f && Q + M + U < best_S) {
-        N = std::max(1.0f, std::ceil(U_coeff / (best_S - Q - M) - 1));
+        N = std::max(1.0f, std::ceil(edge.GetP() * U_coeff / (best_S - Q - M) - 1));
       }
     }
     sum += std::pow(
         std::max(0.0f,
                  (max_n <= 0.0f
                       ? edge.GetP()
-                      : (N + offset) / max_n)),
+                      : std::max((N + offset) / max_n, 0.0f))),
         1 / temperature);
     cumulative_sums.push_back(sum);
   }
