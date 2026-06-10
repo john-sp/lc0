@@ -1893,7 +1893,7 @@ void SearchWorker::PickNodesToExtendTask(
       // node to stay at 64 bytes).
       int max_needed = node->GetNumEdges();
       if (!is_root_node || (root_move_filter.empty() &&
-                            !search_->forced_exploration_visits_.empty())) {
+                            search_->forced_exploration_visits_.empty())) {
         max_needed = std::min(max_needed, node->GetNStarted() + cur_limit + 2);
       }
       node->CopyPolicy(max_needed, current_pol.data());
