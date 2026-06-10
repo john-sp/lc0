@@ -573,6 +573,14 @@ const OptionId SearchParams::kPolicyPostProcessingWeightTemperatureId{
          "sharpness is adjusted for different positions. Lower values mean "
          "variance focuses more towards good moves. Lower values add extra "
          "sharpness towards sharp positions."}};
+const OptionId SearchParams::kTemperatureSimulatedCpuctId{
+    {.long_flag = "temperature-simulated-cpuct",
+     .uci_option = "TemperatureSimulatedCpuct",
+     .help_text =
+         "When picking a move with temperature, use this cpuct value for "
+         "simulating the search behavior. It allows consistent blunder chances "
+         "with changing root CPuct. It is only used if ForcedExplorationFactor is greater than zero.",
+     .visibility = OptionId::kProOnly}};
 
 void BaseSearchParams::Populate(OptionsParser* options) {
   // Here the uci optimized defaults" are set.
@@ -678,6 +686,7 @@ void SearchParams::Populate(OptionsParser* options) {
                             100.0f) = 0.42f;
   options->Add<FloatOption>(kPolicyPostProcessingWeightTemperatureId, 0.0001f,
                             1000.0f) = 0.07f;
+  options->Add<FloatOption>(kTemperatureSimulatedCpuctId, 0.0f, 100.0f) = 2.53f;
 }
 
 BaseSearchParams::BaseSearchParams(const OptionsDict& options)
@@ -773,10 +782,7 @@ SearchParams::SearchParams(const OptionsDict& options)
       kSolidTreeThreshold(options.Get<int>(kSolidTreeThresholdId)),
       kUsePolicyPostProcessing(options.Get<bool>(kUsePolicyPostProcessingId)),
       kForcedExplorationFactor(options.Get<float>(kForcedExplorationFactorId)),
-      kSingleChildForcedBoost(options.Get<float>(kSingleChildForcedBoostId) / 100.0f),
-      kPolicyPostProcessingUtilityAlpha(
-          options.Get<float>(kPolicyPostProcessingUtilityAlphaId)),
-      kPolicyPostProcessingWeightTemperature(
-          options.Get<float>(kPolicyPostProcessingWeightTemperatureId)) {}
+      kSingleChildForcedBoost(options.Get<float>(kSingleChildForcedBoostId) /
+                              100.0f) {}
 }  // namespace classic
 }  // namespace lczero

@@ -472,8 +472,9 @@ inline float GetFpu(const SearchParams& params, const Node* node, bool is_root_n
 }
 
 inline float ComputeCpuct(const SearchParams& params, uint32_t N,
-                          bool is_root_node) {
-  const float init = params.GetCpuct(is_root_node);
+                          bool is_root_node, bool is_temperature = false) {
+  const float init = !is_temperature ? params.GetCpuct(is_root_node)
+                                     : params.GetTemperatureSimulatedCpuct();
   const float k = params.GetCpuctFactor(is_root_node);
   const float base = params.GetCpuctBase(is_root_node);
   return init + (k ? k * FastLog((N + base) / base) : 0.0f);
@@ -989,8 +990,9 @@ EdgeAndNode Search::GetBestRootChildWithTemperature(float temperature) const {
   MEvaluator m_evaluator = backend_attributes_.has_mlh
                                ? MEvaluator(params_, root_node_)
                                : MEvaluator();
-  const float U_coeff = ComputeCpuct(params_, root_node_->GetN(), /* is_root_node= */ true) *
-                    std::sqrt(std::max(root_node_->GetChildrenVisits(), 1u));
+  const float U_coeff =
+      ComputeCpuct(params_, root_node_->GetN(), /* is_root_node= */ true, true) *
+      std::sqrt(std::max(root_node_->GetChildrenVisits(), 1u));
 
   for (auto& edge : root_node_->Edges()) {
     if (!root_move_filter_.empty() &&
@@ -1001,7 +1003,8 @@ EdgeAndNode Search::GetBestRootChildWithTemperature(float temperature) const {
     if (edge.GetN() + offset > max_n) {
       max_n = edge.GetN() + offset;
       max_eval = edge.GetQ(fpu, draw_score);
-      best_S = max_eval + m_evaluator.GetMUtility(edge, max_eval) + edge.GetU(U_coeff);
+      best_S = max_eval + m_evaluator.GetMUtility(edge, max_eval) +
+               edge.GetU(U_coeff);
     }
   }
 
@@ -1020,16 +1023,14 @@ EdgeAndNode Search::GetBestRootChildWithTemperature(float temperature) const {
     // remove forced visits from N
     if (params_.GetForcedExplorationFactor() > 0.0f) {
       float M = m_evaluator.GetMUtility(edge, Q);
-      float U = edge.GetU(U_coeff);
-      if (N > 0.0f && Q + M + U < best_S) {
-        N = std::max(1.0f, std::ceil(edge.GetP() * U_coeff / (best_S - Q - M) - 1));
+      if (N > 0.0f) {
+        N = std::max(1.0f,
+                     std::ceil(edge.GetP() * U_coeff / (best_S - Q - M) - 1));
       }
     }
     sum += std::pow(
-        std::max(0.0f,
-                 (max_n <= 0.0f
-                      ? edge.GetP()
-                      : std::max((N + offset) / max_n, 0.0f))),
+        std::max(0.0f, (max_n <= 0.0f ? edge.GetP()
+                                      : std::max((N + offset) / max_n, 0.0f))),
         1 / temperature);
     cumulative_sums.push_back(sum);
   }

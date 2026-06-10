@@ -314,6 +314,9 @@ class SearchParams : public BaseSearchParams {
   float GetPolicyPostProcessingWeightTemperature() const {
     return options_.Get<float>(kPolicyPostProcessingWeightTemperatureId);
   }
+  float GetTemperatureSimulatedCpuct() const {
+    return options_.Get<float>(kTemperatureSimulatedCpuctId);
+  }
 
   // Search parameter IDs.
   static const OptionId kMaxPrefetchBatchId;
@@ -323,14 +326,13 @@ class SearchParams : public BaseSearchParams {
   static const OptionId kUsePolicyPostProcessingId;
   static const OptionId kPolicyPostProcessingUtilityAlphaId;
   static const OptionId kPolicyPostProcessingWeightTemperatureId;
+  static const OptionId kTemperatureSimulatedCpuctId;
 
  private:
   const int kSolidTreeThreshold;
   const bool kUsePolicyPostProcessing;
   const float kForcedExplorationFactor;
   const float kSingleChildForcedBoost;
-  const float kPolicyPostProcessingUtilityAlpha;
-  const float kPolicyPostProcessingWeightTemperature;
 };
 }  // namespace classic
 }  // namespace lczero
