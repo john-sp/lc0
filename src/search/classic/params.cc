@@ -543,14 +543,14 @@ const OptionId SearchParams::kUsePolicyPostProcessingId{
     {.long_flag = "use-policy-post-processing",
      .uci_option = "UsePolicyPostProcessing",
      .help_text = "Apply post-processing to the policy training targets."}};
-const OptionId SearchParams::kForcedExplorationFactorId{
-    {.long_flag = "forced-exploration-factor",
-     .uci_option = "ForcedExplorationFactor",
+const OptionId SearchParams::kForcedExplorationVisitsId{
+    {.long_flag = "forced-exploration-visits",
+     .uci_option = "ForcedExplorationVisits",
      .help_text =
-         "Force minimum visits at root based on policy which can include "
-         "noise. This aims to overcome a problem if the first visit to a child "
-         "evaluates it incorrectly which would suppress further visits even "
-         "when noised policy wants to explore it."}};
+         "Force minimum this number of visits at root based on policy which "
+         "can include noise. This aims to overcome a problem if the first "
+         "visit to a child evaluates it incorrectly which would suppress "
+         "further visits even when noised policy wants to explore it."}};
 const OptionId SearchParams::kSingleChildForcedBoostId{
     {.long_flag = "single-child-forced-boost",
      .uci_option = "SingleChildForcedBoost",
@@ -579,7 +579,8 @@ const OptionId SearchParams::kTemperatureSimulatedCpuctId{
      .help_text =
          "When picking a move with temperature, use this cpuct value for "
          "simulating the search behavior. It allows consistent blunder chances "
-         "with changing root CPuct. It is only used if ForcedExplorationFactor is greater than zero.",
+         "with changing root CPuct. It is only used if ForcedExplorationFactor "
+         "is greater than zero.",
      .visibility = OptionId::kProOnly}};
 
 void BaseSearchParams::Populate(OptionsParser* options) {
@@ -680,7 +681,7 @@ void SearchParams::Populate(OptionsParser* options) {
   options->Add<IntOption>(kMaxPrefetchBatchId, 0, 1024) = DEFAULT_MAX_PREFETCH;
   options->Add<IntOption>(kSolidTreeThresholdId, 1, 2000000000) = 100;
   options->Add<BoolOption>(kUsePolicyPostProcessingId) = true;
-  options->Add<FloatOption>(kForcedExplorationFactorId, 0.0f, 100.0f) = 0.0f;
+  options->Add<IntOption>(kForcedExplorationVisitsId, 0, 100000) = 0;
   options->Add<FloatOption>(kSingleChildForcedBoostId, 0.0f, 100.0f) = 5.0f;
   options->Add<FloatOption>(kPolicyPostProcessingUtilityAlphaId, 0.00001f,
                             100.0f) = 0.42f;
@@ -780,9 +781,6 @@ BaseSearchParams::BaseSearchParams(const OptionsDict& options)
 SearchParams::SearchParams(const OptionsDict& options)
     : BaseSearchParams(options),
       kSolidTreeThreshold(options.Get<int>(kSolidTreeThresholdId)),
-      kUsePolicyPostProcessing(options.Get<bool>(kUsePolicyPostProcessingId)),
-      kForcedExplorationFactor(options.Get<float>(kForcedExplorationFactorId)),
-      kSingleChildForcedBoost(options.Get<float>(kSingleChildForcedBoostId) /
-                              100.0f) {}
+      kUsePolicyPostProcessing(options.Get<bool>(kUsePolicyPostProcessingId)) {}
 }  // namespace classic
 }  // namespace lczero

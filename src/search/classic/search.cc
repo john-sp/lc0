@@ -199,13 +199,13 @@ Search::Search(const NodeTree& tree, Backend* backend,
 }
 
 namespace {
-int SelectChildForExtraForcedVisits(Node* node, float child_boost) {
+int SelectChildForExtraForcedVisits(Node* node, const SearchParams& params) {
+  const float child_boost = params.GetSingleChildForcedBoost();
   if (child_boost == 0) {
     return -1;
   }
   int rv = -1;
   // Choose one low policy child to get extra exploration.
-  node->SortEdges();
   std::vector<float> policy;
   bool has_nonzero_policy = false;
   for (const auto& edge : node->Edges()) {
@@ -221,11 +221,35 @@ int SelectChildForExtraForcedVisits(Node* node, float child_boost) {
   return rv;
 }
 
-int ApplyDirichletNoise(Node* node, float eps, double alpha,
-                        float child_boost) {
+std::vector<uint32_t> ComputeForcedVisits(Node* node,
+                                          const SearchParams& params) {
+  const float visits = params.GetForcedExplorationVisits();
+  if (visits <= 0) {
+    return {};
+  }
+  int forced_child = SelectChildForExtraForcedVisits(node, params);
+  std::vector<float> forced_visits(node->GetNumEdges(), 0);
+  float sum = 0.0f;
+  std::generate(forced_visits.begin(), forced_visits.end(),
+                [&, i = 0, edge = node->Edges()]() mutable {
+                  float share = std::sqrt(
+                      (i++ == forced_child) ? params.GetSingleChildForcedBoost()
+                                            : edge.GetP());
+                  ++edge;
+                  sum += share;
+                  return share;
+                });
+  std::transform(forced_visits.begin(), forced_visits.end(),
+                 forced_visits.begin(),
+                 [sum, visits](float v) { return visits * v / sum; });
+  return {forced_visits.begin(), forced_visits.end()};
+}
+
+void ApplyDirichletNoise(Node* node, const SearchParams& params) {
   float total = 0;
   std::vector<float> noise;
-
+  const float eps = params.GetNoiseEpsilon();
+  const float alpha = params.GetNoiseAlpha();
   for (int i = 0; i < node->GetNumEdges(); ++i) {
     float eta = Random::Get().GetGamma(alpha, 1.0);
     noise.emplace_back(eta);
@@ -233,7 +257,7 @@ int ApplyDirichletNoise(Node* node, float eps, double alpha,
   }
 
   if (total < std::numeric_limits<float>::min()) {
-    return SelectChildForExtraForcedVisits(node, child_boost);
+    return;
   }
 
   int noise_idx = 0;
@@ -241,7 +265,7 @@ int ApplyDirichletNoise(Node* node, float eps, double alpha,
     auto* edge = child.edge();
     edge->SetP(edge->GetP() * (1 - eps) + eps * noise[noise_idx++] / total);
   }
-  return SelectChildForExtraForcedVisits(node, child_boost);
+  return;
 }
 }  // namespace
 
@@ -991,7 +1015,8 @@ EdgeAndNode Search::GetBestRootChildWithTemperature(float temperature) const {
                                ? MEvaluator(params_, root_node_)
                                : MEvaluator();
   const float U_coeff =
-      ComputeCpuct(params_, root_node_->GetN(), /* is_root_node= */ true, true) *
+      ComputeCpuct(params_, root_node_->GetN(), /* is_root_node= */ true,
+                   true) *
       std::sqrt(std::max(root_node_->GetChildrenVisits(), 1u));
 
   for (auto& edge : root_node_->Edges()) {
@@ -1021,7 +1046,7 @@ EdgeAndNode Search::GetBestRootChildWithTemperature(float temperature) const {
     if (Q < min_eval) continue;
     float N = edge.GetN();
     // remove forced visits from N
-    if (params_.GetForcedExplorationFactor() > 0.0f) {
+    if (!forced_exploration_visits_.empty()) {
       float M = m_evaluator.GetMUtility(edge, Q);
       if (N > 0.0f) {
         N = std::max(1.0f,
@@ -1447,14 +1472,9 @@ int CalculateCollisionsLeft(int64_t nodes, const SearchParams& params) {
                       params.GetMaxCollisionVisitsScalingPower()));
 }
 
-float GetForcedExploration(float policy, float total_visits, float factor) {
-  return std::sqrt(policy * total_visits * factor);
-}
-
-int AddForcedExploration(const SearchParams& params, Node::Iterator& iter,
-                         int node_limit, float policy, int& nstarted) {
-  const float factor = params.GetForcedExplorationFactor();
-  if (factor == 0.0f) {
+int AddForcedExploration(Node::Iterator& iter, size_t idx,
+                         const std::vector<uint32_t>& visits, int nstarted) {
+  if (visits.empty()) {
     return 0;
   }
 
@@ -1462,7 +1482,8 @@ int AddForcedExploration(const SearchParams& params, Node::Iterator& iter,
     return 0;
   }
 
-  int minimum_visits = GetForcedExploration(policy, node_limit, factor);
+  assert(idx < visits.size());
+  int minimum_visits = visits[idx];
   if (iter.GetN() == 0) {
     minimum_visits = std::min(minimum_visits, 1);
   }
@@ -1872,7 +1893,7 @@ void SearchWorker::PickNodesToExtendTask(
       // node to stay at 64 bytes).
       int max_needed = node->GetNumEdges();
       if (!is_root_node || (root_move_filter.empty() &&
-                            params_.GetForcedExplorationFactor() == 0.0f)) {
+                            !search_->forced_exploration_visits_.empty())) {
         max_needed = std::min(max_needed, node->GetNStarted() + cur_limit + 2);
       }
       node->CopyPolicy(max_needed, current_pol.data());
@@ -1949,14 +1970,10 @@ void SearchWorker::PickNodesToExtendTask(
                           cur_iters[idx].GetMove()) == root_move_filter.end()) {
               continue;
             }
-            if (params_.GetForcedExplorationFactor() > 0.0f) {
+            if (!search_->forced_exploration_visits_.empty()) {
               // Do forced visits before other visits.
               new_visits = AddForcedExploration(
-                  params_, cur_iters[idx],
-                  latest_time_manager_hints_.GetNodeLimit(),
-                  idx == search_->forced_boost_index_
-                      ? params_.GetSingleChildForcedBoost()
-                      : current_pol[idx],
+                  cur_iters[idx], idx, search_->forced_exploration_visits_,
                   current_nstarted[idx]);
 
               if (!has_forced_visits && new_visits > 0) {
@@ -2428,12 +2445,11 @@ void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process) {
   }
   // Add Dirichlet noise if enabled and at root.
   if (params_.GetNoiseEpsilon() && node == search_->root_node_) {
-    int idx = ApplyDirichletNoise(node, params_.GetNoiseEpsilon(),
-                                  params_.GetNoiseAlpha(),
-                                  params_.GetSingleChildForcedBoost());
-    search_->forced_boost_index_ = idx;
-  } else {
-    node->SortEdges();
+    ApplyDirichletNoise(node, params_);
+  }
+  node->SortEdges();
+  if (node == search_->root_node_) {
+    search_->forced_exploration_visits_ = ComputeForcedVisits(node, params_);
   }
 }
 

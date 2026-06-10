@@ -179,6 +179,7 @@ class Search {
   // tb_hits_ must be initialized before root_move_filter_.
   std::atomic<int> tb_hits_{0};
   const MoveList root_move_filter_;
+  std::vector<uint32_t> forced_exploration_visits_;
 
   mutable SharedMutex nodes_mutex_;
   EdgeAndNode current_best_edge_ GUARDED_BY(nodes_mutex_);
@@ -191,7 +192,6 @@ class Search {
   uint16_t max_depth_ GUARDED_BY(nodes_mutex_) = 0;
   // Cumulative depth of all paths taken in PickNodetoExtend.
   uint64_t cum_depth_ GUARDED_BY(nodes_mutex_) = 0;
-  int forced_boost_index_ GUARDED_BY(nodes_mutex_) = -1;
 
   std::optional<std::chrono::steady_clock::time_point> nps_start_time_
       GUARDED_BY(counters_mutex_);
