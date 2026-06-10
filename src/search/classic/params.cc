@@ -212,7 +212,7 @@ const OptionId BaseSearchParams::kCpuctFactorAtRootId{
 // training server stops sending it.
 const OptionId BaseSearchParams::kRootHasOwnCpuctParamsId{
     {.long_flag = "root-has-own-cpuct-params",
-     .uci_option = "RootHasOwnCpuctParams",
+     .uci_option = "RootHasOwnCPuctParams",
      .help_text =
          "If enabled, cpuct parameters for root node are taken from *AtRoot "
          "parameters. Otherwise, they are the same as for the rest of nodes. "
@@ -575,7 +575,7 @@ const OptionId SearchParams::kPolicyPostProcessingWeightTemperatureId{
          "sharpness towards sharp positions."}};
 const OptionId SearchParams::kTemperatureSimulatedCpuctId{
     {.long_flag = "temperature-simulated-cpuct",
-     .uci_option = "TemperatureSimulatedCpuct",
+     .uci_option = "TemperatureSimulatedCPuct",
      .help_text =
          "When picking a move with temperature, use this cpuct value for "
          "simulating the search behavior. It allows consistent blunder chances "
