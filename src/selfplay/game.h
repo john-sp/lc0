@@ -43,7 +43,8 @@ struct SelfPlayLimits {
   std::int64_t playouts = -1;
   std::int64_t movetime = -1;
 
-  std::unique_ptr<classic::ChainedSearchStopper> MakeSearchStopper() const;
+  std::unique_ptr<classic::ChainedSearchStopper> MakeSearchStopper(
+      bool value_match_visits) const;
 };
 
 struct PlayerOptions {

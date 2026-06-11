@@ -36,8 +36,14 @@ namespace classic {
 // ChainedSearchStopper
 ///////////////////////////
 
+ChainedSearchStopper::ChainedSearchStopper(bool require_value_match_visits)
+    : require_value_match_visits_(require_value_match_visits) {}
+
 bool ChainedSearchStopper::ShouldStop(const IterationStats& stats,
                                       StoppersHints* hints) {
+  if (require_value_match_visits_ && !stats.best_move_has_best_s) {
+    return false;
+  }
   for (const auto& x : stoppers_) {
     if (x->ShouldStop(stats, hints)) return true;
   }

@@ -38,7 +38,7 @@ namespace classic {
 // Combines multiple stoppers into one.
 class ChainedSearchStopper : public SearchStopper {
  public:
-  ChainedSearchStopper() = default;
+  ChainedSearchStopper(bool require_value_match_visits = false);
   // Calls stoppers one by one until one of them returns true. If one of
   // stoppers modifies hints, next stoppers in the chain see that.
   bool ShouldStop(const IterationStats&, StoppersHints*) override;
@@ -48,6 +48,7 @@ class ChainedSearchStopper : public SearchStopper {
 
  private:
   std::vector<std::unique_ptr<SearchStopper>> stoppers_;
+  bool require_value_match_visits_ = false;
 };
 
 // Watches visits (total tree nodes) and predicts remaining visits.
