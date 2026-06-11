@@ -1018,6 +1018,7 @@ EdgeAndNode Search::GetBestRootChildWithTemperature(float temperature) const {
       ComputeCpuct(params_, root_node_->GetN(), /* is_root_node= */ true,
                    true) *
       std::sqrt(std::max(root_node_->GetChildrenVisits(), 1u));
+  Node::Iterator best_edge;
 
   for (auto& edge : root_node_->Edges()) {
     if (!root_move_filter_.empty() &&
@@ -1030,6 +1031,60 @@ EdgeAndNode Search::GetBestRootChildWithTemperature(float temperature) const {
       max_eval = edge.GetQ(fpu, draw_score);
       best_S = max_eval + m_evaluator.GetMUtility(edge, max_eval) +
                edge.GetU(U_coeff);
+      best_edge = edge;
+    }
+  }
+
+  // Correct best_S if the best evaluation isn't the most visits.
+  if (!forced_exploration_visits_.empty() && !best_edge.IsZeroPolicy()) {
+    double best_QM = best_edge.GetQ(fpu, draw_score) +
+                     m_evaluator.GetMUtility(best_edge, max_eval);
+
+    for (auto& edge : root_node_->Edges()) {
+      if (!root_move_filter_.empty() &&
+          std::find(root_move_filter_.begin(), root_move_filter_.end(),
+                    edge.GetMove()) == root_move_filter_.end()) {
+        continue;
+      }
+      double Q = edge.GetQ(fpu, draw_score);
+      double M = m_evaluator.GetMUtility(edge, Q);
+      if (edge == best_edge || edge.IsZeroPolicy() || Q + M <= best_QM) {
+        continue;
+      }
+      // Q1 + M1 + P1 * U_coeff / (1 + (N1+N2)*x) ==
+      // Q2 + M2 + P2 * U_coeff / (1 + (N1+N2)*(1-x))
+      // C = Q1 - Q2 + M1 - M2
+      double C = Q + M - best_QM;
+      assert(C > 0);
+      // N = N1 + N2
+      double N = edge.GetN() + best_edge.GetN();
+      // Un = Pn * U_coeff
+      double U1 = edge.GetP() * U_coeff;
+      double U2 = best_edge.GetP() * U_coeff;
+      // C + U1 / (1 + N*x) == U2 / (1 + N*(1-x))
+      // Wolfram solved for x:
+      // xs = (-C N^2 + N U1 + N U2)^2
+      // xr = +-sqrt(xs - 4 C N^2 (C (-N) - C - N U1 - U1 + U2))
+      // x = (xr + C N^2 - N U1 - N U2)/(2 C N^2)
+      double xs = -C * N * N + N * U1 + N * U2;
+      xs *= xs;
+      double xrr = xs - 4 * C * N * N * (U2 - C * N - C - N * U1 - U1);
+      assert(xrr >= 0);
+      double xr = std::sqrt(xrr);
+      double xp = (xr + C * N * N - N * U1 - N * U2) / (2 * C * N * N);
+      double xm = (-xr + C * N * N - N * U1 - N * U2) / (2 * C * N * N);
+      double x = (xp >= 0.0 && xp <= 1.0) ? xp : xm;
+      assert(std::abs(C + U1 / (1 + N * x) - U2 / (1 + N * (1 - x))) < 1e-3);
+      assert(x > 0);
+      assert(x < 1);
+      float S = Q + M + edge.GetP() * U_coeff / (1.0f + N * x);
+      if (S > best_S) {
+        best_S = S;
+        if (x >= 0.5f) {
+          max_eval = Q;
+        }
+        max_n = N * std::max(x, 1.0f - x) + offset;
+      }
     }
   }
 
@@ -1046,7 +1101,8 @@ EdgeAndNode Search::GetBestRootChildWithTemperature(float temperature) const {
     if (Q < min_eval) continue;
     float N = edge.GetN();
     // remove forced visits from N
-    if (!forced_exploration_visits_.empty()) {
+    if (!forced_exploration_visits_.empty() && !best_edge.IsZeroPolicy() &&
+        !edge.IsZeroPolicy()) {
       float M = m_evaluator.GetMUtility(edge, Q);
       if (N > 0.0f) {
         N = std::max(1.0f,

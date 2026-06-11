@@ -95,6 +95,7 @@ class Edge {
   // (but can be changed by adding Dirichlet noise). Must be in [0,1].
   float GetP() const;
   void SetP(float val);
+  bool IsZeroPolicy() const;
 
   // Debug information about the edge.
   std::string DebugString() const;
@@ -399,6 +400,7 @@ class EdgeAndNode {
 
   // Edge related getters.
   float GetP() const { return edge_->GetP(); }
+  bool IsZeroPolicy() const { return edge_->IsZeroPolicy(); }
   Move GetMove(bool flip = false) const {
     return edge_ ? edge_->GetMove(flip) : Move();
   }
