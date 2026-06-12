@@ -1199,8 +1199,8 @@ void Search::PopulateCommonIterationStats(IterationStats* stats) {
         GetFpu(params_, root_node_, /* is_root_node */ true, draw_score);
     float max_q_plus_m = -1000;
     float max_s = -1000;
-    const float s_threshold = 1e-3;
     uint64_t max_n = 0;
+    const float s_threshold = 1e-2f;
     bool max_n_has_max_q_plus_m = true, max_n_has_best_s = true;
     const auto m_evaluator = backend_attributes_.has_mlh
                                  ? MEvaluator(params_, root_node_)
@@ -1237,14 +1237,15 @@ void Search::PopulateCommonIterationStats(IterationStats* stats) {
       if (max_n < n) {
         max_n = n;
         max_n_has_max_q_plus_m = false;
+        max_n_has_best_s = false;
       }
       if (max_q_plus_m <= q_plus_m) {
         max_n_has_max_q_plus_m = (max_n == n);
         max_q_plus_m = q_plus_m;
       }
-      if (max_s < s + s_threshold * (max_n == n)) {
+      if (max_s + s_threshold * max_n_has_best_s < s + s_threshold * (max_n == n)) {
         max_n_has_best_s = (max_n == n);
-        max_s = s + s_threshold * (max_n == n);
+        max_s = s;
       }
     }
     stats->best_move_has_best_s = max_n_has_best_s;
