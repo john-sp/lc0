@@ -1200,7 +1200,7 @@ void Search::PopulateCommonIterationStats(IterationStats* stats) {
     float max_q_plus_m = -1000;
     float max_s = -1000;
     uint64_t max_n = 0;
-    const float s_threshold = 1e-2f;
+    float s_threshold = 1e-2f;
     bool max_n_has_max_q_plus_m = true, max_n_has_best_s = true;
     const auto m_evaluator = backend_attributes_.has_mlh
                                  ? MEvaluator(params_, root_node_)
@@ -1238,6 +1238,7 @@ void Search::PopulateCommonIterationStats(IterationStats* stats) {
         max_n = n;
         max_n_has_max_q_plus_m = false;
         max_n_has_best_s = false;
+        s_threshold = 4.0f / max_n;
       }
       if (max_q_plus_m <= q_plus_m) {
         max_n_has_max_q_plus_m = (max_n == n);
