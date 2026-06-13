@@ -733,9 +733,6 @@ void OnnxComputation<DataType>::ComputeBlockingImpl() {
     }
     i += batch;
   }
-  if (network_->provider_ != OnnxProvider::CPU) {
-    network_->lock_.unlock();
-  }
 #ifdef USE_ONNX_CUDART
   if ((network_->provider_ == OnnxProvider::TRT ||
        network_->provider_ == OnnxProvider::CUDA) &&
