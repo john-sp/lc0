@@ -1238,7 +1238,7 @@ void Search::PopulateCommonIterationStats(IterationStats* stats) {
         max_n = n;
         max_n_has_max_q_plus_m = false;
         max_n_has_best_s = false;
-        s_threshold = max_n > 0 ? 4.0f / max_n : 4.0f;
+        s_threshold = std::max(max_n > 0 ? 4.0f / max_n : 4.0f, 1e-2f);
       }
       if (max_q_plus_m <= q_plus_m) {
         max_n_has_max_q_plus_m = (max_n == n);
