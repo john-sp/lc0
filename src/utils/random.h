@@ -37,6 +37,8 @@ namespace lczero {
 class Random {
  public:
   static Random& Get();
+  // A negative seed keeps the current non-deterministic seeding behavior.
+  explicit Random(int seed);
   double GetDouble(double max_val);
   float GetFloat(float max_val);
   double GetGamma(double alpha, double beta);

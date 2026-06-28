@@ -37,6 +37,7 @@
 #include "utils/mutex.h"
 #include "utils/optionsdict.h"
 #include "utils/optionsparser.h"
+#include "utils/random.h"
 
 namespace lczero {
 
@@ -79,6 +80,7 @@ class SelfPlayTournament {
   bool first_game_black_ GUARDED_BY(mutex_) = false;
   std::unique_ptr<SyzygyTablebase> syzygy_tb_ GUARDED_BY(mutex_);
   std::vector<Opening> discard_pile_ GUARDED_BY(mutex_);
+  Random opening_random_;
   // Number of games which already started.
   int games_count_ GUARDED_BY(mutex_) = 0;
   bool abort_ GUARDED_BY(mutex_) = false;
