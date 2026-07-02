@@ -32,10 +32,6 @@ namespace lczero {
 
 Random::Random() : gen_(std::random_device()()) {}
 
-Random::Random(int seed)
-    : gen_(seed < 0 ? std::random_device()()
-                    : static_cast<std::mt19937::result_type>(seed)) {}
-
 Random& Random::Get() {
   static Random rand;
   return rand;
