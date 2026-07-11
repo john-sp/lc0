@@ -558,7 +558,13 @@ std::string Converter::MakeEncoderLayer(
     OnnxBuilder* builder, const MultiHeadWeights::EncoderLayer& layer,
     int embedding_size, int heads, const std::string& encoder_in,
     const std::string& name, ActivationFunction activation, float alpha) {
-  const int d_model = layer.mha.q_b.size();
+  // Q/K/V biases are optional in newer weight files.  The projection width is
+  // normally available from q_b, but must be inferred from q_w when it is
+  // omitted.  ONNX's MatMul does not need a bias input, so simply skip the
+  // corresponding Add in that case.
+  const int d_model = layer.mha.q_b.empty()
+                          ? layer.mha.q_w.size() / embedding_size
+                          : layer.mha.q_b.size();
   const int depth = d_model / heads;
 
   auto mha_shape =
@@ -567,22 +573,28 @@ std::string Converter::MakeEncoderLayer(
   auto flow = builder->MatMul(
       name + "/mha/Q/w", encoder_in,
       *GetWeghtsConverter(layer.mha.q_w, {embedding_size, d_model}, {1, 0}));
-  flow = builder->Add(name + "/mha/Q/b", flow,
-                      *GetWeghtsConverter(layer.mha.q_b, {d_model}));
+  if (!layer.mha.q_b.empty()) {
+    flow = builder->Add(name + "/mha/Q/b", flow,
+                        *GetWeghtsConverter(layer.mha.q_b, {d_model}));
+  }
   flow = builder->Reshape(name + "/mha/Q/reshape", flow, mha_shape);
   auto Q = builder->Transpose(name + "/mha/Q/transpose", flow, {0, 2, 1, 3});
   flow = builder->MatMul(
       name + "/mha/K/w", encoder_in,
       *GetWeghtsConverter(layer.mha.k_w, {embedding_size, d_model}, {1, 0}));
-  flow = builder->Add(name + "/mha/K/b", flow,
-                      *GetWeghtsConverter(layer.mha.k_b, {d_model}));
+  if (!layer.mha.k_b.empty()) {
+    flow = builder->Add(name + "/mha/K/b", flow,
+                        *GetWeghtsConverter(layer.mha.k_b, {d_model}));
+  }
   flow = builder->Reshape(name + "/mha/K/reshape", flow, mha_shape);
   auto K = builder->Transpose(name + "/mha/K/transpose", flow, {0, 2, 3, 1});
   flow = builder->MatMul(
       name + "/mha/V/w", encoder_in,
       *GetWeghtsConverter(layer.mha.v_w, {embedding_size, d_model}, {1, 0}));
-  flow = builder->Add(name + "/mha/V/b", flow,
-                      *GetWeghtsConverter(layer.mha.v_b, {d_model}));
+  if (!layer.mha.v_b.empty()) {
+    flow = builder->Add(name + "/mha/V/b", flow,
+                        *GetWeghtsConverter(layer.mha.v_b, {d_model}));
+  }
   flow = builder->Reshape(name + "/mha/V/reshape", flow, mha_shape);
   auto V = builder->Transpose(name + "/mha/V/transpose", flow, {0, 2, 1, 3});
   flow = builder->MatMul(name + "/mha/QK/matmul", Q, K);
