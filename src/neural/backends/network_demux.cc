@@ -76,30 +76,31 @@ class DemuxingChildBackend {
 
   AssignFuture Assign(const std::string& name,
                       const std::optional<WeightsFile>& weights,
-                      const OptionsDict& opts, std::atomic<bool>& abort,
-                      AssignPromise& promise) {
+                      const OptionsDict& opts, std::atomic<bool>& abort) {
     int numa_node = opts.GetOrDefault<int>("numa_node", -1);
+    AssignPromise promise;
     auto rv = promise.get_future();
-    threads_.emplace_back(
-        [this, name, &weights, opts, &promise, &abort, numa_node] {
+    threads_.emplace_back([this, name, &weights, opts,
+                           promise = std::move(promise), &abort,
+                           numa_node]() mutable {
+      if (numa_node >= 0) {
+        Numa::BindThreadToNode(numa_node);
+      }
+      ConstructBackend(name, weights, opts, promise);
+      int nn_threads = opts.GetOrDefault<int>("demux_threads", 0);
+      if (nn_threads == 0) {
+        nn_threads = network_->GetThreads() + !network_->IsCpu();
+      }
+      for (int i = 1; i < nn_threads; i++) {
+        threads_.emplace_back([&] {
           if (numa_node >= 0) {
             Numa::BindThreadToNode(numa_node);
           }
-          ConstructBackend(name, weights, opts, promise);
-          int nn_threads = opts.GetOrDefault<int>("demux_threads", 0);
-          if (nn_threads == 0) {
-            nn_threads = network_->GetThreads() + !network_->IsCpu();
-          }
-          for (int i = 1; i < nn_threads; i++) {
-            threads_.emplace_back([&] {
-              if (numa_node >= 0) {
-                Numa::BindThreadToNode(numa_node);
-              }
-              Worker(abort);
-            });
-          }
           Worker(abort);
         });
+      }
+      Worker(abort);
+    });
     return rv;
   }
 
@@ -153,22 +154,19 @@ class DemuxingBackend final : public Backend {
     UpdateConfiguration(options);
     const auto parents = backend_options.ListSubdicts();
     std::vector<DemuxingChildBackend::AssignFuture> capabilities;
-    std::vector<DemuxingChildBackend::AssignPromise> promises(std::max<size_t>(1, parents.size()));
-    capabilities.reserve(promises.size());
+    capabilities.reserve(std::max<size_t>(1, parents.size()));
     if (parents.empty()) {
       // If options are empty, or multiplexer configured in root object,
       // initialize on root object and default backend.
       auto backends = NetworkFactory::Get()->GetBackendsList();
-      capabilities.emplace_back(AddBackend(0, backends[0], weights,
-                                           backend_options, promises.front()));
+      capabilities.emplace_back(
+          AddBackend(0, backends[0], weights, backend_options));
     }
 
     int i = 0;
     for (const auto& name : parents) {
-      auto& p = promises[i];
-      capabilities.emplace_back(AddBackend(i++, name, weights,
-                                           backend_options.GetSubdict(name),
-                                           p));
+      capabilities.emplace_back(
+          AddBackend(i++, name, weights, backend_options.GetSubdict(name)));
     }
     i = 0;
     for (auto& future : capabilities) {
@@ -197,11 +195,10 @@ class DemuxingBackend final : public Backend {
 
   DemuxingChildBackend::AssignFuture AddBackend(
       int index, const std::string& name,
-      const std::optional<WeightsFile>& weights, const OptionsDict& opts,
-      DemuxingChildBackend::AssignPromise& promise) {
+      const std::optional<WeightsFile>& weights, const OptionsDict& opts) {
     const std::string backend = opts.GetOrDefault<std::string>("backend", name);
 
-    return backends_[index].Assign(backend, weights, opts, abort_, promise);
+    return backends_[index].Assign(backend, weights, opts, abort_);
   }
 
   std::unique_ptr<BackendComputation> CreateComputation() override;
