@@ -511,6 +511,44 @@ inline float ComputeCpuct(const SearchParams& params, uint32_t N,
   const float base = params.GetCpuctBase(is_root_node);
   return init + (k ? k * FastLog((N + base) / base) : 0.0f);
 }
+
+inline uint32_t EstimateForcedVisits(const SearchParams& params,
+                                     const Node* node, float draw_score,
+                                     MEvaluator m_evaluator) {
+  if (node->GetN() <= 1) return 0;
+
+  const float U_coeff =
+      ComputeCpuct(params, node->GetN(), /* is_root_node= */ true) *
+      std::sqrt(std::max(node->GetChildrenVisits(), 1u));
+  float best_S = 0.0f;
+  for (const auto& edge : node->Edges()) {
+    if (edge.GetN() == 0) {
+      break;
+    }
+
+    float Q = edge.GetQ(0.0f, draw_score);
+    float M = m_evaluator.GetMUtility(edge, Q);
+    float S = Q + edge.GetU(U_coeff) + M;
+    best_S = std::max(best_S, S);
+  }
+
+  float sum = 0.0f;
+  for (const auto& edge : node->Edges()) {
+    if (edge.GetN() == 0) {
+      break;
+    }
+
+    float Q = edge.GetQ(0.0f, draw_score);
+    float M = m_evaluator.GetMUtility(edge, Q);
+    float N = std::max(1.0f, edge.GetP() * U_coeff / (best_S - Q - M) - 1.0f);
+
+    assert(std::floor(N) <= edge.GetNStarted());
+
+    sum += std::max(0.0f, edge.GetNStarted() - N);
+  }
+  return sum;
+}
+
 }  // namespace
 
 // Ignore the last tuple element when sorting in GetVerboseStats
@@ -1188,7 +1226,14 @@ void Search::PopulateCommonIterationStats(IterationStats* stats) {
       nps_start_time_ = std::chrono::steady_clock::now();
     }
   }
-  stats->total_nodes = total_playouts_ + initial_visits_;
+  uint32_t forced_visits =
+      forced_exploration_visits_.empty()
+          ? 0
+          : EstimateForcedVisits(params_, root_node_, GetDrawScore(false),
+                                 backend_attributes_.has_mlh
+                                     ? MEvaluator(params_, root_node_)
+                                     : MEvaluator());
+  stats->total_nodes = total_playouts_ + initial_visits_ - forced_visits;
   stats->nodes_since_movestart = total_playouts_;
   stats->batches_since_movestart = total_batches_;
   stats->average_depth = cum_depth_ / (total_playouts_ ? total_playouts_ : 1);
