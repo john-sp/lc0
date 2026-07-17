@@ -31,6 +31,7 @@
 #include "search/register.h"
 #include "search/search.h"
 #include "neural/shared_params.h"
+#include "utils/numa.h"
 #include "utils/trace.h"
 
 namespace lczero {
@@ -60,7 +61,8 @@ const OptionId kHashId{{.long_flag = "hash",
 class DagClassicSearch : public SearchBase {
  public:
   DagClassicSearch(UciResponder* responder, const OptionsDict* options)
-      : SearchBase(responder), options_(options) {}
+      : SearchBase(responder), options_(options) {
+  }
   ~DagClassicSearch() { search_.reset(); }
 
  private:

@@ -42,6 +42,7 @@
 
 #include "search/dag_classic/node.h"
 #include "utils/fastmath.h"
+#include "utils/numa.h"
 #include "utils/random.h"
 #include "utils/spinhelper.h"
 #include "utils/trace.h"
@@ -651,6 +652,7 @@ void TaskQueue::DeactivateTasks() {
 }
 
 void TaskQueue::RunTasks(int tid) {
+  Numa::BindTaskWorkersToSocket();
   while (true) {
     int nta = 0;
     int tc = 0;
@@ -1496,6 +1498,7 @@ void Search::StartThreads(size_t how_many) {
       task_workers = std::min(std::thread::hardware_concurrency() - 1, 4U);
     }
   }
+  Numa::ReserveSearchWorkers(how_many);
   state_.StartANewSearch(task_workers, how_many);
   // Only one thread can do work until the root has been evaluated. Other
   // workers will wait until the first thread increases the thread_count_.
@@ -1507,12 +1510,16 @@ void Search::StartThreads(size_t how_many) {
   }
   // First thread is a watchdog thread.
   if (threads_.size() == 0) {
-    threads_.emplace_back([this]() { WatchdogThread(); });
+    threads_.emplace_back([this]() {
+      Numa::BindTaskWorkersToSocket();
+      WatchdogThread();
+    });
   }
   state_.worker_states_.resize(how_many);
   // Start working threads.
   for (size_t i = 0; i < how_many; i++) {
     threads_.emplace_back([this, i, task_workers]() {
+      Numa::BindThread(i);
       SearchWorker worker(i + task_workers, state_.worker_states_[i], this,
                           params_);
       worker.RunBlocking();
