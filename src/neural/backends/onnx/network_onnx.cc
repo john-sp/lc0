@@ -34,8 +34,11 @@
 #include <iterator>
 #include <list>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 #include "onnx_conf.h"
@@ -243,6 +246,18 @@ class OnnxNetwork final : public Network {
   cudaStream_t download_stream_ = nullptr;
   cudaEvent_t compute_ordering_event_ = nullptr;
 #endif
+
+  static std::deque<std::mutex>& GetSessionInitLocks(int sessions) {
+    static std::mutex resize_mutex;
+    std::lock_guard<std::mutex> lock(resize_mutex);
+    static std::deque<std::mutex> locks(sessions);
+
+    if (locks.size() < (size_t)sessions) {
+      locks.resize(sessions);
+    }
+
+    return locks;
+  }
 
  private:
   std::mutex inputs_outputs_lock_;
@@ -1114,34 +1129,54 @@ OnnxNetwork::OnnxNetwork(const WeightsFile& file, const OptionsDict& opts,
 
   int attempt = 0;
   std::filesystem::file_time_type start = std::chrono::file_clock::now();
-  for (int step = 1; step <= steps_; step++) {
-    int max_batch = batch_size_ > 0 ? batch_size_ * step : max_batch_size_;
-    int min_batch =
-        batch_size_ > 0 ? max_batch - batch_size_ + 1 : min_batch_size_;
-    COUT << "Building engine for step " << step << " with batch size "
-         << min_batch << "-" << max_batch << ".";
-    session_.emplace_back(
-        onnx_env_, file.onnx_model().model().data(),
-        file.onnx_model().model().size(),
-        GetOptions(threads, batch_size_ * step, hash, optimize));
-    attempt++;
+  auto& mutexes = GetSessionInitLocks(steps_);
 
-    if (provider == OnnxProvider::TRT && (fp16_ || bf16_)) {
-      if (!IsTRTEngineGood(start, batch_size_ * step, hash,
-                           file.onnx_model().model().size(), attempt,
-                           optimize)) {
-        if (attempt > 3) {
-          throw Exception("TensorRT failed to build a good engine after " +
-                          std::to_string(attempt) + " attempts.");
+  assert(mutexes.size() >= (size_t)steps_);
+
+  std::map<int, Ort::Session> sessions;
+  while (sessions.size() < (size_t)steps_) {
+    for (int step = 1; step <= steps_; step++) {
+      if (sessions.contains(step)) continue;
+      std::unique_lock<std::mutex> lock(mutexes[step - 1], std::defer_lock);
+      if (provider_ != OnnxProvider::CPU) {
+        if (!lock.try_lock()) {
+          continue;
         }
-        COUT << "WARNING: TensorRT build a bad engine! Deleted the bad engine "
-                "and retrying.";
-        session_.pop_back();
-        step--;
-        continue;
       }
+      int max_batch = batch_size_ > 0 ? batch_size_ * step : max_batch_size_;
+      int min_batch =
+          batch_size_ > 0 ? max_batch - batch_size_ + 1 : min_batch_size_;
+      COUT << "Building engine for step " << step << " with batch size "
+           << min_batch << "-" << max_batch << ".";
+      sessions.emplace(
+          std::piecewise_construct, std::forward_as_tuple(step),
+          std::forward_as_tuple(
+              onnx_env_, file.onnx_model().model().data(),
+              file.onnx_model().model().size(),
+              GetOptions(threads, batch_size_ * step, hash, optimize)));
+      attempt++;
+
+      if (provider == OnnxProvider::TRT && (fp16_ || bf16_)) {
+        if (!IsTRTEngineGood(start, batch_size_ * step, hash,
+                             file.onnx_model().model().size(), attempt,
+                             optimize)) {
+          if (attempt > 3) {
+            throw Exception("TensorRT failed to build a good engine after " +
+                            std::to_string(attempt) + " attempts.");
+          }
+          COUT
+              << "WARNING: TensorRT build a bad engine! Deleted the bad engine "
+                 "and retrying.";
+          sessions.erase(step);
+          step--;
+          continue;
+        }
+      }
+      attempt = 0;
     }
-    attempt = 0;
+  }
+  for (auto& session : sessions) {
+    session_.push_back(std::move(session.second));
   }
 #ifdef USE_ONNX_CUDART
   if ((provider == OnnxProvider::TRT || provider == OnnxProvider::CUDA) &&
