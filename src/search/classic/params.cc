@@ -551,6 +551,14 @@ const OptionId SearchParams::kForcedExplorationVisitsId{
          "can include noise. This aims to overcome a problem if the first "
          "visit to a child evaluates it incorrectly which would suppress "
          "further visits even when noised policy wants to explore it."}};
+const OptionId SearchParams::kForcedExplorationMaxPolicyId{
+    {.long_flag = "forced-exploration-max-policy",
+     .uci_option = "ForcedExplorationMaxPolicy",
+     .help_text =
+         "Force minimum visits at root based on policy which can include "
+         "noise. This parameter scales down higher policy children visits to "
+         "avoid over exploration when policy would force enough exploration in "
+         "a normal search."}};
 const OptionId SearchParams::kSingleChildForcedBoostId{
     {.long_flag = "single-child-forced-boost",
      .uci_option = "SingleChildForcedBoost",
@@ -682,6 +690,7 @@ void SearchParams::Populate(OptionsParser* options) {
   options->Add<IntOption>(kSolidTreeThresholdId, 1, 2000000000) = 100;
   options->Add<BoolOption>(kUsePolicyPostProcessingId) = true;
   options->Add<IntOption>(kForcedExplorationVisitsId, 0, 100000) = 0;
+  options->Add<FloatOption>(kForcedExplorationMaxPolicyId, 0.0f, 100.0f) = 7.0f;
   options->Add<FloatOption>(kSingleChildForcedBoostId, 0.0f, 100.0f) = 5.0f;
   options->Add<FloatOption>(kPolicyPostProcessingUtilityAlphaId, 0.00001f,
                             100.0f) = 0.42f;

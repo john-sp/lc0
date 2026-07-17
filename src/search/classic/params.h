@@ -307,6 +307,9 @@ class SearchParams : public BaseSearchParams {
   int GetForcedExplorationVisits() const {
     return options_.Get<int>(kForcedExplorationVisitsId);
   }
+  float GetForcedExplorationMaxPolicy() const {
+    return options_.Get<float>(kForcedExplorationMaxPolicyId) / 100.0f;
+  }
   float GetSingleChildForcedBoost() const {
     return options_.Get<float>(kSingleChildForcedBoostId) / 100.0f;
   }
@@ -324,6 +327,7 @@ class SearchParams : public BaseSearchParams {
   static const OptionId kMaxPrefetchBatchId;
   static const OptionId kSolidTreeThresholdId;
   static const OptionId kForcedExplorationVisitsId;
+  static const OptionId kForcedExplorationMaxPolicyId;
   static const OptionId kSingleChildForcedBoostId;
   static const OptionId kUsePolicyPostProcessingId;
   static const OptionId kPolicyPostProcessingUtilityAlphaId;

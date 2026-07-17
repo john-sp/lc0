@@ -228,6 +228,8 @@ std::vector<uint32_t> ComputeForcedVisits(Node* node,
     return {};
   }
   int forced_child = SelectChildForExtraForcedVisits(node, params);
+  float max_exploration_policy =
+      std::sqrt(params.GetForcedExplorationMaxPolicy());
   std::vector<float> forced_visits(node->GetNumEdges(), 0);
   float sum = 0.0f;
   std::generate(forced_visits.begin(), forced_visits.end(),
@@ -239,9 +241,15 @@ std::vector<uint32_t> ComputeForcedVisits(Node* node,
                   sum += share;
                   return share;
                 });
-  std::transform(forced_visits.begin(), forced_visits.end(),
+  std::transform(forced_visits.begin(), forced_visits.end(), node->Edges(),
                  forced_visits.begin(),
-                 [sum, visits](float v) { return visits * v / sum; });
+                 [sum, visits, max_exploration_policy](float v, auto edge) {
+                   float policy = std::sqrt(edge.GetP());
+                   float policy_adjust = policy > max_exploration_policy
+                                             ? max_exploration_policy / policy
+                                             : 1.0f;
+                   return policy_adjust * visits * v / sum;
+                 });
   return {forced_visits.begin(), forced_visits.end()};
 }
 
@@ -1244,7 +1252,8 @@ void Search::PopulateCommonIterationStats(IterationStats* stats) {
         max_n_has_max_q_plus_m = (max_n == n);
         max_q_plus_m = q_plus_m;
       }
-      if (max_s + s_threshold * max_n_has_best_s < s + s_threshold * (max_n == n)) {
+      if (max_s + s_threshold * max_n_has_best_s <
+          s + s_threshold * (max_n == n)) {
         max_n_has_best_s = (max_n == n);
         max_s = s;
       }
@@ -1554,10 +1563,11 @@ int AddForcedExploration(Node::Iterator& iter, size_t idx,
 
   assert(idx < visits.size());
   int minimum_visits = visits[idx];
-  if (iter.GetN() == 0) {
-    minimum_visits = std::min(minimum_visits, 1);
+  if (minimum_visits <= nstarted) {
+    return 0;
+  } else {
+    return 1;
   }
-  return std::max(0, minimum_visits - nstarted);
 }
 
 }  // namespace
@@ -1608,7 +1618,7 @@ void SearchWorker::GatherMinibatch() {
 
     int new_start = static_cast<int>(minibatch_.size());
 
-    PickNodesToExtend(
+    bool stop = PickNodesToExtend(
         std::min({collisions_left, target_minibatch_size_ - minibatch_size,
                   max_out_of_order_ - number_out_of_order_}));
 
@@ -1689,6 +1699,8 @@ void SearchWorker::GatherMinibatch() {
         }
       }
     }
+
+    if (stop) break;
 
     LCTRACE_FUNCTION_SCOPE;
     // Check for stop at the end so we have at least one node.
@@ -1779,7 +1791,7 @@ int SearchWorker::WaitForTasks() {
   }
 }
 
-void SearchWorker::PickNodesToExtend(int collision_limit) {
+bool SearchWorker::PickNodesToExtend(int collision_limit) {
   ResetTasks();
   if (task_workers_ > 0 && !search_->backend_attributes_.runs_on_cpu) {
     // While nothing is ready yet - wake the task runners so they are ready to
@@ -1792,8 +1804,9 @@ void SearchWorker::PickNodesToExtend(int collision_limit) {
   // Since the tasks perform work which assumes they have the lock, even though
   // actually this thread does.
   SharedMutex::Lock lock(search_->nodes_mutex_);
-  PickNodesToExtendTask(search_->root_node_, 0, collision_limit, empty_movelist,
-                        &minibatch_, &main_workspace_);
+  bool stop =
+      PickNodesToExtendTask(search_->root_node_, 0, collision_limit,
+                            empty_movelist, &minibatch_, &main_workspace_);
 
   WaitForTasks();
   for (int i = 0; i < static_cast<int>(picking_tasks_.size()); i++) {
@@ -1802,6 +1815,7 @@ void SearchWorker::PickNodesToExtend(int collision_limit) {
       minibatch_.emplace_back(std::move(picking_tasks_[i].results[j]));
     }
   }
+  return stop;
 }
 
 void SearchWorker::EnsureNodeTwoFoldCorrectForDepth(Node* child_node,
@@ -1845,7 +1859,7 @@ void SearchWorker::EnsureNodeTwoFoldCorrectForDepth(Node* child_node,
   }
 }
 
-void SearchWorker::PickNodesToExtendTask(
+bool SearchWorker::PickNodesToExtendTask(
     Node* node, int base_depth, int collision_limit,
     const std::vector<Move>& moves_to_base,
     std::vector<NodeToProcess>* receiver,
@@ -1893,6 +1907,7 @@ void SearchWorker::PickNodesToExtendTask(
   auto m_evaluator = moves_left_support_ ? MEvaluator(params_) : MEvaluator();
 
   int max_limit = std::numeric_limits<int>::max();
+  bool stop = false;
 
   current_path.push_back(-1);
   while (current_path.size() > 0) {
@@ -2049,30 +2064,21 @@ void SearchWorker::PickNodesToExtendTask(
               if (!has_forced_visits && new_visits > 0) {
                 has_forced_visits = true;
                 second_best_edge.Reset();
+                stop = true;
               }
 
               if (has_forced_visits) {
-                int nstarted = node->GetNInFlight() - cur_limit;
-                new_visits = std::min<int>(new_visits,
-                                           target_minibatch_size_ - nstarted);
+                int nstarted_root = node->GetNInFlight() - cur_limit;
+                new_visits = std::min<int>(
+                    new_visits, target_minibatch_size_ - nstarted_root);
                 if (idx + 1 == max_needed ||
-                    nstarted + new_visits == target_minibatch_size_) {
-                  // Stop node picking after forced visits has been distributed.
-                  if (new_visits != 0) {
-                    // We need to stup without normal visits because the last
-                    // child needs forced visits.
-                    node->CancelScoreUpdate(cur_limit);
-                    cur_limit = 0;
-                  } else {
-                    // Send remaining visits to the top policy move because the
-                    // last child doesn't need forced visits.
-                    int reimaining_visits = target_minibatch_size_ - nstarted;
-                    if (cur_limit > reimaining_visits) {
-                      node->CancelScoreUpdate(cur_limit - reimaining_visits);
-                      cur_limit = reimaining_visits;
-                    }
-                    best_idx = 0;
-                    best_edge = cur_iters[0];
+                    nstarted_root + new_visits == target_minibatch_size_) {
+                  // Stop node picking after forced visits has been distributed
+                  // for this batch.
+                  node->CancelScoreUpdate(cur_limit);
+                  cur_limit = 0;
+                  if (new_visits == 0) {
+                    break;
                   }
                 }
                 if (new_visits == 0) {
@@ -2108,6 +2114,9 @@ void SearchWorker::PickNodesToExtendTask(
             can_exit = true;
           }
         }
+        if (best_idx == -1) {
+          break;
+        }
         if (second_best_edge) {
           int estimated_visits_to_change_best = std::numeric_limits<int>::max();
           if (best_without_u < second_best) {
@@ -2131,7 +2140,7 @@ void SearchWorker::PickNodesToExtendTask(
                     vtp_array + best_idx + 1, 0);
         }
         (*visits_to_perform.back())[best_idx] += new_visits;
-        if (!has_forced_visits || cache_filled_idx + 1 == max_needed) {
+        if (!has_forced_visits) {
           cur_limit -= new_visits;
         }
         Node* child_node = best_edge.GetOrSpawnNode(/* parent */ node);
@@ -2167,6 +2176,9 @@ void SearchWorker::PickNodesToExtendTask(
           receiver->back().moves_to_visit = moves_to_path;
           receiver->back().moves_to_visit.push_back(best_edge.GetMove());
         }
+        assert(!has_forced_visits ||
+               static_cast<int>(child_node->GetNInFlight()) <=
+                   search_->thread_count_.load(std::memory_order_relaxed));
         if (best_idx > vtp_last_filled.back() &&
             (*visits_to_perform.back())[best_idx] > 0) {
           vtp_last_filled.back() = best_idx;
@@ -2242,6 +2254,7 @@ void SearchWorker::PickNodesToExtendTask(
       vtp_last_filled.pop_back();
     }
   }
+  return stop;
 }
 
 void SearchWorker::ExtendNode(Node* node, int depth,
