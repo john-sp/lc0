@@ -107,8 +107,8 @@ PjrtType XlaTypeToPjrtType(pblczero::XlaShapeProto::Type type) {
 }
 }  // namespace
 
-XlaRunner::XlaRunner(const char* library_path, int device)
-    : pjrt_client_(Pjrt(library_path).CreateClient()), device_(device) {
+XlaRunner::XlaRunner(const char* library_path, int device, const ArgT& options)
+    : pjrt_client_(Pjrt(library_path).CreateClient(options)), device_(device) {
   CERR << "Devices:";
   devices_ = pjrt_client_->GetDevices();
   for (const auto& device : devices_) {

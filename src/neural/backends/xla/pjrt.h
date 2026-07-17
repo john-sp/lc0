@@ -42,8 +42,11 @@ struct PJRT_DeviceDescription;
 struct PJRT_Error;
 struct PJRT_Event;
 struct PJRT_LoadedExecutable;
+struct PJRT_NamedValue;
 
 namespace lczero {
+
+using ArgT = std::vector<PJRT_NamedValue>;
 
 // PJRT_Error_Code as enum class. Coincidentally, the error codes are the same
 // as in absl Status module.
@@ -242,7 +245,7 @@ class Pjrt : protected PjrtCommon {
  public:
   Pjrt(const char* library_path);
   std::vector<PjrtKeyValue> GetAttributes() const;
-  std::unique_ptr<PjrtClient> CreateClient();
+  std::unique_ptr<PjrtClient> CreateClient(const ArgT& options);
   std::pair<int, int> ApiVersion() const;
 
  private:
