@@ -29,6 +29,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdlib>
+#include <future>
 #include <mutex>
 #include <queue>
 #include <thread>
@@ -37,6 +38,7 @@
 #include "neural/factory.h"
 #include "neural/shared_params.h"
 #include "utils/atomic_vector.h"
+#include "utils/numa.h"
 
 namespace lczero {
 namespace {
@@ -65,17 +67,51 @@ class DemuxingChildBackend;
 
 class DemuxingChildBackend {
  public:
+  using AssignFuture =
+      std::future<std::tuple<BackendAttributes, const NetworkCapabilities&>>;
+  using AssignPromise =
+      std::promise<std::tuple<BackendAttributes, const NetworkCapabilities&>>;
+
   ~DemuxingChildBackend();
 
-  void Assign(std::unique_ptr<Network>&& network, const OptionsDict& opts,
-              std::atomic<bool>& abort) {
-    network_ = std::move(network);
-    int nn_threads = opts.GetOrDefault<int>("threads", 0);
-    if (nn_threads == 0) {
-      nn_threads = network_->GetThreads() + !network_->IsCpu();
-    }
-    for (int i = 0; i < nn_threads; i++) {
-      threads_.emplace_back([&] { Worker(abort); });
+  AssignFuture Assign(const std::string& name,
+                      const std::optional<WeightsFile>& weights,
+                      const OptionsDict& opts, std::atomic<bool>& abort,
+                      AssignPromise& promise) {
+    int numa_node = opts.GetOrDefault<int>("numa_node", -1);
+    auto rv = promise.get_future();
+    threads_.emplace_back(
+        [this, name, &weights, opts, &promise, &abort, numa_node] {
+          if (numa_node >= 0) {
+            Numa::BindThreadToNode(numa_node);
+          }
+          ConstructBackend(name, weights, opts, promise);
+          int nn_threads = opts.GetOrDefault<int>("demux_threads", 0);
+          if (nn_threads == 0) {
+            nn_threads = network_->GetThreads() + !network_->IsCpu();
+          }
+          for (int i = 1; i < nn_threads; i++) {
+            threads_.emplace_back([&] {
+              if (numa_node >= 0) {
+                Numa::BindThreadToNode(numa_node);
+              }
+              Worker(abort);
+            });
+          }
+          Worker(abort);
+        });
+    return rv;
+  }
+
+  void ConstructBackend(const std::string& name,
+                        const std::optional<WeightsFile>& weights,
+                        const OptionsDict& opts, AssignPromise& promise) {
+    try {
+      network_ = NetworkFactory::Get()->Create(name, weights, opts);
+      promise.set_value(
+          {BackendAttributes(*network_), network_->GetCapabilities()});
+    } catch (...) {
+      promise.set_exception(std::current_exception());
     }
   }
 
@@ -116,16 +152,40 @@ class DemuxingBackend final : public Backend {
             options.Get<std::string>(SharedBackendParams::kWeightsId)) {
     UpdateConfiguration(options);
     const auto parents = backend_options.ListSubdicts();
+    std::vector<DemuxingChildBackend::AssignFuture> capabilities;
+    std::vector<DemuxingChildBackend::AssignPromise> promises(std::max<size_t>(1, parents.size()));
+    capabilities.reserve(promises.size());
     if (parents.empty()) {
       // If options are empty, or multiplexer configured in root object,
       // initialize on root object and default backend.
       auto backends = NetworkFactory::Get()->GetBackendsList();
-      AddBackend(0, backends[0], weights, backend_options);
+      capabilities.emplace_back(AddBackend(0, backends[0], weights,
+                                           backend_options, promises.front()));
     }
 
     int i = 0;
     for (const auto& name : parents) {
-      AddBackend(i++, name, weights, backend_options.GetSubdict(name));
+      auto& p = promises[i];
+      capabilities.emplace_back(AddBackend(i++, name, weights,
+                                           backend_options.GetSubdict(name),
+                                           p));
+    }
+    i = 0;
+    for (auto& future : capabilities) {
+      assert(future.valid());
+      auto [attr, caps] = future.get();
+      if (i == 0) {
+        i = 1;
+        attrs_ = attr;
+        input_format_ = caps.input_format;
+      } else {
+        attrs_ += attr;
+        if (input_format_ != caps.input_format) {
+          throw Exception("Incompatible input formats, " +
+                          std::to_string(input_format_) + " vs " +
+                          std::to_string(caps.input_format));
+        }
+      }
     }
     attrs_.maximum_batch_size =
         std::max(attrs_.recommended_batch_size, attrs_.maximum_batch_size);
@@ -135,26 +195,13 @@ class DemuxingBackend final : public Backend {
         std::min(attrs_.maximum_batch_size, attrs_.recommended_batch_size);
   }
 
-  void AddBackend(int index, const std::string& name,
-                  const std::optional<WeightsFile>& weights,
-                  const OptionsDict& opts) {
+  DemuxingChildBackend::AssignFuture AddBackend(
+      int index, const std::string& name,
+      const std::optional<WeightsFile>& weights, const OptionsDict& opts,
+      DemuxingChildBackend::AssignPromise& promise) {
     const std::string backend = opts.GetOrDefault<std::string>("backend", name);
 
-    auto network = NetworkFactory::Get()->Create(backend, weights, opts);
-    const NetworkCapabilities& caps = network->GetCapabilities();
-
-    if (index == 0) {
-      attrs_ = BackendAttributes(*network);
-      input_format_ = caps.input_format;
-    } else {
-      attrs_ += BackendAttributes(*network);
-      if (input_format_ != caps.input_format) {
-        throw Exception("Incompatible input formats, " +
-                        std::to_string(input_format_) + " vs " +
-                        std::to_string(caps.input_format));
-      }
-    }
-    backends_[index].Assign(std::move(network), opts, abort_);
+    return backends_[index].Assign(backend, weights, opts, abort_, promise);
   }
 
   std::unique_ptr<BackendComputation> CreateComputation() override;
@@ -219,8 +266,7 @@ class DemuxingComputation final : public BackendComputation {
  public:
   DemuxingComputation(DemuxingBackend* backend)
       : backend_(backend), entries_(backend_->attrs_.maximum_batch_size) {}
-  ~DemuxingComputation() {
-  }
+  ~DemuxingComputation() {}
 
   AddInputResult AddInput(const EvalPosition& pos,
                           EvalResultPtr result) override {
@@ -247,9 +293,7 @@ class DemuxingComputation final : public BackendComputation {
     first_done_cv_.notify_one();
   }
 
-  void NotifyComplete() {
-    dataready_.fetch_sub(1, std::memory_order_release);
-  }
+  void NotifyComplete() { dataready_.fetch_sub(1, std::memory_order_release); }
 
   void ProcessResults(const DemuxingWork& work);
 

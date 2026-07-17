@@ -49,6 +49,8 @@ class Numa {
 
   // Bind task workers to a socket.
   static void BindTaskWorkersToSocket();
+
+  static void BindThreadToNode(int node_id);
 };
 
 }  // namespace lczero

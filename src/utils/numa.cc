@@ -315,6 +315,14 @@ struct Config {
         hwloc_set_cpubind(topology_, modified_set, HWLOC_CPUBIND_THREAD));
   }
 
+  void SetMembind(const CpuSet& cpuset) {
+    assert(topology_);
+    assert(cpuset);
+    ReportHWLocError(
+        hwloc_set_membind(topology_, cpuset, HWLOC_MEMBIND_BIND,
+                          HWLOC_MEMBIND_THREAD));
+  }
+
   void GetAffinity(CpuSet& cpuset) {
     assert(topology_);
     ReportHWLocError(
@@ -705,4 +713,19 @@ void Numa::BindTaskWorkersToSocket() {
   config->SetAffinity(cpuset);
 #endif
 }
+
+void Numa::BindThreadToNode(int node_id) {
+#if HAVE_LIBHWLOC
+  auto config = Config::Lock();
+  CpuSet cpuset;
+  if (node_id < 0 || (size_t)node_id >= config->GetNodeCount()) {
+    throw Exception("Invalid NUMA node id: " + std::to_string(node_id) +
+                    ". Valid range is 0 to " +
+                    std::to_string(config->GetNodeCount() - 1));
+  }
+  config->GetNumaSet(node_id, cpuset);
+  config->SetAffinity(cpuset);
+  config->SetMembind(cpuset);
+}
+#endif
 }  // namespace lczero
