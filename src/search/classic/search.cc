@@ -1240,7 +1240,6 @@ void Search::PopulateCommonIterationStats(IterationStats* stats) {
   stats->edge_n.clear();
   stats->win_found = false;
   stats->may_resign = true;
-  stats->best_move_has_best_s = false;
   stats->num_losing_edges = 0;
   stats->time_usage_hint_ = IterationStats::TimeUsageHint::kNormal;
   stats->mate_depth = std::numeric_limits<int>::max();
@@ -1251,21 +1250,15 @@ void Search::PopulateCommonIterationStats(IterationStats* stats) {
     const float fpu =
         GetFpu(params_, root_node_, /* is_root_node */ true, draw_score);
     float max_q_plus_m = -1000;
-    float max_s = -1000;
     uint64_t max_n = 0;
-    float s_threshold = 1e-2f;
-    bool max_n_has_max_q_plus_m = true, max_n_has_best_s = true;
+    bool max_n_has_max_q_plus_m = true;
     const auto m_evaluator = backend_attributes_.has_mlh
                                  ? MEvaluator(params_, root_node_)
                                  : MEvaluator();
-    const auto U_coeff =
-        ComputeCpuct(params_, root_node_->GetN(), /* is_root_node= */ true) *
-        std::sqrt(std::max(root_node_->GetChildrenVisits(), 1u));
     for (const auto& edge : root_node_->Edges()) {
       const auto n = edge.GetN();
       const auto q = edge.GetQ(fpu, draw_score);
       const auto m = m_evaluator.GetMUtility(edge, q);
-      const auto s = q + m + edge.GetU(U_coeff);
       const auto q_plus_m = q + m;
       stats->edge_n.push_back(n);
       if (n > 0 && edge.IsTerminal() && edge.GetWL(0.0f) > 0.0f) {
@@ -1290,20 +1283,12 @@ void Search::PopulateCommonIterationStats(IterationStats* stats) {
       if (max_n < n) {
         max_n = n;
         max_n_has_max_q_plus_m = false;
-        max_n_has_best_s = false;
-        s_threshold = std::max(max_n > 0 ? 4.0f / max_n : 4.0f, 1e-2f);
       }
       if (max_q_plus_m <= q_plus_m) {
         max_n_has_max_q_plus_m = (max_n == n);
         max_q_plus_m = q_plus_m;
       }
-      if (max_s + s_threshold * max_n_has_best_s <
-          s + s_threshold * (max_n == n)) {
-        max_n_has_best_s = (max_n == n);
-        max_s = s;
-      }
     }
-    stats->best_move_has_best_s = max_n_has_best_s;
     if (!max_n_has_max_q_plus_m) {
       stats->time_usage_hint_ = IterationStats::TimeUsageHint::kNeedMoreTime;
     }

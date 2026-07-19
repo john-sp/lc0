@@ -65,11 +65,6 @@ const OptionId kOpeningStopProbId{
     "opening-stop-prob", "OpeningStopProb",
     "From each opening move, start a self-play game with probability max(p, "
     "1/n), where p is the value given and n the opening moves remaining."};
-const OptionId kStopperRequiresValueMatchVisitsId{
-    {.long_flag = "stopper-requires-value-match-visits",
-     .uci_option = "StopperRequiresValueMatchVisits",
-     .help_text =
-         "Require the most visited move to have the best selection score."}};
 }  // namespace
 
 void SelfPlayGame::PopulateUciParams(OptionsParser* options) {
@@ -82,7 +77,6 @@ void SelfPlayGame::PopulateUciParams(OptionsParser* options) {
   PopulateTimeManagementOptions(classic::RunType::kSelfplay, options);
   options->Add<StringOption>(kSyzygyTablebaseId);
   options->Add<FloatOption>(kOpeningStopProbId, 0.0f, 1.0f) = 0.0f;
-  options->Add<BoolOption>(kStopperRequiresValueMatchVisitsId) = false;
 }
 
 SelfPlayGame::SelfPlayGame(PlayerOptions white, PlayerOptions black,
@@ -167,10 +161,7 @@ void SelfPlayGame::Play(int white_threads, int black_threads, bool training,
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (abort_) break;
-      bool value_match_visits = options_[idx].uci_options->Get<bool>(
-          kStopperRequiresValueMatchVisitsId);
-      auto stoppers =
-          options_[idx].search_limits.MakeSearchStopper(value_match_visits);
+      auto stoppers = options_[idx].search_limits.MakeSearchStopper();
       classic::PopulateIntrinsicStoppers(stoppers.get(),
                                          *options_[idx].uci_options);
 
@@ -363,9 +354,8 @@ void SelfPlayGame::WriteTrainingData(TrainingDataWriter* writer) const {
 }
 
 std::unique_ptr<classic::ChainedSearchStopper>
-SelfPlayLimits::MakeSearchStopper(bool value_match_visits) const {
-  auto result =
-      std::make_unique<classic::ChainedSearchStopper>(value_match_visits);
+SelfPlayLimits::MakeSearchStopper() const {
+  auto result = std::make_unique<classic::ChainedSearchStopper>();
 
   // always set VisitsStopper to avoid exceeding the limit 4000000000, the
   // default value when visits = 0
