@@ -521,7 +521,8 @@ inline int64_t EstimateForcedVisits(const SearchParams& params,
   const float U_coeff =
       ComputeCpuct(params, node->GetN(), /* is_root_node= */ true) *
       std::sqrt(std::max(node->GetChildrenVisits(), 1u));
-  float best_S = -1.0f - params.GetMovesLeftMaxEffect();
+  float best_QM = -1.0f - params.GetMovesLeftMaxEffect();
+  EdgeAndNode best_edge;
   for (const auto& edge : node->Edges()) {
     if (edge.GetN() == 0) {
       break;
@@ -529,10 +530,21 @@ inline int64_t EstimateForcedVisits(const SearchParams& params,
 
     float Q = edge.GetQ(0.0f, draw_score);
     float M = m_evaluator.GetMUtility(edge, Q);
-    float U = std::max(edge.GetU(U_coeff), 1e-4f);
-    float S = Q + M + U;
-    best_S = std::max(best_S, S);
+    if (Q + M > best_QM) {
+      best_QM = Q + M;
+      best_edge = edge;
+    }
   }
+
+  if (best_edge.IsTerminal()) {
+    // TODO: Implement an approximation how much extra visits the terminal
+    // should have been given.
+    return 0;
+  }
+
+  assert(best_edge.GetP() > 0.0f);
+
+  float best_S = best_QM + best_edge.GetU(U_coeff);
 
   float sum = 0.0f;
   Edge* iter = root_policy.get();
