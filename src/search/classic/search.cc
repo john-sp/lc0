@@ -224,7 +224,7 @@ int SelectChildForExtraForcedVisits(Node* node, const SearchParams& params) {
 std::vector<uint32_t> ComputeForcedVisits(Node* node,
                                           const SearchParams& params) {
   const float visits = params.GetForcedExplorationVisits();
-  if (visits <= 0) {
+  if (visits <= 0 || node->GetNumEdges() <= 1) {
     return {};
   }
   int forced_child = SelectChildForExtraForcedVisits(node, params);
