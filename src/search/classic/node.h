@@ -190,6 +190,11 @@ class Node {
     }
   }
 
+  void CopyPolicy(Edge* dst) const {
+    if (!edges_) return;
+    std::copy(edges_.get(), edges_.get() + num_edges_, dst);
+  }
+
   // Makes the node terminal and sets it's score.
   void MakeTerminal(GameResult result, float plies_left = 0.0f,
                     Terminal type = Terminal::EndOfGame);

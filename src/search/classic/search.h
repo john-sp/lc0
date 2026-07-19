@@ -142,6 +142,8 @@ class Search {
 
   PositionHistory GetPositionHistoryAtNode(const Node* node) const;
 
+  void StoreOriginalPolicy(const Node* node, std::unique_ptr<Edge []>& dst);
+
   mutable Mutex counters_mutex_ ACQUIRED_AFTER(nodes_mutex_);
   // Tells all threads to stop.
   std::atomic<bool> stop_{false};
@@ -180,6 +182,7 @@ class Search {
   std::atomic<int> tb_hits_{0};
   const MoveList root_move_filter_;
   std::vector<uint32_t> forced_exploration_visits_;
+  std::unique_ptr<Edge []> noised_policy_;
 
   mutable SharedMutex nodes_mutex_;
   EdgeAndNode current_best_edge_ GUARDED_BY(nodes_mutex_);

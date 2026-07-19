@@ -512,15 +512,16 @@ inline float ComputeCpuct(const SearchParams& params, uint32_t N,
   return init + (k ? k * FastLog((N + base) / base) : 0.0f);
 }
 
-inline uint32_t EstimateForcedVisits(const SearchParams& params,
-                                     const Node* node, float draw_score,
-                                     MEvaluator m_evaluator) {
+inline int64_t EstimateForcedVisits(const SearchParams& params,
+                                     const Node* node,
+                                     std::unique_ptr<Edge[]>& root_policy,
+                                     float draw_score, MEvaluator m_evaluator) {
   if (node->GetN() <= 1) return 0;
 
   const float U_coeff =
       ComputeCpuct(params, node->GetN(), /* is_root_node= */ true) *
       std::sqrt(std::max(node->GetChildrenVisits(), 1u));
-  float best_S = 0.0f;
+  float best_S = -1.0f - params.GetMovesLeftMaxEffect();
   for (const auto& edge : node->Edges()) {
     if (edge.GetN() == 0) {
       break;
@@ -528,23 +529,24 @@ inline uint32_t EstimateForcedVisits(const SearchParams& params,
 
     float Q = edge.GetQ(0.0f, draw_score);
     float M = m_evaluator.GetMUtility(edge, Q);
-    float S = Q + edge.GetU(U_coeff) + M;
+    float U = std::max(edge.GetU(U_coeff), 1e-4f);
+    float S = Q + M + U;
     best_S = std::max(best_S, S);
   }
 
   float sum = 0.0f;
+  Edge* iter = root_policy.get();
   for (const auto& edge : node->Edges()) {
+    auto orig_edge = *iter++;
     if (edge.GetN() == 0) {
       break;
     }
 
     float Q = edge.GetQ(0.0f, draw_score);
     float M = m_evaluator.GetMUtility(edge, Q);
-    float N = std::max(1.0f, edge.GetP() * U_coeff / (best_S - Q - M) - 1.0f);
+    float N = std::max(1.0f, orig_edge.GetP() * U_coeff / (best_S - Q - M) - 1.0f);
 
-    assert(std::floor(N) <= edge.GetNStarted());
-
-    sum += std::max(0.0f, edge.GetNStarted() - N);
+    sum += edge.GetNStarted() - N;
   }
   return sum;
 }
@@ -1226,13 +1228,13 @@ void Search::PopulateCommonIterationStats(IterationStats* stats) {
       nps_start_time_ = std::chrono::steady_clock::now();
     }
   }
-  uint32_t forced_visits =
+  int64_t forced_visits =
       forced_exploration_visits_.empty()
           ? 0
-          : EstimateForcedVisits(params_, root_node_, GetDrawScore(false),
-                                 backend_attributes_.has_mlh
-                                     ? MEvaluator(params_, root_node_)
-                                     : MEvaluator());
+          : EstimateForcedVisits(
+                params_, root_node_, noised_policy_, GetDrawScore(false),
+                backend_attributes_.has_mlh ? MEvaluator(params_, root_node_)
+                                            : MEvaluator());
   stats->total_nodes = total_playouts_ + initial_visits_ - forced_visits;
   stats->nodes_since_movestart = total_playouts_;
   stats->batches_since_movestart = total_batches_;
@@ -2525,6 +2527,17 @@ void SearchWorker::FetchMinibatchResults() {
   }
 }
 
+void Search::StoreOriginalPolicy(const Node* node,
+                                 std::unique_ptr<Edge[]>& dst) {
+  if (node != root_node_) return;
+
+  assert(!dst);
+
+  dst = std::make_unique<Edge[]>(node->GetNumEdges());
+
+  node->CopyPolicy(dst.get());
+}
+
 void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process) {
   if (node_to_process->IsCollision()) return;
   Node* node = node_to_process->node;
@@ -2563,6 +2576,9 @@ void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process) {
   node->SortEdges();
   if (node == search_->root_node_) {
     search_->forced_exploration_visits_ = ComputeForcedVisits(node, params_);
+    if (!search_->forced_exploration_visits_.empty()) {
+      search_->StoreOriginalPolicy(node, search_->noised_policy_);
+    }
   }
 }
 
