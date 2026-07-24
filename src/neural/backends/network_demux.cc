@@ -39,6 +39,7 @@
 #include "neural/shared_params.h"
 #include "utils/atomic_vector.h"
 #include "utils/numa.h"
+#include "utils/trace.h"
 
 namespace lczero {
 namespace {
@@ -383,6 +384,7 @@ void DemuxingChildBackend::Worker(std::atomic<bool>& abort) {
       }
     }
     if (work) {
+      LCTRACE_FUNCTION_SCOPE;
       work->computation_ = network_->NewComputation();
       auto& entries = work->source_->entries_;
       for (int i = work->start_; i < work->end_; i++) {
@@ -401,6 +403,7 @@ void DemuxingChildBackend::Worker(std::atomic<bool>& abort) {
 }
 
 void DemuxingComputation::ComputeBlocking(ComputationCallback callback) {
+  LCTRACE_FUNCTION_SCOPE;
   assert(UsedBatchSize() != 0);
   callback_ = callback;
   // Calculate batch_step_ size split count.
