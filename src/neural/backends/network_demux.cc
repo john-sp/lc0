@@ -31,6 +31,7 @@
 #include <cstdlib>
 #include <future>
 #include <mutex>
+#include <new>
 #include <queue>
 #include <thread>
 
