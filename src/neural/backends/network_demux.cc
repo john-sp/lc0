@@ -45,7 +45,11 @@
 namespace lczero {
 namespace {
 
+#if __cpp_lib_hardware_interference_size >= 201703L
 constexpr size_t kCacheLineSize = std::hardware_destructive_interference_size;
+#else
+constexpr size_t kCacheLineSize = 64;
+#endif
 
 class DemuxingComputation;
 
