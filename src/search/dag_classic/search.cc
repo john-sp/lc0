@@ -1706,7 +1706,7 @@ void SearchWorkerCachedState::StartANewSearch(const SearchParams& params,
                                               size_t target_minibatch_size,
                                               size_t max_out_of_order) {
   if (minibatch_.capacity() < target_minibatch_size) {
-    decltype(minibatch_) minibatch(target_minibatch_size);
+    decltype(minibatch_) minibatch(target_minibatch_size + max_out_of_order);
     minibatch_ = std::move(minibatch);
   }
 
