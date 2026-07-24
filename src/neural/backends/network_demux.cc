@@ -211,6 +211,9 @@ class DemuxingBackend final : public Backend {
                           std::to_string(caps.input_format));
         }
       }
+      if (attr.runs_on_cpu) {
+        uses_cpu_backend_ = true;
+      }
     }
     attrs_.maximum_batch_size =
         std::max(attrs_.recommended_batch_size, attrs_.maximum_batch_size);
@@ -269,6 +272,7 @@ class DemuxingBackend final : public Backend {
   pblczero::NetworkFormat::InputFormat input_format_;
   float softmax_policy_temperature_;
   FillEmptyHistory fill_empty_history_;
+  bool uses_cpu_backend_ = false;
   std::atomic<int64_t> start_index_ = 0;
   std::atomic<bool> abort_ = false;
 
@@ -314,13 +318,15 @@ class DemuxingComputation final : public BackendComputation {
 
   void NotifyFirstDone() {
     callback_(ComputationEvent::FIRST_BACKEND_IDLE);
-    {
-      std::lock_guard lock(mutex_);
-    }
-    first_done_cv_.notify_one();
+    first_done_.notify_one();
   }
 
-  void NotifyComplete() { dataready_.fetch_sub(1, std::memory_order_release); }
+  void NotifyComplete() { int outstanding = dataready_.fetch_sub(1, std::memory_order_release);
+    if (backend_->uses_cpu_backend_ && outstanding == 1) {
+      last_done_.store(1, std::memory_order_release);
+      last_done_.notify_one();
+    }
+  }
 
   void ProcessResults(const DemuxingWork& work);
 
@@ -330,10 +336,9 @@ class DemuxingComputation final : public BackendComputation {
   std::vector<DemuxingWork> children_;
   ComputationCallback callback_;
 
-  std::mutex mutex_;
-  std::condition_variable first_done_cv_;
-  std::atomic<int> dataready_ = 0;
-  std::atomic<bool> first_done_ = false;
+  alignas(kCacheLineSize) std::atomic<int> dataready_ = 0;
+  alignas(kCacheLineSize) std::atomic<int> first_done_ = 0;
+  alignas(kCacheLineSize) std::atomic<int> last_done_ = 0;
 
   friend class DemuxingChildBackend;
 };
@@ -384,9 +389,9 @@ void DemuxingChildBackend::Worker(std::atomic<bool>& abort) {
         work->computation_->AddInput(std::move(entries[i].input));
       }
       work->computation_->ComputeBlocking();
-      bool expected = false;
+      int expected = 0;
       if (work->source_->first_done_.compare_exchange_strong(
-              expected, true, std::memory_order_relaxed)) {
+              expected, 1, std::memory_order_relaxed)) {
         work->source_->NotifyFirstDone();
       }
       work->ProcessResults();
@@ -450,14 +455,14 @@ void DemuxingComputation::ComputeBlocking(ComputationCallback callback) {
   assert(work_start == UsedBatchSize());
   assert(work_items == (int)children_.size());
   // Wait until all backends complete their work.
-  {
-    std::unique_lock<std::mutex> lock(mutex_);
-    first_done_cv_.wait(
-        lock, [this]() { return first_done_.load(std::memory_order_acquire); });
-  }
-  // Use spinloop to reduce wake-up latency.
-  while (dataready_.load(std::memory_order_acquire) != 0) {
-    SpinloopPause();
+  if (!backend_->uses_cpu_backend_) {
+    first_done_.wait(false, std::memory_order_acquire);
+    // Use spinloop to reduce wake-up latency.
+    while (dataready_.load(std::memory_order_acquire) != 0) {
+      SpinloopPause();
+    }
+  } else {
+    last_done_.wait(0, std::memory_order_acquire);
   }
 }
 
