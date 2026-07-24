@@ -493,7 +493,5 @@ class DemuxingBackendFactory : public BackendFactory {
 BackendManager::Register register_demux(
     std::make_unique<DemuxingBackendFactory>());
 
-// REGISTER_BACKEND("demux", MakeDemuxingNetwork, -1001)
-
 }  // namespace
 }  // namespace lczero
