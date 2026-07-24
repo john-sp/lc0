@@ -726,6 +726,6 @@ void Numa::BindThreadToNode(int node_id) {
   config->GetNumaSet(node_id, cpuset);
   config->SetAffinity(cpuset);
   config->SetMembind(cpuset);
-}
 #endif
+}
 }  // namespace lczero
