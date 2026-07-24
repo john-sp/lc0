@@ -43,6 +43,8 @@
 namespace lczero {
 namespace {
 
+constexpr size_t kCacheLineSize = std::hardware_destructive_interference_size;
+
 class DemuxingComputation;
 
 struct DemuxingWork {
@@ -67,53 +69,73 @@ class DemuxingChildBackend;
 
 class DemuxingChildBackend {
  public:
-  using AssignFuture =
-      std::future<std::tuple<BackendAttributes, const NetworkCapabilities&>>;
-  using AssignPromise =
-      std::promise<std::tuple<BackendAttributes, const NetworkCapabilities&>>;
+  using AssingType = std::tuple<BackendAttributes, const NetworkCapabilities&>;
+  using AssignFuture = std::future<AssingType>;
+  using AssignPromise = std::promise<AssingType>;
 
   ~DemuxingChildBackend();
 
   AssignFuture Assign(const std::string& name,
                       const std::optional<WeightsFile>& weights,
-                      const OptionsDict& opts, std::atomic<bool>& abort) {
+                      const OptionsDict& opts, std::atomic<bool>& abort,
+                      size_t shared_count, size_t shared_stride) {
     int numa_node = opts.GetOrDefault<int>("numa_node", -1);
     AssignPromise promise;
     auto rv = promise.get_future();
     threads_.emplace_back([this, name, &weights, opts,
-                           promise = std::move(promise), &abort,
-                           numa_node]() mutable {
-      if (numa_node >= 0) {
-        Numa::BindThreadToNode(numa_node);
-      }
-      ConstructBackend(name, weights, opts, promise);
-      int nn_threads = opts.GetOrDefault<int>("demux_threads", 0);
-      if (nn_threads == 0) {
-        nn_threads = network_->GetThreads() + !network_->IsCpu();
-      }
-      for (int i = 1; i < nn_threads; i++) {
-        threads_.emplace_back([&] {
-          if (numa_node >= 0) {
-            Numa::BindThreadToNode(numa_node);
+                           promise = std::move(promise), &abort, numa_node,
+                           shared_count, shared_stride]() mutable {
+      try {
+        if (numa_node >= 0) {
+          Numa::BindThreadToNode(numa_node);
+        }
+        AssingType result =
+            shared_count > 0 ? ConstructBackend(name, weights, opts)
+                             : UseSharedBackend(this[-shared_stride].network_);
+        std::vector<AssignFuture> other_backends;
+        if (shared_count > 1) {
+          other_backends.reserve(shared_count - 1);
+          for (size_t i = 1; i < shared_count; i++) {
+            other_backends.emplace_back(this[shared_stride * i].Assign(
+                name, weights, opts, abort, 0, shared_stride * i));
           }
-          Worker(abort);
-        });
+        }
+        int nn_threads = opts.GetOrDefault<int>("demux_threads", 0);
+        if (nn_threads == 0) {
+          nn_threads = network_->GetThreads() + !network_->IsCpu();
+        }
+        for (int i = 1; i < nn_threads; i++) {
+          threads_.emplace_back([&] {
+            if (numa_node >= 0) {
+              Numa::BindThreadToNode(numa_node);
+            }
+            Worker(abort);
+          });
+        }
+        for (auto& f : other_backends) {
+          // Wait for the other shared backends and check for exceptions.
+          f.get();
+        }
+        promise.set_value(std::move(result));
+      } catch (...) {
+        promise.set_exception(std::current_exception());
+        return;
       }
       Worker(abort);
     });
     return rv;
   }
 
-  void ConstructBackend(const std::string& name,
-                        const std::optional<WeightsFile>& weights,
-                        const OptionsDict& opts, AssignPromise& promise) {
-    try {
-      network_ = NetworkFactory::Get()->Create(name, weights, opts);
-      promise.set_value(
-          {BackendAttributes(*network_), network_->GetCapabilities()});
-    } catch (...) {
-      promise.set_exception(std::current_exception());
-    }
+  AssingType UseSharedBackend(std::shared_ptr<Network> shared) {
+    network_ = shared;
+    return {BackendAttributes(*network_), network_->GetCapabilities()};
+  }
+
+  AssingType ConstructBackend(const std::string& name,
+                              const std::optional<WeightsFile>& weights,
+                              const OptionsDict& opts) {
+    network_ = NetworkFactory::Get()->Create(name, weights, opts);
+    return {BackendAttributes(*network_), network_->GetCapabilities()};
   }
 
   void Enqueue(DemuxingWork* work) {
@@ -137,7 +159,7 @@ class DemuxingChildBackend {
   std::mutex mutex_;
   std::condition_variable dataready_cv_;
   std::vector<std::thread> threads_;
-  std::unique_ptr<Network> network_;
+  std::shared_ptr<Network> network_;
   std::queue<DemuxingWork*> queue_;
 };
 
@@ -146,11 +168,15 @@ class DemuxingBackend final : public Backend {
   DemuxingBackend(const std::optional<WeightsFile>& weights,
                   const OptionsDict& options,
                   const OptionsDict& backend_options)
-      : backends_(std::max(size_t(1), backend_options.ListSubdicts().size())),
+      : backends_(std::max(size_t(1), backend_options.ListSubdicts().size() *
+                                          backend_options.GetOrDefault<int>(
+                                              "shared_backend_threads", 1))),
         backend_opts_(
             options.Get<std::string>(SharedBackendParams::kBackendOptionsId)),
         weights_path_(
             options.Get<std::string>(SharedBackendParams::kWeightsId)) {
+    int shared_threads =
+        backend_options.GetOrDefault<int>("shared_backend_threads", 1);
     UpdateConfiguration(options);
     const auto parents = backend_options.ListSubdicts();
     std::vector<DemuxingChildBackend::AssignFuture> capabilities;
@@ -160,13 +186,14 @@ class DemuxingBackend final : public Backend {
       // initialize on root object and default backend.
       auto backends = NetworkFactory::Get()->GetBackendsList();
       capabilities.emplace_back(
-          AddBackend(0, backends[0], weights, backend_options));
+          AddBackend(0, backends[0], weights, backend_options, shared_threads));
     }
 
     int i = 0;
     for (const auto& name : parents) {
-      capabilities.emplace_back(
-          AddBackend(i++, name, weights, backend_options.GetSubdict(name)));
+      capabilities.emplace_back(AddBackend(i++, name, weights,
+                                           backend_options.GetSubdict(name),
+                                           shared_threads));
     }
     i = 0;
     for (auto& future : capabilities) {
@@ -195,10 +222,13 @@ class DemuxingBackend final : public Backend {
 
   DemuxingChildBackend::AssignFuture AddBackend(
       int index, const std::string& name,
-      const std::optional<WeightsFile>& weights, const OptionsDict& opts) {
+      const std::optional<WeightsFile>& weights, const OptionsDict& opts,
+      int shared_threads) {
     const std::string backend = opts.GetOrDefault<std::string>("backend", name);
 
-    return backends_[index].Assign(backend, weights, opts, abort_);
+    return backends_[index].Assign(backend, weights, opts, abort_,
+                                   shared_threads,
+                                   backends_.size() / shared_threads);
   }
 
   std::unique_ptr<BackendComputation> CreateComputation() override;
