@@ -645,7 +645,7 @@ struct Config {
 }  // namespace
 
 void Numa::Init(OptionsParser* parser) {
-  parser->Add<BoolOption>(kUseThreadAfinityOptionId) = true;
+  parser->Add<BoolOption>(kUseThreadAfinityOptionId) = false;
   parser->Add<BoolOption>(kUseAllCoresOptionId) = false;
   parser->Add<BoolOption>(kShuffleCoreReservationOptionId) = true;
   parser->Add<IntOption>(kSearchNodeOptionId, 0, 512) = 0;
