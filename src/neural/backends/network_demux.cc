@@ -279,8 +279,9 @@ class DemuxingBackend final : public Backend {
   float softmax_policy_temperature_;
   FillEmptyHistory fill_empty_history_;
   bool uses_cpu_backend_ = false;
-  std::atomic<int64_t> start_index_ = 0;
-  std::atomic<bool> abort_ = false;
+
+  alignas(kCacheLineSize) std::atomic<int64_t> start_index_ = 0;
+  alignas(kCacheLineSize) std::atomic<bool> abort_ = false;
 
   // Cache cold variables
   const std::string backend_opts_;
