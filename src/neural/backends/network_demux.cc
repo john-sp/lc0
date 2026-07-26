@@ -328,7 +328,8 @@ class DemuxingComputation final : public BackendComputation {
     first_done_.notify_one();
   }
 
-  void NotifyComplete() { int outstanding = dataready_.fetch_sub(1, std::memory_order_release);
+  void NotifyComplete() {
+    int outstanding = dataready_.fetch_sub(1, std::memory_order_acq_rel);
     if (backend_->uses_cpu_backend_ && outstanding == 1) {
       last_done_.store(1, std::memory_order_release);
       last_done_.notify_one();
