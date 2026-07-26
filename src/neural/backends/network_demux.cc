@@ -183,6 +183,8 @@ class DemuxingBackend final : public Backend {
             options.Get<std::string>(SharedBackendParams::kWeightsId)) {
     int shared_threads =
         backend_options.GetOrDefault<int>("shared_backend_threads", 1);
+    minimum_batch_step_ =
+        backend_options.GetOrDefault<int>("min_batch_step", 1);
     UpdateConfiguration(options);
     const auto parents = backend_options.ListSubdicts();
     std::vector<DemuxingChildBackend::AssignFuture> capabilities;
@@ -227,6 +229,15 @@ class DemuxingBackend final : public Backend {
         "max_batch", attrs_.maximum_batch_size);
     attrs_.recommended_batch_size =
         std::min(attrs_.maximum_batch_size, attrs_.recommended_batch_size);
+
+    minimum_batch_step_ =
+        std::clamp(minimum_batch_step_, 1, attrs_.recommended_batch_size);
+
+    CERR << "Demuxing backend initialized with " << backends_.size()
+         << " backends, maximum batch size: " << attrs_.maximum_batch_size
+         << ", recommended batch size: " << attrs_.recommended_batch_size
+         << ", preferred batch step: " << attrs_.preferred_batch_step
+         << ", minimum batch step: " << minimum_batch_step_;
   }
 
   DemuxingChildBackend::AssignFuture AddBackend(
@@ -278,6 +289,7 @@ class DemuxingBackend final : public Backend {
   pblczero::NetworkFormat::InputFormat input_format_;
   float softmax_policy_temperature_;
   FillEmptyHistory fill_empty_history_;
+  int minimum_batch_step_ = 1;
   bool uses_cpu_backend_ = false;
 
   alignas(kCacheLineSize) std::atomic<int64_t> start_index_ = 0;
@@ -414,19 +426,32 @@ void DemuxingComputation::ComputeBlocking(ComputationCallback callback) {
   assert(UsedBatchSize() != 0);
   callback_ = callback;
   // Calculate batch_step_ size split count.
-  int splits =
-      1 + (UsedBatchSize() - 1) / backend_->attrs_.preferred_batch_step;
+  int step = backend_->attrs_.preferred_batch_step;
+  if (UsedBatchSize() <
+          backend_->minimum_batch_step_ * backend_->backends_.size() &&
+      UsedBatchSize() >=
+          backend_->minimum_batch_step_ * backend_->backends_.size() / 2) {
+    step = backend_->minimum_batch_step_;
+  }
+  int splits = 1 + (UsedBatchSize() - 1) / step;
+  int last_split_size = (UsedBatchSize() - 1) % step + 1;
+  bool are_all_splits_full = last_split_size == step;
   // Calculate the minimum number of splits per backend.
   int split_size_per_backend = splits / backend_->backends_.size();
   // Calculate how many backends get extra work.
   int extra_split_backends =
       splits - split_size_per_backend * backend_->backends_.size();
 
+  int partial_split_correction = 0;
+  if (extra_split_backends == 0 && !are_all_splits_full) {
+    partial_split_correction = 1;
+  }
+
   // Find the first backend which got less work from the previous batch.
-  size_t start_index =
-      backend_->start_index_.fetch_add(std::max(1, extra_split_backends),
-                                       std::memory_order_relaxed) %
-      backend_->backends_.size();
+  size_t start_index = backend_->start_index_.fetch_add(
+                           extra_split_backends + partial_split_correction,
+                           std::memory_order_relaxed) %
+                       backend_->backends_.size();
 
   size_t end_index =
       (start_index + extra_split_backends) % backend_->backends_.size();
@@ -441,8 +466,10 @@ void DemuxingComputation::ComputeBlocking(ComputationCallback callback) {
   int split_size = split_size_per_backend + 1;
   for (; i != end_index; i = (i + 1) % backend_->backends_.size()) {
     assert(work_start != UsedBatchSize());
-    size_t work_end =
-        work_start + split_size * backend_->attrs_.preferred_batch_step;
+    size_t next_i = (i + 1) % backend_->backends_.size();
+    size_t work_end = next_i == end_index && !are_all_splits_full ?
+       work_start + last_split_size + (split_size - 1) * step
+       : work_start + split_size * step;
     work_end = std::min(work_end, UsedBatchSize());
     children_.emplace_back(this, work_start, work_end);
     backend_->backends_[i].Enqueue(&children_.back());
@@ -453,8 +480,7 @@ void DemuxingComputation::ComputeBlocking(ComputationCallback callback) {
   if (split_size > 0) {
     do {
       assert(work_start != UsedBatchSize());
-      size_t work_end =
-          work_start + split_size * backend_->attrs_.preferred_batch_step;
+      size_t work_end = work_start + split_size * step;
       work_end = std::min(work_end, UsedBatchSize());
       children_.emplace_back(this, work_start, work_end);
       backend_->backends_[i].Enqueue(&children_.back());
