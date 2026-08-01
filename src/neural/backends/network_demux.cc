@@ -30,7 +30,6 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <future>
-#include <mutex>
 #include <new>
 #include <queue>
 #include <thread>
@@ -39,6 +38,7 @@
 #include "neural/factory.h"
 #include "neural/shared_params.h"
 #include "utils/atomic_vector.h"
+#include "utils/mutex.h"
 #include "utils/numa.h"
 #include "utils/trace.h"
 
@@ -146,7 +146,7 @@ class DemuxingChildBackend {
 
   void Enqueue(DemuxingWork* work) {
     {
-      std::unique_lock lock(mutex_);
+      Mutex::Lock lock(mutex_);
       queue_.push(work);
     }
     dataready_cv_.notify_one();
@@ -154,7 +154,7 @@ class DemuxingChildBackend {
 
   void Abort() {
     {
-      std::unique_lock lock(mutex_);
+      Mutex::Lock lock(mutex_);
     }
     dataready_cv_.notify_all();
   }
@@ -162,11 +162,13 @@ class DemuxingChildBackend {
   void Worker(std::atomic<bool>& abort);
 
  private:
-  std::mutex mutex_;
-  std::condition_variable dataready_cv_;
+  // Runtime constant variables
   std::vector<std::thread> threads_;
   std::shared_ptr<Network> network_;
-  std::queue<DemuxingWork*> queue_;
+  // Mutex protected queue
+  Mutex mutex_;
+  std::condition_variable dataready_cv_;
+  std::queue<DemuxingWork*> queue_ GUARDED_BY(mutex_);
 };
 
 class DemuxingBackend final : public Backend {
@@ -392,8 +394,8 @@ void DemuxingChildBackend::Worker(std::atomic<bool>& abort) {
   while (!abort.load(std::memory_order_relaxed)) {
     DemuxingWork* work = nullptr;
     {
-      std::unique_lock lock(mutex_);
-      dataready_cv_.wait(lock, [&] {
+      Mutex::Lock lock(mutex_);
+      dataready_cv_.wait(lock.get_raw(), [&] {
         return abort.load(std::memory_order_relaxed) || !queue_.empty();
       });
       if (abort.load(std::memory_order_relaxed)) return;
