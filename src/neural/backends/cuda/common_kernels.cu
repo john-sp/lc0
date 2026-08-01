@@ -929,7 +929,7 @@ __device__ __forceinline__ float shared_sum_for_layer_norm(float x) {
 // Each thread processes 4 elements
 // 1. Perform Bias add, and skip add
 // 2. Perform layer norm (normalize across C dimension)
-template <typename T>
+template <typename T, bool kNoActivation, bool kHasSkip>
 __global__ void layer_norm_kernel(int N, int C, T* output, const T* input,
                                   const T* bias, const T* skip, const T* gammas,
                                   const T* betas, float ep, float alpha,
@@ -973,7 +973,7 @@ __global__ void layer_norm_kernel(int N, int C, T* output, const T* input,
   }
 
   if (!oobThread) {
-    if (skip != nullptr) {
+    if (kHasSkip) {
       // Load from memory (16 elements a time)
       if (fp16) {
         half inp[8];
@@ -993,14 +993,16 @@ __global__ void layer_norm_kernel(int N, int C, T* output, const T* input,
   // 1. Compute mean
   float s = 0;
   if (!oobThread)
-    if (skip != nullptr) {
+    if (kHasSkip) {
       for (int i = 0; i < 16; i++) {
-        val[i] = activate(val[i], act) * alpha + oth[i];
+        float activated = kNoActivation ? val[i] : activate(val[i], act);
+        val[i] = activated * alpha + oth[i];
         s += val[i];
       }
     } else {
       for (int i = 0; i < 16; i++) {
-        val[i] = activate(val[i], act) * alpha;
+        float activated = kNoActivation ? val[i] : activate(val[i], act);
+        val[i] = activated * alpha;
         s += val[i];
       }
     }
@@ -1036,9 +1038,10 @@ __global__ void layer_norm_kernel(int N, int C, T* output, const T* input,
   }
 
   // 3. Normalize
+  const float inv_std = 1.0f / sqrtf(var + ep);
   for (int i = 0; i < 16; i++) {
     float d = val[i] - mean;
-    float norm = d / sqrt(var + ep);
+    float norm = d * inv_std;
     float op = norm * oth[i];
     val[i] = op;
   }
@@ -1100,8 +1103,23 @@ void LayerNorm(int N, int C, T* output, const T* input, const T* bias,
   gridDim.y = 1;
   gridDim.z = 1;
 
-  layer_norm_kernel<T><<<gridDim, blockDim, 0, stream>>>(
-      N, C, output, input, bias, skip, gammas, betas, ep, alpha, act);
+  if (act == ACTIVATION_NONE) {
+    if (skip != nullptr) {
+      layer_norm_kernel<T, true, true><<<gridDim, blockDim, 0, stream>>>(
+          N, C, output, input, bias, skip, gammas, betas, ep, alpha, act);
+    } else {
+      layer_norm_kernel<T, true, false><<<gridDim, blockDim, 0, stream>>>(
+          N, C, output, input, bias, skip, gammas, betas, ep, alpha, act);
+    }
+  } else {
+    if (skip != nullptr) {
+      layer_norm_kernel<T, false, true><<<gridDim, blockDim, 0, stream>>>(
+          N, C, output, input, bias, skip, gammas, betas, ep, alpha, act);
+    } else {
+      layer_norm_kernel<T, false, false><<<gridDim, blockDim, 0, stream>>>(
+          N, C, output, input, bias, skip, gammas, betas, ep, alpha, act);
+    }
+  }
 
   ReportCUDAErrors(cudaGetLastError());
 }
