@@ -51,7 +51,7 @@ struct Lc0Mish<cutlass::Array<float, Count>> {
       cutlass::epilogue::thread::LinearCombinationGenericParams<float>;
 
   CUTLASS_HOST_DEVICE
-  Fragment operator()(const Fragment& input, const Params&) const {
+  Fragment operator()(const Fragment& input) const {
     Fragment output;
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < Count; ++i) {
@@ -69,6 +69,11 @@ struct Lc0Mish<cutlass::Array<float, Count>> {
     }
     return output;
   }
+
+  CUTLASS_HOST_DEVICE
+  Fragment operator()(const Fragment& input, const Params&) const {
+    return (*this)(input);
+  }
 };
 
 template <typename T>
@@ -81,7 +86,7 @@ struct Lc0Relu2<cutlass::Array<float, Count>> {
       cutlass::epilogue::thread::LinearCombinationGenericParams<float>;
 
   CUTLASS_HOST_DEVICE
-  Fragment operator()(const Fragment& input, const Params&) const {
+  Fragment operator()(const Fragment& input) const {
     Fragment output;
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < Count; ++i) {
@@ -90,6 +95,11 @@ struct Lc0Relu2<cutlass::Array<float, Count>> {
       output[i] = x * x;
     }
     return output;
+  }
+
+  CUTLASS_HOST_DEVICE
+  Fragment operator()(const Fragment& input, const Params&) const {
+    return (*this)(input);
   }
 };
 
