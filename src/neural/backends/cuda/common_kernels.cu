@@ -900,9 +900,13 @@ void Softmax(int N, int C, T* output, const T* input, const T* input2,
   ReportCUDAErrors(cudaGetLastError());
 }
 
+template <bool kSingleWarpPerRow>
 __device__ __forceinline__ float shared_sum_for_layer_norm(float x) {
   // compute warp-wide sum
   float s = warpReduce(x);
+
+  // A single warp already has the complete row sum in every lane.
+  if constexpr (kSingleWarpPerRow) return s;
 
   // warp-wide sums
   // Max product of the two dimension for the below array is 16 (512/32), but
@@ -929,7 +933,7 @@ __device__ __forceinline__ float shared_sum_for_layer_norm(float x) {
 // Each thread processes 4 elements
 // 1. Perform Bias add, and skip add
 // 2. Perform layer norm (normalize across C dimension)
-template <typename T>
+template <typename T, bool kSingleWarpPerRow>
 __global__ void layer_norm_kernel(int N, int C, T* output, const T* input,
                                   const T* bias, const T* skip, const T* gammas,
                                   const T* betas, float ep, float alpha,
@@ -1005,7 +1009,7 @@ __global__ void layer_norm_kernel(int N, int C, T* output, const T* input,
       }
     }
 
-  s = shared_sum_for_layer_norm(s);
+  s = shared_sum_for_layer_norm<kSingleWarpPerRow>(s);
   float mean = s / C;
 
   // 2. Compute varience
@@ -1016,7 +1020,7 @@ __global__ void layer_norm_kernel(int N, int C, T* output, const T* input,
       float d_sq = d * d;
       s += d_sq;
     }
-  s = shared_sum_for_layer_norm(s);
+  s = shared_sum_for_layer_norm<kSingleWarpPerRow>(s);
   float var = s / C;
 
   if (!oobThread) {
@@ -1100,8 +1104,13 @@ void LayerNorm(int N, int C, T* output, const T* input, const T* bias,
   gridDim.y = 1;
   gridDim.z = 1;
 
-  layer_norm_kernel<T><<<gridDim, blockDim, 0, stream>>>(
-      N, C, output, input, bias, skip, gammas, betas, ep, alpha, act);
+  if (blockDim.y == 1) {
+    layer_norm_kernel<T, true><<<gridDim, blockDim, 0, stream>>>(
+        N, C, output, input, bias, skip, gammas, betas, ep, alpha, act);
+  } else {
+    layer_norm_kernel<T, false><<<gridDim, blockDim, 0, stream>>>(
+        N, C, output, input, bias, skip, gammas, betas, ep, alpha, act);
+  }
 
   ReportCUDAErrors(cudaGetLastError());
 }
