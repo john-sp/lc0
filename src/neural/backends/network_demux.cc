@@ -193,6 +193,18 @@ class DemuxingChildBackend {
     return {batch_time, original_batch_time};
   }
 
+  void StartComputationWhenIdle() {
+    auto idle = idle_prediction_.load(std::memory_order_relaxed);
+    IdlePrediction new_idle = idle;
+    auto now = Clock::now();
+    do {
+      // Idle backend requires setting completion time to be when GPU gets the
+      // work. We use CPU time to approximate the timing.
+      new_idle.last_batch_completed_ = now.time_since_epoch().count();
+    } while (!idle_prediction_.compare_exchange_weak(
+        idle, new_idle, std::memory_order_relaxed));
+  }
+
   constexpr static int BatchTimeUpdateWeight = 32;
 
   void CompleteBackendWork(int batch_size,
@@ -253,6 +265,8 @@ class DemuxingChildBackend {
   void Enqueue(DemuxingWork* work) {
     {
       Mutex::Lock lock(mutex_);
+      work->first_in_queue_ = queue_.empty();
+      work->predicted_times_ = AddBackendWork(work->end_ - work->start_);
       queue_.push(work);
     }
     dataready_cv_.notify_one();
@@ -525,12 +539,14 @@ void DemuxingChildBackend::Worker(std::atomic<bool>& abort) {
       for (int i = work->start_; i < work->end_; i++) {
         work->computation_->AddInput(std::move(entries[i].input));
       }
-      auto batch_time = AddBackendWork(work->end_ - work->start_);
+      if (work->first_in_queue_) {
+        StartComputationWhenIdle();
+      }
       work->computation_->ComputeBlocking();
       // TODO: This should read the time from the backend which could use more
       // accurate GPU timers. CPU time has potential for random extra delay
       // sometimes.
-      CompleteBackendWork(work->end_ - work->start_, batch_time);
+      CompleteBackendWork(work->end_ - work->start_, work->predicted_times_);
       int expected = 0;
       if (work->source_->first_done_.compare_exchange_strong(
               expected, 1, std::memory_order_relaxed)) {
