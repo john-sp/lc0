@@ -58,7 +58,9 @@ struct DemuxingWork {
   DemuxingComputation* source_ = nullptr;
   std::unique_ptr<NetworkComputation> computation_;
   int start_ = 0;
-  int end_ = 0;
+  int end_ : 31 = 0;
+  bool first_in_queue_ : 1 = false;
+  std::tuple<uint32_t, uint32_t> predicted_times_;
 
   DemuxingWork(int sample) : end_(sample) {}
   DemuxingWork(DemuxingComputation* source, int start, int end)
@@ -137,7 +139,7 @@ class DemuxingChildBackend {
     network_ = shared;
     BackendAttributes attrs(*network_);
     batch_times_ns_ =
-        std::make_unique<std::atomic<uint32_t>[]>(attrs.maximum_batch_size);
+        std::make_unique<std::atomic<uint32_t>[]>(attrs.maximum_batch_size + 1);
     IdlePrediction prediction(Clock::now().time_since_epoch().count(), 0);
     idle_prediction_.store(prediction, std::memory_order_relaxed);
     return {attrs, network_->GetCapabilities()};
@@ -149,7 +151,7 @@ class DemuxingChildBackend {
     network_ = NetworkFactory::Get()->Create(name, weights, opts);
     BackendAttributes attrs(*network_);
     batch_times_ns_ =
-        std::make_unique<std::atomic<uint32_t>[]>(attrs.maximum_batch_size);
+        std::make_unique<std::atomic<uint32_t>[]>(attrs.maximum_batch_size + 1);
     IdlePrediction prediction(Clock::now().time_since_epoch().count(), 0);
     idle_prediction_.store(prediction, std::memory_order_relaxed);
     return {attrs, network_->GetCapabilities()};
@@ -167,10 +169,15 @@ class DemuxingChildBackend {
     return std::max<int64_t>(0, idle_time_ns + queued_work_ns);
   }
 
-  uint32_t AddBackendWork(int batch_size) {
-    uint32_t batch_time = 0;
-    batch_time +=
-        batch_times_ns_[batch_size - 1].load(std::memory_order_relaxed);
+  std::tuple<uint32_t, uint32_t> AddBackendWork(int batch_size) {
+    uint32_t batch_time = 0, original_batch_time = 0;
+    original_batch_time = batch_time =
+        batch_times_ns_[batch_size].load(std::memory_order_relaxed);
+
+    if (batch_time == 0) {
+      batch_time =
+          batch_times_ns_[0].load(std::memory_order_relaxed) * batch_size;
+    }
     auto idle = idle_prediction_.load(std::memory_order_relaxed);
     IdlePrediction new_idle = idle;
     do {
@@ -183,12 +190,14 @@ class DemuxingChildBackend {
       new_idle.queued_work_ns_ += batch_time;
     } while (!idle_prediction_.compare_exchange_weak(
         idle, new_idle, std::memory_order_relaxed));
-    return batch_time;
+    return {batch_time, original_batch_time};
   }
 
   constexpr static int BatchTimeUpdateWeight = 32;
 
-  void CompleteBackendWork(int batch_size, uint32_t predicted_batch_time) {
+  void CompleteBackendWork(int batch_size,
+                           std::tuple<uint32_t, uint32_t> predicted_times) {
+    auto [predicted_batch_time, original_batch_time] = predicted_times;
     auto now = Clock::now();
     auto idle = idle_prediction_.load(std::memory_order_relaxed);
     IdlePrediction new_idle = idle;
@@ -200,13 +209,15 @@ class DemuxingChildBackend {
 
     int32_t batch_time =
         now.time_since_epoch().count() - idle.last_batch_completed_;
+
+    int32_t average_per_position = batch_time / batch_size;
     if (batch_time < 0) {
       // Protect against out of order clocks.
       return;
     }
-    if (predicted_batch_time == 0) {
-      if (batch_times_ns_[batch_size - 1].compare_exchange_strong(
-              predicted_batch_time, batch_time, std::memory_order_relaxed)) {
+    if (original_batch_time == 0) {
+      if (batch_times_ns_[batch_size].compare_exchange_strong(
+              original_batch_time, batch_time, std::memory_order_relaxed)) {
         // There was no average yet so we updated it to match the first batch
         // time.
         return;
@@ -214,14 +225,29 @@ class DemuxingChildBackend {
       // Other thread updated the prediction. We update the average using the
       // new prediction.
     }
-    batch_time = static_cast<int32_t>(batch_time - predicted_batch_time) /
-                 BatchTimeUpdateWeight;
-    if (batch_time == 0) {
+    int32_t batch_time_delta =
+        static_cast<int32_t>(batch_time - original_batch_time) /
+        BatchTimeUpdateWeight;
+    if (batch_time_delta == 0) {
       // No need to update atomic value if prediction was accurate.
       return;
     }
-    batch_times_ns_[batch_size - 1].fetch_sub(batch_time,
-                                              std::memory_order_relaxed);
+    batch_times_ns_[batch_size].fetch_add(batch_time_delta,
+                                          std::memory_order_relaxed);
+
+    uint32_t average = batch_times_ns_[0].load(std::memory_order_relaxed);
+    if (average == 0) {
+      if (batch_times_ns_[0].compare_exchange_strong(
+              average, average_per_position, std::memory_order_relaxed)) {
+        // There was no average yet so we updated it to match the first batch
+        // time.
+        return;
+      }
+    }
+    int32_t average_delta =
+        static_cast<int32_t>(average_per_position - average) /
+        BatchTimeUpdateWeight;
+    batch_times_ns_[0].fetch_add(average_delta, std::memory_order_relaxed);
   }
 
   void Enqueue(DemuxingWork* work) {
@@ -499,7 +525,7 @@ void DemuxingChildBackend::Worker(std::atomic<bool>& abort) {
       for (int i = work->start_; i < work->end_; i++) {
         work->computation_->AddInput(std::move(entries[i].input));
       }
-      uint32_t batch_time = AddBackendWork(work->end_ - work->start_);
+      auto batch_time = AddBackendWork(work->end_ - work->start_);
       work->computation_->ComputeBlocking();
       // TODO: This should read the time from the backend which could use more
       // accurate GPU timers. CPU time has potential for random extra delay
