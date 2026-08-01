@@ -363,11 +363,16 @@ class DemuxingBackend final : public Backend {
     minimum_batch_step_ =
         std::clamp(minimum_batch_step_, 1, attrs_.recommended_batch_size);
 
+    const int default_min_batch_step = minimum_batch_step_ * (backends_.size() - 1) / 2;
+    lower_limit_batch_step_ = backend_options.GetOrDefault<int>(
+        "lower_limit_min_batch_step", default_min_batch_step);
+
     CERR << "Demuxing backend initialized with " << backends_.size()
          << " backends, maximum batch size: " << attrs_.maximum_batch_size
          << ", recommended batch size: " << attrs_.recommended_batch_size
          << ", preferred batch step: " << attrs_.preferred_batch_step
-         << ", minimum batch step: " << minimum_batch_step_;
+         << ", minimum batch step: " << minimum_batch_step_
+         << ", lower limit: " << lower_limit_batch_step_;
   }
 
   DemuxingChildBackend::AssignFuture AddBackend(
@@ -420,6 +425,7 @@ class DemuxingBackend final : public Backend {
   float softmax_policy_temperature_;
   FillEmptyHistory fill_empty_history_;
   int minimum_batch_step_ = 1;
+  unsigned lower_limit_batch_step_ = 1;
   bool uses_cpu_backend_ = false;
 
   alignas(kCacheLineSize) SpinMutex load_balancing_mutex_;
@@ -566,8 +572,7 @@ void DemuxingComputation::ComputeBlocking(ComputationCallback callback) {
   int step = backend_->attrs_.preferred_batch_step;
   if (UsedBatchSize() <
           backend_->minimum_batch_step_ * backend_->backends_.size() &&
-      UsedBatchSize() >=
-          backend_->minimum_batch_step_ * backend_->backends_.size() / 2) {
+      UsedBatchSize() >= backend_->lower_limit_batch_step_) {
     step = backend_->minimum_batch_step_;
   }
   int splits = 1 + (UsedBatchSize() - 1) / step;
