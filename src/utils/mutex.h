@@ -143,6 +143,11 @@ class CAPABILITY("mutex") SpinMutex {
     Lock(SpinMutex& m) ACQUIRE(m) : lock_(m) {}
     ~Lock() RELEASE() {}
 
+    void unlock() RELEASE() { lock_.unlock(); }
+    void lock() ACQUIRE() { lock_.lock(); }
+
+    bool owns_lock() const { return lock_.owns_lock(); }
+
    private:
     std::unique_lock<SpinMutex> lock_;
   };

@@ -422,7 +422,7 @@ class DemuxingBackend final : public Backend {
   int minimum_batch_step_ = 1;
   bool uses_cpu_backend_ = false;
 
-  alignas(kCacheLineSize) std::atomic<int64_t> start_index_ = 0;
+  alignas(kCacheLineSize) SpinMutex load_balancing_mutex_;
   alignas(kCacheLineSize) std::atomic<bool> abort_ = false;
 
   // Cache cold variables
@@ -591,6 +591,8 @@ void DemuxingComputation::ComputeBlocking(ComputationCallback callback) {
   std::vector<BackendSortingOrder> backend_order;
   backend_order.reserve(backend_->backends_.size());
 
+  SpinMutex::Lock lock(backend_->load_balancing_mutex_);
+
   auto now = Clock::now();
   for (uint32_t idx = 0; idx < backend_->backends_.size(); idx++) {
     const auto& b = backend_->backends_[idx];
@@ -638,6 +640,7 @@ void DemuxingComputation::ComputeBlocking(ComputationCallback callback) {
       work_start = work_end;
     }
   }
+  lock.unlock();
   assert(work_start == UsedBatchSize());
   assert(work_items == (int)children_.size());
   // Wait until all backends complete their work.
