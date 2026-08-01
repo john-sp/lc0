@@ -103,31 +103,41 @@ void addVectorsHNC_NHC(T* a, T* b, int N, int H, int C, cudaStream_t stream) {
   ReportCUDAErrors(cudaGetLastError());
 }
 
-template <typename T, ActivationFunction act>
+template <typename T, ActivationFunction act, int kElementsPerThread,
+          bool kInputGating>
 __global__ void addBiasBatched_kernel(T* output, const T* input, const T* bias,
-                                      int N, int C) {
+                                      const T* mult, const T* add, int N, int C,
+                                      int HW) {
   int batch = blockIdx.y;
   int n = blockIdx.x * blockDim.y + threadIdx.y;
   if (n >= N) return;
-  int c = threadIdx.x * 4;
+  int c = threadIdx.x * kElementsPerThread;
 
   int biasIndex = batch * C + c;
   int tensorIndex = batch * N * C + n * C + c;
 
-  float val[4];
-  float b[4];
+  float val[kElementsPerThread];
+  float b[kElementsPerThread];
 
   // Load from memory
   const bool fp16 = std::is_same<half, T>::value;
   if (fp16) {
-    half inp[4];
-    copyAs<uint2>(&inp[0], &input[tensorIndex]);
+    half inp[kElementsPerThread];
+    if (kElementsPerThread == 8) {
+      copyAs<uint4>(&inp[0], &input[tensorIndex]);
+    } else {
+      copyAs<uint2>(&inp[0], &input[tensorIndex]);
+    }
 #pragma unroll
-    for (int i = 0; i < 4; i++) val[i] = (float)inp[i];
+    for (int i = 0; i < kElementsPerThread; i++) val[i] = (float)inp[i];
 
-    copyAs<uint2>(&inp[0], &bias[biasIndex]);
+    if (kElementsPerThread == 8) {
+      copyAs<uint4>(&inp[0], &bias[biasIndex]);
+    } else {
+      copyAs<uint2>(&inp[0], &bias[biasIndex]);
+    }
 #pragma unroll
-    for (int i = 0; i < 4; i++) b[i] = (float)inp[i];
+    for (int i = 0; i < kElementsPerThread; i++) b[i] = (float)inp[i];
   } else {
     copyAs<uint4>(&val[0], &input[tensorIndex]);
     copyAs<uint4>(&b[0], &bias[biasIndex]);
@@ -135,20 +145,66 @@ __global__ void addBiasBatched_kernel(T* output, const T* input, const T* bias,
 
   // Perform bias add and activation
 #pragma unroll
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < kElementsPerThread; i++) {
     float x = val[i] + b[i];
     x = activate(x, act);
+    if constexpr (kInputGating) {
+      // Match the standalone sequence's producer store/load rounding.
+      x = (float)(T)x;
+      const int gate_index = (c + i) * HW + n % HW;
+      x = x * (float)mult[gate_index] + (float)add[gate_index];
+    }
     val[i] = x;
   }
 
   // write to memory
   if (fp16) {
-    half op[4];
+    half op[kElementsPerThread];
 #pragma unroll
-    for (int i = 0; i < 4; i++) op[i] = (half)val[i];
-    copyAs<uint2>(&output[tensorIndex], &op[0]);
+    for (int i = 0; i < kElementsPerThread; i++) op[i] = (half)val[i];
+    if (kElementsPerThread == 8) {
+      copyAs<uint4>(&output[tensorIndex], &op[0]);
+    } else {
+      copyAs<uint2>(&output[tensorIndex], &op[0]);
+    }
   } else {
     copyAs<uint4>(&output[tensorIndex], &val[0]);
+  }
+}
+
+template <typename T, ActivationFunction act, int kElementsPerThread,
+          bool kInputGating>
+void launchAddBiasBatchedImpl(T* output, const T* input, const T* bias,
+                              const T* mult, const T* add, int Batch, int N,
+                              int C, int HW, cudaStream_t stream) {
+  dim3 blockDim, gridDim;
+  blockDim.x = C / kElementsPerThread;
+  blockDim.y = std::min(std::max(512 / blockDim.x, 1u), (unsigned int)N);
+  blockDim.z = 1;
+  gridDim.x = DivUp(N, blockDim.y);
+  gridDim.y = Batch;
+  gridDim.z = 1;
+
+  addBiasBatched_kernel<T, act, kElementsPerThread, kInputGating>
+      <<<gridDim, blockDim, 0, stream>>>(output, input, bias, mult, add, N, C,
+                                         HW);
+}
+
+template <typename T, ActivationFunction act, bool kInputGating>
+void launchAddBiasBatched(T* output, const T* input, const T* bias, int Batch,
+                          int N, int C, const T* mult, const T* add, int HW,
+                          cudaStream_t stream) {
+  if constexpr (std::is_same<half, T>::value) {
+    if (C % 8 == 0) {
+      launchAddBiasBatchedImpl<T, act, 8, kInputGating>(
+          output, input, bias, mult, add, Batch, N, C, HW, stream);
+    } else {
+      launchAddBiasBatchedImpl<T, act, 4, kInputGating>(
+          output, input, bias, mult, add, Batch, N, C, HW, stream);
+    }
+  } else {
+    launchAddBiasBatchedImpl<T, act, 4, kInputGating>(
+        output, input, bias, mult, add, Batch, N, C, HW, stream);
   }
 }
 
@@ -157,42 +213,35 @@ __global__ void addBiasBatched_kernel(T* output, const T* input, const T* bias,
 template <typename T>
 void addBiasBatched(T* output, const T* input, const T* bias, int Batch, int N,
                     int C, ActivationFunction activation, cudaStream_t stream) {
-  // process 4 elements per thread to achieve close to peak memory bandwidth
+  // Process 8 fp16 elements per thread when 128-bit access is aligned, while
+  // retaining the 4-element path for fp32 and narrower channel counts.
   if (C % 4 != 0) throw Exception("unsupported filter size");
   if (C > 4096) throw Exception("unsupported filter size");
 
-  dim3 blockDim, gridDim;
-  blockDim.x = C / 4;
-  blockDim.y = std::min(std::max(512 / blockDim.x, 1u), (unsigned int)N);
-  blockDim.z = 1;
-  gridDim.x = DivUp(N, blockDim.y);
-  gridDim.y = Batch;
-  gridDim.z = 1;
-
   switch (activation) {
     case ACTIVATION_NONE:
-      addBiasBatched_kernel<T, ACTIVATION_NONE>
-          <<<gridDim, blockDim, 0, stream>>>(output, input, bias, N, C);
+      launchAddBiasBatched<T, ACTIVATION_NONE, false>(
+          output, input, bias, Batch, N, C, nullptr, nullptr, 0, stream);
       break;
     case ACTIVATION_SELU:
-      addBiasBatched_kernel<T, ACTIVATION_SELU>
-          <<<gridDim, blockDim, 0, stream>>>(output, input, bias, N, C);
+      launchAddBiasBatched<T, ACTIVATION_SELU, false>(
+          output, input, bias, Batch, N, C, nullptr, nullptr, 0, stream);
       break;
     case ACTIVATION_MISH:
-      addBiasBatched_kernel<T, ACTIVATION_MISH>
-          <<<gridDim, blockDim, 0, stream>>>(output, input, bias, N, C);
+      launchAddBiasBatched<T, ACTIVATION_MISH, false>(
+          output, input, bias, Batch, N, C, nullptr, nullptr, 0, stream);
       break;
     case ACTIVATION_RELU:
-      addBiasBatched_kernel<T, ACTIVATION_RELU>
-          <<<gridDim, blockDim, 0, stream>>>(output, input, bias, N, C);
+      launchAddBiasBatched<T, ACTIVATION_RELU, false>(
+          output, input, bias, Batch, N, C, nullptr, nullptr, 0, stream);
       break;
     case ACTIVATION_SWISH:
-      addBiasBatched_kernel<T, ACTIVATION_SWISH>
-          <<<gridDim, blockDim, 0, stream>>>(output, input, bias, N, C);
+      launchAddBiasBatched<T, ACTIVATION_SWISH, false>(
+          output, input, bias, Batch, N, C, nullptr, nullptr, 0, stream);
       break;
     case ACTIVATION_RELU_2:  // square relu
-      addBiasBatched_kernel<T, ACTIVATION_RELU_2>
-          <<<gridDim, blockDim, 0, stream>>>(output, input, bias, N, C);
+      launchAddBiasBatched<T, ACTIVATION_RELU_2, false>(
+          output, input, bias, Batch, N, C, nullptr, nullptr, 0, stream);
       break;
     default:
       throw Exception(
@@ -202,31 +251,80 @@ void addBiasBatched(T* output, const T* input, const T* bias, int Batch, int N,
   ReportCUDAErrors(cudaGetLastError());
 }
 
-template <typename T, ActivationFunction act>
+template <typename T>
+void addBiasBatchedInputGating(
+    T* output, const T* input, const T* bias, const T* mult, const T* add,
+    int Batch, int N, int C, int HW, ActivationFunction activation,
+    cudaStream_t stream) {
+  if (C % 4 != 0 || C > 4096 || HW <= 0) {
+    throw Exception("unsupported input gating shape");
+  }
+
+  switch (activation) {
+    case ACTIVATION_NONE:
+      launchAddBiasBatched<T, ACTIVATION_NONE, true>(
+          output, input, bias, Batch, N, C, mult, add, HW, stream);
+      break;
+    case ACTIVATION_SELU:
+      launchAddBiasBatched<T, ACTIVATION_SELU, true>(
+          output, input, bias, Batch, N, C, mult, add, HW, stream);
+      break;
+    case ACTIVATION_MISH:
+      launchAddBiasBatched<T, ACTIVATION_MISH, true>(
+          output, input, bias, Batch, N, C, mult, add, HW, stream);
+      break;
+    case ACTIVATION_RELU:
+      launchAddBiasBatched<T, ACTIVATION_RELU, true>(
+          output, input, bias, Batch, N, C, mult, add, HW, stream);
+      break;
+    case ACTIVATION_SWISH:
+      launchAddBiasBatched<T, ACTIVATION_SWISH, true>(
+          output, input, bias, Batch, N, C, mult, add, HW, stream);
+      break;
+    case ACTIVATION_RELU_2:
+      launchAddBiasBatched<T, ACTIVATION_RELU_2, true>(
+          output, input, bias, Batch, N, C, mult, add, HW, stream);
+      break;
+    default:
+      throw Exception("unsupported activation in input gating fusion");
+  }
+
+  ReportCUDAErrors(cudaGetLastError());
+}
+
+template <typename T, ActivationFunction act, int kElementsPerThread>
 __global__ void addBiasBatched_kernel(T* output, const T* input, const T* bias,
                                       int N, int C, int Nstride) {
   int batch = blockIdx.y;
   int n = blockIdx.x * blockDim.y + threadIdx.y;
   if (n >= N) return;
-  int c = threadIdx.x * 4;
+  int c = threadIdx.x * kElementsPerThread;
 
   int biasIndex = batch * C + c;
   int tensorIndex = batch * Nstride * C + n * C + c;
 
-  float val[4];
-  float b[4];
+  float val[kElementsPerThread];
+  float b[kElementsPerThread];
 
   // Load from memory
   const bool fp16 = std::is_same<half, T>::value;
   if (fp16) {
-    half inp[4];
-    copyAs<uint2>(&inp[0], &input[tensorIndex]);
+    half inp[kElementsPerThread];
+    if (kElementsPerThread == 8) {
+      copyAs<uint4>(&inp[0], &input[tensorIndex]);
+    } else {
+      copyAs<uint2>(&inp[0], &input[tensorIndex]);
+    }
 #pragma unroll
-    for (int i = 0; i < 4; i++) val[i] = (float)inp[i];
+    for (int i = 0; i < kElementsPerThread; i++) val[i] = (float)inp[i];
 
-    copyAs<uint2>(&inp[0], &bias[biasIndex]);
+    if (kElementsPerThread == 8) {
+      copyAs<uint4>(&inp[0], &bias[biasIndex]);
+    } else {
+      copyAs<uint2>(&inp[0], &bias[biasIndex]);
+    }
 #pragma unroll
-    for (int i = 0; i < 4; i++) b[i] = (float)inp[i];
+    for (int i = 0; i < kElementsPerThread; i++) b[i] = (float)inp[i];
   } else {
     copyAs<uint4>(&val[0], &input[tensorIndex]);
     copyAs<uint4>(&b[0], &bias[biasIndex]);
@@ -234,7 +332,7 @@ __global__ void addBiasBatched_kernel(T* output, const T* input, const T* bias,
 
   // Perform bias add and activation
 #pragma unroll
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < kElementsPerThread; i++) {
     float x = val[i] + b[i];
     x = activate(x, act);
     val[i] = x;
@@ -242,12 +340,50 @@ __global__ void addBiasBatched_kernel(T* output, const T* input, const T* bias,
 
   // write to memory
   if (fp16) {
-    half op[4];
+    half op[kElementsPerThread];
 #pragma unroll
-    for (int i = 0; i < 4; i++) op[i] = (half)val[i];
-    copyAs<uint2>(&output[tensorIndex], &op[0]);
+    for (int i = 0; i < kElementsPerThread; i++) op[i] = (half)val[i];
+    if (kElementsPerThread == 8) {
+      copyAs<uint4>(&output[tensorIndex], &op[0]);
+    } else {
+      copyAs<uint2>(&output[tensorIndex], &op[0]);
+    }
   } else {
     copyAs<uint4>(&output[tensorIndex], &val[0]);
+  }
+}
+
+template <typename T, ActivationFunction act, int kElementsPerThread>
+void launchAddBiasBatchedNstrideImpl(T* output, const T* input, const T* bias,
+                                     int Batch, int N, int C, int Nstride,
+                                     cudaStream_t stream) {
+  dim3 blockDim, gridDim;
+  blockDim.x = C / kElementsPerThread;
+  blockDim.y = std::min(std::max(512 / blockDim.x, 1u), (unsigned int)N);
+  blockDim.z = 1;
+  gridDim.x = DivUp(N, blockDim.y);
+  gridDim.y = Batch;
+  gridDim.z = 1;
+
+  addBiasBatched_kernel<T, act, kElementsPerThread>
+      <<<gridDim, blockDim, 0, stream>>>(output, input, bias, N, C, Nstride);
+}
+
+template <typename T, ActivationFunction act>
+void launchAddBiasBatchedNstride(T* output, const T* input, const T* bias,
+                                 int Batch, int N, int C, int Nstride,
+                                 cudaStream_t stream) {
+  if constexpr (std::is_same<half, T>::value) {
+    if (C % 8 == 0) {
+      launchAddBiasBatchedNstrideImpl<T, act, 8>(output, input, bias, Batch, N,
+                                                 C, Nstride, stream);
+    } else {
+      launchAddBiasBatchedNstrideImpl<T, act, 4>(output, input, bias, Batch, N,
+                                                 C, Nstride, stream);
+    }
+  } else {
+    launchAddBiasBatchedNstrideImpl<T, act, 4>(output, input, bias, Batch, N, C,
+                                               Nstride, stream);
   }
 }
 
@@ -257,48 +393,35 @@ template <typename T>
 void addBiasBatched(T* output, const T* input, const T* bias, int Batch, int N,
                     int C, int Nstride, ActivationFunction activation,
                     cudaStream_t stream) {
-  // process 4 elements per thread to achieve close to peak memory bandwidth
+  // Process 8 fp16 elements per thread when 128-bit access is aligned, while
+  // retaining the 4-element path for fp32 and narrower channel counts.
   if (C % 4 != 0) throw Exception("unsupported filter size");
   if (C > 4096) throw Exception("unsupported filter size");
 
-  dim3 blockDim, gridDim;
-  blockDim.x = C / 4;
-  blockDim.y = std::min(std::max(512 / blockDim.x, 1u), (unsigned int)N);
-  blockDim.z = 1;
-  gridDim.x = DivUp(N, blockDim.y);
-  gridDim.y = Batch;
-  gridDim.z = 1;
-
   switch (activation) {
     case ACTIVATION_NONE:
-      addBiasBatched_kernel<T, ACTIVATION_NONE>
-          <<<gridDim, blockDim, 0, stream>>>(output, input, bias, N, C,
-                                             Nstride);
+      launchAddBiasBatchedNstride<T, ACTIVATION_NONE>(
+          output, input, bias, Batch, N, C, Nstride, stream);
       break;
     case ACTIVATION_SELU:
-      addBiasBatched_kernel<T, ACTIVATION_SELU>
-          <<<gridDim, blockDim, 0, stream>>>(output, input, bias, N, C,
-                                             Nstride);
+      launchAddBiasBatchedNstride<T, ACTIVATION_SELU>(
+          output, input, bias, Batch, N, C, Nstride, stream);
       break;
     case ACTIVATION_MISH:
-      addBiasBatched_kernel<T, ACTIVATION_MISH>
-          <<<gridDim, blockDim, 0, stream>>>(output, input, bias, N, C,
-                                             Nstride);
+      launchAddBiasBatchedNstride<T, ACTIVATION_MISH>(
+          output, input, bias, Batch, N, C, Nstride, stream);
       break;
     case ACTIVATION_RELU:
-      addBiasBatched_kernel<T, ACTIVATION_RELU>
-          <<<gridDim, blockDim, 0, stream>>>(output, input, bias, N, C,
-                                             Nstride);
+      launchAddBiasBatchedNstride<T, ACTIVATION_RELU>(
+          output, input, bias, Batch, N, C, Nstride, stream);
       break;
     case ACTIVATION_SWISH:
-      addBiasBatched_kernel<T, ACTIVATION_SWISH>
-          <<<gridDim, blockDim, 0, stream>>>(output, input, bias, N, C,
-                                             Nstride);
+      launchAddBiasBatchedNstride<T, ACTIVATION_SWISH>(
+          output, input, bias, Batch, N, C, Nstride, stream);
       break;
     case ACTIVATION_RELU_2:  // square relu
-      addBiasBatched_kernel<T, ACTIVATION_RELU_2>
-          <<<gridDim, blockDim, 0, stream>>>(output, input, bias, N, C,
-                                             Nstride);
+      launchAddBiasBatchedNstride<T, ACTIVATION_RELU_2>(
+          output, input, bias, Batch, N, C, Nstride, stream);
       break;
     default:
       throw Exception(
@@ -820,8 +943,9 @@ __global__ void softmax_opt_64_kernel(T* output, const T* input,
   float Sum = warpReduce(threadSum);
   Sum = __shfl_sync(0xFFFFFFFF, Sum, 0);
 
-  ex[0] = ex[0] / Sum;
-  ex[1] = ex[1] / Sum;
+  const float inv_sum = 1.0f / Sum;
+  ex[0] = ex[0] * inv_sum;
+  ex[1] = ex[1] * inv_sum;
 
   // Store to memory
   if (fp16) {
@@ -889,7 +1013,7 @@ void Softmax(int N, int C, T* output, const T* input, const T* input2,
              cudaStream_t stream) {
   if (C == 64) {
     int size = N * 32;  // Total no of threads needed
-    const int kBlockSize = 256;
+    const int kBlockSize = 128;  // Four independent softmax rows per block.
     int blocks = DivUp(size, kBlockSize);
     softmax_opt_64_kernel<T>
         <<<blocks, kBlockSize, 0, stream>>>(output, input, input2, size);
@@ -900,9 +1024,17 @@ void Softmax(int N, int C, T* output, const T* input, const T* input2,
   ReportCUDAErrors(cudaGetLastError());
 }
 
+template <bool kSingleWarpPerRow>
 __device__ __forceinline__ float shared_sum_for_layer_norm(float x) {
   // compute warp-wide sum
   float s = warpReduce(x);
+
+  // When a row fits in one warp, warpReduce already produced the complete
+  // result in every lane. Avoid the shared-memory round trip and two
+  // block-wide barriers used to combine multiple warps. This covers the
+  // current layout for channel counts up to 512; wider rows retain the
+  // original multi-warp reduction below.
+  if constexpr (kSingleWarpPerRow) return s;
 
   // warp-wide sums
   // Max product of the two dimension for the below array is 16 (512/32), but
@@ -926,14 +1058,16 @@ __device__ __forceinline__ float shared_sum_for_layer_norm(float x) {
   return sum[threadIdx.z][0];
 }
 
-// Each thread processes 4 elements
+// Each thread processes 16 elements.
 // 1. Perform Bias add, and skip add
 // 2. Perform layer norm (normalize across C dimension)
-template <typename T>
+template <typename T, bool kNoActivation, bool kHasSkip,
+          bool kSingleWarpPerRow, bool kInputGating>
 __global__ void layer_norm_kernel(int N, int C, T* output, const T* input,
                                   const T* bias, const T* skip, const T* gammas,
-                                  const T* betas, float ep, float alpha,
-                                  ActivationFunction act) {
+                                  const T* betas, const T* gate_mult,
+                                  const T* gate_add, int gate_hw, float ep,
+                                  float alpha, ActivationFunction act) {
   int n = blockIdx.x * blockDim.z + threadIdx.z;
   if (n >= N) return;
   int c = (threadIdx.y * 32 + threadIdx.x) * 16;
@@ -973,7 +1107,7 @@ __global__ void layer_norm_kernel(int N, int C, T* output, const T* input,
   }
 
   if (!oobThread) {
-    if (skip != nullptr) {
+    if (kHasSkip) {
       // Load from memory (16 elements a time)
       if (fp16) {
         half inp[8];
@@ -993,19 +1127,21 @@ __global__ void layer_norm_kernel(int N, int C, T* output, const T* input,
   // 1. Compute mean
   float s = 0;
   if (!oobThread)
-    if (skip != nullptr) {
+    if (kHasSkip) {
       for (int i = 0; i < 16; i++) {
-        val[i] = activate(val[i], act) * alpha + oth[i];
+        float activated = kNoActivation ? val[i] : activate(val[i], act);
+        val[i] = activated * alpha + oth[i];
         s += val[i];
       }
     } else {
       for (int i = 0; i < 16; i++) {
-        val[i] = activate(val[i], act) * alpha;
+        float activated = kNoActivation ? val[i] : activate(val[i], act);
+        val[i] = activated * alpha;
         s += val[i];
       }
     }
 
-  s = shared_sum_for_layer_norm(s);
+  s = shared_sum_for_layer_norm<kSingleWarpPerRow>(s);
   float mean = s / C;
 
   // 2. Compute varience
@@ -1016,7 +1152,7 @@ __global__ void layer_norm_kernel(int N, int C, T* output, const T* input,
       float d_sq = d * d;
       s += d_sq;
     }
-  s = shared_sum_for_layer_norm(s);
+  s = shared_sum_for_layer_norm<kSingleWarpPerRow>(s);
   float var = s / C;
 
   if (!oobThread) {
@@ -1036,9 +1172,10 @@ __global__ void layer_norm_kernel(int N, int C, T* output, const T* input,
   }
 
   // 3. Normalize
+  const float inv_std = 1.0f / sqrtf(var + ep);
   for (int i = 0; i < 16; i++) {
     float d = val[i] - mean;
-    float norm = d / sqrt(var + ep);
+    float norm = d * inv_std;
     float op = norm * oth[i];
     val[i] = op;
   }
@@ -1063,6 +1200,21 @@ __global__ void layer_norm_kernel(int N, int C, T* output, const T* input,
     val[i] += oth[i];
   }
 
+  if constexpr (kInputGating) {
+    if (!oobThread) {
+      const int hw = n % gate_hw;
+#pragma unroll
+      for (int i = 0; i < 16; i++) {
+        // Match the standalone sequence's layer-normalization store/load
+        // rounding before applying the gate.
+        const float gated_input = (float)(T)val[i];
+        const int gate_index = (c + i) * gate_hw + hw;
+        val[i] = gated_input * (float)gate_mult[gate_index] +
+                 (float)gate_add[gate_index];
+      }
+    }
+  }
+
   if (!oobThread) {
     // Write to memory
     if (fp16) {
@@ -1083,10 +1235,12 @@ __global__ void layer_norm_kernel(int N, int C, T* output, const T* input,
 // add (optional) skip connection to input, and then perform Layer normalization
 // normalization is done across C dimension (i.e, sums and std deviations taken
 // over elements in C dim)
-template <typename T>
-void LayerNorm(int N, int C, T* output, const T* input, const T* bias,
-               const T* skip, const T* gammas, const T* betas, float ep,
-               float alpha, ActivationFunction act, cudaStream_t stream) {
+template <typename T, bool kInputGating>
+void launchLayerNorm(int N, int C, T* output, const T* input, const T* bias,
+                     const T* skip, const T* gammas, const T* betas,
+                     const T* gate_mult, const T* gate_add, int gate_hw,
+                     float ep, float alpha, ActivationFunction act,
+                     cudaStream_t stream) {
   // process 4 elements per thread to achieve close to peak memory bandwidth
   if (C % 16 != 0) throw Exception("unsupported filter size");
   if (C > 16384) throw Exception("unsupported filter size");
@@ -1100,10 +1254,79 @@ void LayerNorm(int N, int C, T* output, const T* input, const T* bias,
   gridDim.y = 1;
   gridDim.z = 1;
 
-  layer_norm_kernel<T><<<gridDim, blockDim, 0, stream>>>(
-      N, C, output, input, bias, skip, gammas, betas, ep, alpha, act);
+  if (blockDim.y == 1) {
+    if (act == ACTIVATION_NONE) {
+      if (skip != nullptr) {
+        layer_norm_kernel<T, true, true, true, kInputGating>
+            <<<gridDim, blockDim, 0, stream>>>(
+                N, C, output, input, bias, skip, gammas, betas, gate_mult,
+                gate_add, gate_hw, ep, alpha, act);
+      } else {
+        layer_norm_kernel<T, true, false, true, kInputGating>
+            <<<gridDim, blockDim, 0, stream>>>(
+                N, C, output, input, bias, skip, gammas, betas, gate_mult,
+                gate_add, gate_hw, ep, alpha, act);
+      }
+    } else {
+      if (skip != nullptr) {
+        layer_norm_kernel<T, false, true, true, kInputGating>
+            <<<gridDim, blockDim, 0, stream>>>(
+                N, C, output, input, bias, skip, gammas, betas, gate_mult,
+                gate_add, gate_hw, ep, alpha, act);
+      } else {
+        layer_norm_kernel<T, false, false, true, kInputGating>
+            <<<gridDim, blockDim, 0, stream>>>(
+                N, C, output, input, bias, skip, gammas, betas, gate_mult,
+                gate_add, gate_hw, ep, alpha, act);
+      }
+    }
+  } else {
+    if (act == ACTIVATION_NONE) {
+      if (skip != nullptr) {
+        layer_norm_kernel<T, true, true, false, kInputGating>
+            <<<gridDim, blockDim, 0, stream>>>(
+                N, C, output, input, bias, skip, gammas, betas, gate_mult,
+                gate_add, gate_hw, ep, alpha, act);
+      } else {
+        layer_norm_kernel<T, true, false, false, kInputGating>
+            <<<gridDim, blockDim, 0, stream>>>(
+                N, C, output, input, bias, skip, gammas, betas, gate_mult,
+                gate_add, gate_hw, ep, alpha, act);
+      }
+    } else {
+      if (skip != nullptr) {
+        layer_norm_kernel<T, false, true, false, kInputGating>
+            <<<gridDim, blockDim, 0, stream>>>(
+                N, C, output, input, bias, skip, gammas, betas, gate_mult,
+                gate_add, gate_hw, ep, alpha, act);
+      } else {
+        layer_norm_kernel<T, false, false, false, kInputGating>
+            <<<gridDim, blockDim, 0, stream>>>(
+                N, C, output, input, bias, skip, gammas, betas, gate_mult,
+                gate_add, gate_hw, ep, alpha, act);
+      }
+    }
+  }
 
   ReportCUDAErrors(cudaGetLastError());
+}
+
+template <typename T>
+void LayerNorm(int N, int C, T* output, const T* input, const T* bias,
+               const T* skip, const T* gammas, const T* betas, float ep,
+               float alpha, ActivationFunction act, cudaStream_t stream) {
+  launchLayerNorm<T, false>(N, C, output, input, bias, skip, gammas, betas,
+                            nullptr, nullptr, 0, ep, alpha, act, stream);
+}
+
+template <typename T>
+void LayerNormInputGating(
+    int N, int C, T* output, const T* input, const T* bias, const T* skip,
+    const T* gammas, const T* betas, const T* mult, const T* add, int HW,
+    float ep, float alpha, ActivationFunction act, cudaStream_t stream) {
+  if (HW <= 0) throw Exception("unsupported input gating shape");
+  launchLayerNorm<T, true>(N, C, output, input, bias, skip, gammas, betas, mult,
+                           add, HW, ep, alpha, act, stream);
 }
 
 // Compute promotion logits in a single kernel
@@ -1124,54 +1347,34 @@ __global__ void promotion_logits_kernel(int C, T* output, const T* keys,
 
   int threadInGroup = threadIdx.y * 24 + threadIdx.x;
 
-  // phase 1 : compute promotion_offsets by multiplying keys and ppo matrices
+  // Phase 1: cooperatively compute the 4x8 promotion-offset matrix. The 192
+  // threads form 32 groups of 6 workers, one group per output dot product.
   const T* keys_start =
       keys + n * 64 * C + C * 56;  // we are interested only in last 8 out of 64
                                    // 'rows' of keys matrix
-  __shared__ float promotion_offsets[4][8];
+  constexpr int kPromotionOffsets = 4 * 8;
+  constexpr int kWorkersPerOffset = 6;
+  __shared__ float promotion_partials[kPromotionOffsets][kWorkersPerOffset];
 
-  // only 32 threads out of 192 in the group are active in this phase, and each
-  // thread computes one element of the promotion_offsets matrix
-  // TODO: opt idea1, can use more threads to reduce the length of the loop for
-  // the matrix multiply (do parallel reduction of partial sums later)
-  //       opt idea2, the below loop for matrix mul has very poor memory access
-  //       pattern, can do the loop over 32, and do parallel reductions
-  if (threadInGroup < 32) {
-    int x = threadInGroup % 4;
-    int y = threadInGroup / 4;
+  const int offset = threadInGroup / kWorkersPerOffset;
+  const int worker = threadInGroup % kWorkersPerOffset;
+  const int ppo_row = offset % 4;
+  const int keys_row = offset / 4;
 
-    float S = 0;
-    for (int i = 0; i < C;
-         i++) {  // TODO: modify to loop over 32 instead of C (doing parallel
-                 // reductions for the 32 sums)
-      float a = (float)keys_start[y * C + i];
-      float b =
-          (float)ppo[x * C + i];  // weight matrix is transposed (col major)
-      S += a * b;
-    }
-
-    // write the product (promotion_offsets) in shared memory
-    promotion_offsets[x][y] = S;
+  float partial = 0;
+  for (int i = worker; i < C; i += kWorkersPerOffset) {
+    const float a = (float)keys_start[keys_row * C + i];
+    const float b = (float)ppo[ppo_row * C + i];
+    partial += a * b;
   }
+  // This layout makes the 192 worker writes contiguous in linear thread order.
+  promotion_partials[offset][worker] = partial;
 
   __syncthreads();
 
-  // phase 2: add the last "row" to the other 3
-  // #knight offset is added to the other three
-  // promotion_offsets = promotion_offsets[:, :3, :] + promotion_offsets[:, 3:4,
-  // :]
-  // Only 24 threads in the group are active in this phase
-  if (threadInGroup < 32) {
-    int x = threadInGroup % 4;
-    int y = threadInGroup / 4;
-    if (x < 3) {
-      promotion_offsets[x][y] += promotion_offsets[3][y];
-    }
-  }
-
-  __syncthreads();
-
-  // phase 3: add 8x8 chunk of policy_attn_logits matrix to promotion offsets
+  // Add the knight offset while consuming the promotion offsets, avoiding a
+  // separate shared-memory update phase and block-wide synchronization.
+  // Then add the 8x8 chunk of policy_attn_logits to the resulting offsets.
   //          the output is 3x8x8 (written as 8 * 24)
   // All threads are active in this phase and they compute one element each
   int w = x / 3;
@@ -1181,7 +1384,16 @@ __global__ void promotion_logits_kernel(int C, T* output, const T* keys,
   // 7 to rank 8
   float n_promo_logit =
       (float)policy_attn_logits[n * output_stride + (48 + y) * 64 + (56 + w)];
-  float promo_offset = promotion_offsets[c][w];
+  const int promotion_offset = w * 4 + c;
+  const int knight_offset = w * 4 + 3;
+  float promotion_sum = 0;
+  float knight_sum = 0;
+#pragma unroll
+  for (int i = 0; i < kWorkersPerOffset; i++) {
+    promotion_sum += promotion_partials[promotion_offset][i];
+    knight_sum += promotion_partials[knight_offset][i];
+  }
+  float promo_offset = promotion_sum + knight_sum;
 
   float op = n_promo_logit + promo_offset;
 
@@ -1227,6 +1439,36 @@ __global__ void preprocess_for_attention_body_kernel(
   output[n * 64 * outputC + hw * outputC + c] = op;
 }
 
+__global__ void preprocess_for_attention_body_fp16x8_kernel(
+    half* output, const half* input, const half* encoding, int input_size,
+    int encoding_size) {
+  constexpr int kContextSize = 64;
+  constexpr int kElementsPerThread = 8;
+
+  const int n = blockIdx.x;
+  const int hw = blockIdx.y;
+  const int c = threadIdx.x * kElementsPerThread;
+  const int output_size = input_size + encoding_size;
+  const int output_index =
+      n * kContextSize * output_size + hw * output_size + c;
+
+  half values[kElementsPerThread];
+  if (c < input_size) {
+    const int input_base =
+        n * input_size * kContextSize + c * kContextSize + hw;
+#pragma unroll
+    for (int i = 0; i < kElementsPerThread; i++) {
+      values[i] = input[input_base + i * kContextSize];
+    }
+  } else {
+    const int encoding_index = n * kContextSize * encoding_size +
+                               hw * encoding_size + c - input_size;
+    copyAs<uint4>(&values[0], &encoding[encoding_index]);
+  }
+
+  copyAs<uint4>(&output[output_index], &values[0]);
+}
+
 template <typename T>
 void inputPreprocessForAttentionBody(T* output, const T* input,
                                      const T* encoding, int N, int input_size,
@@ -1238,6 +1480,22 @@ void inputPreprocessForAttentionBody(T* output, const T* input,
   // Each thread computes a single output element
   dim3 gridSize = dim3(N, 64);
   int blockSize = input_size + encoding_size;
+  if constexpr (std::is_same<half, T>::value) {
+    constexpr int kElementsPerThread = 8;
+    // Keep every vector wholly within either the input or encoding region.
+    const bool use_vector_dense =
+        is_pe_dense_embedding && input_size > 0 && encoding_size > 0 &&
+        input_size % kElementsPerThread == 0 &&
+        encoding_size % kElementsPerThread == 0 &&
+        blockSize % kElementsPerThread == 0;
+    if (use_vector_dense) {
+      preprocess_for_attention_body_fp16x8_kernel
+          <<<gridSize, blockSize / kElementsPerThread, 0, stream>>>(
+              output, input, encoding, input_size, encoding_size);
+      return;
+    }
+  }
+
   preprocess_for_attention_body_kernel<T><<<gridSize, blockSize, 0, stream>>>(
       output, input, encoding, input_size, encoding_size,
       is_pe_dense_embedding);
@@ -1379,6 +1637,15 @@ template void addBiasBatched<half>(half* output, const half* input,
                                    const half* bias, int Batch, int N, int C,
                                    ActivationFunction activation,
                                    cudaStream_t stream);
+
+template void addBiasBatchedInputGating<float>(
+    float* output, const float* input, const float* bias, const float* mult,
+    const float* add, int Batch, int N, int C, int HW,
+    ActivationFunction activation, cudaStream_t stream);
+template void addBiasBatchedInputGating<half>(
+    half* output, const half* input, const half* bias, const half* mult,
+    const half* add, int Batch, int N, int C, int HW,
+    ActivationFunction activation, cudaStream_t stream);
 
 template void addBiasBatched<float>(float* output, const float* input,
                                     const float* bias, int Batch, int N, int C,
@@ -1602,6 +1869,17 @@ template void LayerNorm<float>(int N, int C, float* output, const float* input,
                                const float* gammas, const float* betas,
                                float ep, float alpha, ActivationFunction act,
                                cudaStream_t stream);
+
+template void LayerNormInputGating<half>(
+    int N, int C, half* output, const half* input, const half* bias,
+    const half* skip, const half* gammas, const half* betas, const half* mult,
+    const half* add, int HW, float ep, float alpha, ActivationFunction act,
+    cudaStream_t stream);
+template void LayerNormInputGating<float>(
+    int N, int C, float* output, const float* input, const float* bias,
+    const float* skip, const float* gammas, const float* betas,
+    const float* mult, const float* add, int HW, float ep, float alpha,
+    ActivationFunction act, cudaStream_t stream);
 
 template void ComputePromotionLogits<half>(int N, int C, half* output,
                                            const half* keys, const half* ppo,

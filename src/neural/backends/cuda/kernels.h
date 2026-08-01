@@ -51,6 +51,15 @@ template <typename T>
 void addBiasBatched(T* output, const T* input, const T* bias, int Batch, int N,
                     int C, ActivationFunction activation, cudaStream_t stream);
 
+// Add bias and activation, then apply per-square input gating while the result
+// is still resident in registers. Input/output are contiguous NHWC tensors;
+// the gating arrays use C * HW layout.
+template <typename T>
+void addBiasBatchedInputGating(
+    T* output, const T* input, const T* bias, const T* mult, const T* add,
+    int Batch, int N, int C, int HW, ActivationFunction activation,
+    cudaStream_t stream);
+
 // Optimized kernel to add bias to innermost dimension
 // and perform optional activation (to be used with GEMMs/fully connected)
 template <typename T>
@@ -143,6 +152,15 @@ void LayerNorm(int N, int C, T* output, const T* input, const T* bias,
                const T* skip, const T* gammas, const T* betas, float ep,
                float alpha, ActivationFunction act, cudaStream_t stream);
 
+// Layer normalization followed by per-square input gating, fused into the
+// normalization kernel's output stage. Rows are contiguous NHWC and gates use
+// C * HW layout.
+template <typename T>
+void LayerNormInputGating(
+    int N, int C, T* output, const T* input, const T* bias, const T* skip,
+    const T* gammas, const T* betas, const T* mult, const T* add, int HW,
+    float ep, float alpha, ActivationFunction act, cudaStream_t stream);
+
 template <typename T>
 void ComputePromotionLogits(int N, int C, T* output, const T* keys,
                             const T* ppo, const T* policy_attn_logits,
@@ -166,6 +184,12 @@ void genOffsetPointers(T** offsets, int heads, int max_batch, int depth,
 
 void fusedMHA(void* output, void* mha_q, void* mha_k, void* mha_v, void* skip,
               int batch_size, int num_heads, int depth, cudaStream_t stream);
+
+// Fused FP16 encoder FFN dense-1 GEMM, bias, and activation. Returns false
+// when the shape, device, alignment, or activation is not supported.
+bool fusedFfnDense1(half* output, const half* input, const half* weights,
+                    const half* bias, int rows, int outputs, int inputs,
+                    ActivationFunction activation, cudaStream_t stream);
 
 }  // namespace cudnn_backend
 }  // namespace lczero

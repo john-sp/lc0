@@ -27,12 +27,145 @@
 
 #include "neural/backends/cuda/cuda_common.h"
 
+#include <cmath>
+#include <cstdint>
+
+#include "cutlass/epilogue/thread/linear_combination_generic.h"
+#include "cutlass/gemm/device/gemm.h"
 // Fused MHA implementation from cutlass example #41
 #include "fused_multi_head_attention/kernel_forward.h"
+#include "neural/tables/activation_function.h"
 #include "utils/exception.h"
 
 namespace lczero {
 namespace cudnn_backend {
+namespace {
+
+template <typename T>
+struct Lc0Mish;
+
+template <int Count>
+struct Lc0Mish<cutlass::Array<float, Count>> {
+  using Fragment = cutlass::Array<float, Count>;
+  using Params =
+      cutlass::epilogue::thread::LinearCombinationGenericParams<float>;
+
+  CUTLASS_HOST_DEVICE
+  Fragment operator()(const Fragment& input, const Params&) const {
+    Fragment output;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < Count; ++i) {
+      const float x = input[i];
+#if defined(__CUDA_ARCH__)
+      const float e = __expf(x);
+      const float n = e * e + 2.0f * e;
+      const float d = __fdividef(x, n + 2.0f);
+#else
+      const float e = std::exp(x);
+      const float n = e * e + 2.0f * e;
+      const float d = x / (n + 2.0f);
+#endif
+      output[i] = x <= -0.6f ? n * d : x - 2.0f * d;
+    }
+    return output;
+  }
+};
+
+template <typename T>
+struct Lc0Relu2;
+
+template <int Count>
+struct Lc0Relu2<cutlass::Array<float, Count>> {
+  using Fragment = cutlass::Array<float, Count>;
+  using Params =
+      cutlass::epilogue::thread::LinearCombinationGenericParams<float>;
+
+  CUTLASS_HOST_DEVICE
+  Fragment operator()(const Fragment& input, const Params&) const {
+    Fragment output;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < Count; ++i) {
+      float x = input[i];
+      if (x < 0.0f) x = 0.0f;
+      output[i] = x * x;
+    }
+    return output;
+  }
+};
+
+template <template <typename> class Activation>
+using FfnEpilogue = cutlass::epilogue::thread::LinearCombinationGeneric<
+    Activation, cutlass::half_t, 8, cutlass::half_t, float,
+    cutlass::epilogue::thread::ScaleType::NoBetaScaling,
+    cutlass::FloatRoundStyle::round_to_nearest, true>;
+
+template <template <typename> class Activation>
+using FfnGemm = cutlass::gemm::device::Gemm<
+    cutlass::half_t, cutlass::layout::RowMajor, cutlass::half_t,
+    cutlass::layout::ColumnMajor, cutlass::half_t,
+    cutlass::layout::RowMajor, cutlass::half_t,
+    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<128, 128, 32>,
+    cutlass::gemm::GemmShape<64, 64, 32>,
+    cutlass::gemm::GemmShape<16, 8, 16>, FfnEpilogue<Activation>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, 3>;
+
+template <template <typename> class Activation>
+bool runFfnGemm(half* output, const half* input, const half* weights,
+                const half* bias, int rows, int outputs, int inputs,
+                cudaStream_t stream) {
+  using Gemm = FfnGemm<Activation>;
+  typename Gemm::Arguments arguments{
+      {rows, outputs, inputs},
+      {reinterpret_cast<const cutlass::half_t*>(input), inputs},
+      {reinterpret_cast<const cutlass::half_t*>(weights), inputs},
+      {reinterpret_cast<const cutlass::half_t*>(bias), 0},
+      {reinterpret_cast<cutlass::half_t*>(output), outputs},
+      {1.0f},
+      1};
+
+  if (Gemm::can_implement(arguments) != cutlass::Status::kSuccess) {
+    return false;
+  }
+  Gemm gemm;
+  return gemm(arguments, nullptr, stream) == cutlass::Status::kSuccess;
+}
+
+bool isAligned16(const void* pointer) {
+  return (reinterpret_cast<std::uintptr_t>(pointer) & 15U) == 0;
+}
+
+}  // namespace
+
+bool fusedFfnDense1(half* output, const half* input, const half* weights,
+                    const half* bias, int rows, int outputs, int inputs,
+                    ActivationFunction activation, cudaStream_t stream) {
+  if (rows <= 0 || outputs <= 0 || inputs <= 0 || rows % 8 != 0 ||
+      outputs % 8 != 0 || inputs % 8 != 0 || !isAligned16(output) ||
+      !isAligned16(input) || !isAligned16(weights) || !isAligned16(bias)) {
+    return false;
+  }
+
+  int device = 0;
+  int major = 0;
+  if (cudaGetDevice(&device) != cudaSuccess ||
+      cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
+                             device) != cudaSuccess ||
+      major < 8) {
+    return false;
+  }
+
+  switch (activation) {
+    case ACTIVATION_MISH:
+      return runFfnGemm<Lc0Mish>(output, input, weights, bias, rows, outputs,
+                                 inputs, stream);
+    case ACTIVATION_RELU_2:
+      return runFfnGemm<Lc0Relu2>(output, input, weights, bias, rows, outputs,
+                                  inputs, stream);
+    default:
+      return false;
+  }
+}
 
 template <bool bias>
 void fusedMHACutlass(void* output, void* q, void* k, void* v, void* skip,

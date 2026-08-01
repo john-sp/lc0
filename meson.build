@@ -459,6 +459,8 @@ if get_option('build_backends')
   nvcc_paths += ['nvcc', '/usr/local/cuda/bin/nvcc', '/opt/cuda/bin/nvcc']
   message('Looking for nvcc in: ' + ', '.join(nvcc_paths))
   cu_blas = cc.find_library('cublas', dirs: cudnn_libdirs, required: false)
+  cu_blas_lt = cc.find_library('cublasLt', dirs: cudnn_libdirs,
+                               required: false)
   cu_dnn = cc.find_library('cudnn', dirs: cudnn_libdirs, required: false)
   cu_dart = cc.find_library('cudart', dirs: cudnn_libdirs, required: false)
   nvcc = find_program(nvcc_paths,
@@ -564,6 +566,10 @@ if get_option('build_backends')
   endif
   if (get_option('cudnn') or get_option('plain_cuda')) and cu_dart.found() and cu_blas.found() and nvcc_ok
     deps += [cu_blas, cu_dart]
+    if cu_blas_lt.found()
+      deps += cu_blas_lt
+      add_project_arguments('-DUSE_CUBLAS_LT', language : 'cpp')
+    endif
     cuda_files = ['src/neural/backends/cuda/layers.cc']
     if get_option('cudnn') and cu_dnn.found()
       deps += cu_dnn

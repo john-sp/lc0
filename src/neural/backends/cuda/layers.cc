@@ -26,6 +26,10 @@
 */
 #include "layers.h"
 
+#if defined(USE_CUBLAS_LT) && CUBLAS_VER_MAJOR >= 12
+#include <cublasLt.h>
+#endif
+
 #include <cassert>
 #include <cstring>
 #include <vector>
@@ -1634,6 +1638,132 @@ static void cublasXGemmStridedBatched(
   }
 }
 
+#if defined(USE_CUBLAS_LT) && CUBLAS_VER_MAJOR >= 12
+namespace {
+
+struct CublasLtMatmulDescriptor {
+  cublasLtMatmulDesc_t value = nullptr;
+  ~CublasLtMatmulDescriptor() {
+    if (value != nullptr) cublasLtMatmulDescDestroy(value);
+  }
+};
+
+struct CublasLtMatrixLayout {
+  cublasLtMatrixLayout_t value = nullptr;
+  ~CublasLtMatrixLayout() {
+    if (value != nullptr) cublasLtMatrixLayoutDestroy(value);
+  }
+};
+
+struct CublasLtMatmulPreference {
+  cublasLtMatmulPreference_t value = nullptr;
+  ~CublasLtMatmulPreference() {
+    if (value != nullptr) cublasLtMatmulPreferenceDestroy(value);
+  }
+};
+
+// Computes one or more projections and applies bias in the GEMM epilogue. The
+// matrices use the same column-major interpretation as cublasXgemm and
+// cublasXGemmStridedBatched above. Returns false when cuBLASLt cannot use the
+// exact layout, allowing the caller to retain the legacy GEMM plus bias-kernel
+// path.
+bool cublasLtGemmBias(
+    cublasHandle_t cublas, int m, int n, int k, const half* weights,
+    int weight_ld, int64_t weight_batch_stride, const half* input, int input_ld,
+    int64_t input_batch_stride, half* output, int output_ld,
+    int64_t output_batch_stride, const half* bias, int64_t bias_batch_stride,
+    int32_t batch_count, cudaStream_t stream) {
+  CublasLtMatmulDescriptor operation;
+  if (cublasLtMatmulDescCreate(&operation.value, CUBLAS_COMPUTE_16F,
+                               CUDA_R_16F) != CUBLAS_STATUS_SUCCESS) {
+    return false;
+  }
+
+  const cublasOperation_t transa = CUBLAS_OP_T;
+  const cublasOperation_t transb = CUBLAS_OP_N;
+  const cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
+  const void* bias_pointer = bias;
+  if (cublasLtMatmulDescSetAttribute(
+          operation.value, CUBLASLT_MATMUL_DESC_TRANSA, &transa,
+          sizeof(transa)) != CUBLAS_STATUS_SUCCESS ||
+      cublasLtMatmulDescSetAttribute(
+          operation.value, CUBLASLT_MATMUL_DESC_TRANSB, &transb,
+          sizeof(transb)) != CUBLAS_STATUS_SUCCESS ||
+      cublasLtMatmulDescSetAttribute(
+          operation.value, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue,
+          sizeof(epilogue)) != CUBLAS_STATUS_SUCCESS ||
+      cublasLtMatmulDescSetAttribute(
+          operation.value, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias_pointer,
+          sizeof(bias_pointer)) != CUBLAS_STATUS_SUCCESS) {
+    return false;
+  }
+  if (batch_count > 1 &&
+      cublasLtMatmulDescSetAttribute(
+          operation.value, CUBLASLT_MATMUL_DESC_BIAS_BATCH_STRIDE,
+          &bias_batch_stride,
+          sizeof(bias_batch_stride)) != CUBLAS_STATUS_SUCCESS) {
+    return false;
+  }
+
+  CublasLtMatrixLayout weight_layout;
+  CublasLtMatrixLayout input_layout;
+  CublasLtMatrixLayout result_layout;
+  if (cublasLtMatrixLayoutCreate(&weight_layout.value, CUDA_R_16F, k, m,
+                                 weight_ld) != CUBLAS_STATUS_SUCCESS ||
+      cublasLtMatrixLayoutCreate(&input_layout.value, CUDA_R_16F, k, n,
+                                 input_ld) != CUBLAS_STATUS_SUCCESS ||
+      cublasLtMatrixLayoutCreate(&result_layout.value, CUDA_R_16F, m, n,
+                                 output_ld) != CUBLAS_STATUS_SUCCESS) {
+    return false;
+  }
+
+  const auto set_batched_layout = [batch_count](
+                                      cublasLtMatrixLayout_t layout,
+                                      int64_t stride) {
+    return cublasLtMatrixLayoutSetAttribute(
+               layout, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count,
+               sizeof(batch_count)) == CUBLAS_STATUS_SUCCESS &&
+           cublasLtMatrixLayoutSetAttribute(
+               layout, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride,
+               sizeof(stride)) == CUBLAS_STATUS_SUCCESS;
+  };
+  if (batch_count > 1 &&
+      (!set_batched_layout(weight_layout.value, weight_batch_stride) ||
+       !set_batched_layout(input_layout.value, input_batch_stride) ||
+       !set_batched_layout(result_layout.value, output_batch_stride))) {
+    return false;
+  }
+
+  CublasLtMatmulPreference preference;
+  if (cublasLtMatmulPreferenceCreate(&preference.value) !=
+      CUBLAS_STATUS_SUCCESS) {
+    return false;
+  }
+
+  cublasLtMatmulHeuristicResult_t heuristic = {};
+  int returned_results = 0;
+  const cublasLtHandle_t lt_handle =
+      reinterpret_cast<cublasLtHandle_t>(cublas);
+  if (cublasLtMatmulAlgoGetHeuristic(
+          lt_handle, operation.value, weight_layout.value, input_layout.value,
+          result_layout.value, result_layout.value, preference.value, 1,
+          &heuristic, &returned_results) != CUBLAS_STATUS_SUCCESS ||
+      returned_results == 0 || heuristic.state != CUBLAS_STATUS_SUCCESS) {
+    return false;
+  }
+
+  const unsigned short alpha = FP32toFP16(1.0f);
+  const unsigned short beta = FP32toFP16(0.0f);
+  return cublasLtMatmul(
+             lt_handle, operation.value, &alpha, weights,
+             weight_layout.value, input, input_layout.value, &beta, output,
+             result_layout.value, output, result_layout.value, &heuristic.algo,
+             nullptr, 0, stream) == CUBLAS_STATUS_SUCCESS;
+}
+
+}  // namespace
+#endif
+
 template <typename DataType>
 static void cublasXGemmBatched(cublasHandle_t handle, cublasOperation_t transa,
                                cublasOperation_t transb, int m, int n, int k,
@@ -1745,13 +1875,26 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
     mha_k = mha_q + num_outputs * max_batch;
     mha_v = mha_k + num_outputs * max_batch;
 
-    cublasXGemmStridedBatched<DataType>(
-        cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch, num_inputs, 1.0f,
-        mha_qkv_w, num_inputs, num_inputs * num_outputs, in_out_tensor,
-        num_inputs, 0, 0.0f, mha_q, num_outputs, num_outputs * max_batch, 3,
-        use_gemm_ex_);
-    addBiasBatched<DataType>(mha_q, mha_q, mha_qkv_b, 3, batch, num_outputs,
-                             max_batch, ACTIVATION_NONE, stream);
+    bool fused_qkv_bias = false;
+#if defined(USE_CUBLAS_LT) && CUBLAS_VER_MAJOR >= 12
+    if constexpr (std::is_same<DataType, half>::value) {
+      fused_qkv_bias = cublasLtGemmBias(
+          cublas, num_outputs, batch, num_inputs, mha_qkv_w, num_inputs,
+          static_cast<int64_t>(num_inputs) * num_outputs, in_out_tensor,
+          num_inputs, 0, mha_q, num_outputs,
+          static_cast<int64_t>(num_outputs) * max_batch, mha_qkv_b, num_outputs,
+          3, stream);
+    }
+#endif
+    if (!fused_qkv_bias) {
+      cublasXGemmStridedBatched<DataType>(
+          cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch, num_inputs,
+          1.0f, mha_qkv_w, num_inputs, num_inputs * num_outputs, in_out_tensor,
+          num_inputs, 0, 0.0f, mha_q, num_outputs, num_outputs * max_batch, 3,
+          use_gemm_ex_);
+      addBiasBatched<DataType>(mha_q, mha_q, mha_qkv_b, 3, batch, num_outputs,
+                               max_batch, ACTIVATION_NONE, stream);
+    }
   }
 
   // Apply split_heads() to q, k and v
@@ -1871,11 +2014,21 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
     const int num_inputs = embedding_op_size_;
     const int num_outputs = ffn_dense1_size_;  // encoder_dff
     const int batch = N * 64;
-    cublasXgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch,
-                num_inputs, 1.0f, (const DataType*)ffn_dense1_w, num_inputs,
-                scratch, num_inputs, 0.0f, in_out_tensor, num_outputs);
-    addBiasBatched(in_out_tensor, in_out_tensor, ffn_dense1_b, 1, batch,
-                   num_outputs, ffn_activation_, stream);
+    bool fused_ffn = false;
+#ifdef USE_CUTLASS
+    if constexpr (std::is_same<DataType, half>::value) {
+      fused_ffn = fusedFfnDense1(
+          in_out_tensor, scratch, ffn_dense1_w, ffn_dense1_b, batch,
+          num_outputs, num_inputs, ffn_activation_, stream);
+    }
+#endif
+    if (!fused_ffn) {
+      cublasXgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch,
+                  num_inputs, 1.0f, (const DataType*)ffn_dense1_w, num_inputs,
+                  scratch, num_inputs, 0.0f, in_out_tensor, num_outputs);
+      addBiasBatched(in_out_tensor, in_out_tensor, ffn_dense1_b, 1, batch,
+                     num_outputs, ffn_activation_, stream);
+    }
   }
 
   // #FFN dense 2, in_out_tensor -> buffer1
@@ -1941,13 +2094,27 @@ void AttentionPolicyHead<DataType>::Eval(
     wq = (DataType*)scratch;
     wk = wq + num_outputs * batch;
 
-    cublasXGemmStridedBatched<DataType>(
-        cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch, num_inputs, 1.0f,
-        wqk_w_, num_inputs, num_inputs * num_outputs, input2_tensor, num_inputs,
-        0, 0.0f, wq, num_outputs, num_outputs * batch, 2, use_gemm_ex_);
+    bool fused_wqk_bias = false;
+#if defined(USE_CUBLAS_LT) && CUBLAS_VER_MAJOR >= 12
+    if constexpr (std::is_same<DataType, half>::value) {
+      fused_wqk_bias = cublasLtGemmBias(
+          cublas, num_outputs, batch, num_inputs, wqk_w_, num_inputs,
+          static_cast<int64_t>(num_inputs) * num_outputs, input2_tensor,
+          num_inputs, 0, wq, num_outputs,
+          static_cast<int64_t>(num_outputs) * batch, wqk_b_, num_outputs, 2,
+          stream);
+    }
+#endif
+    if (!fused_wqk_bias) {
+      cublasXGemmStridedBatched<DataType>(
+          cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch, num_inputs,
+          1.0f, wqk_w_, num_inputs, num_inputs * num_outputs, input2_tensor,
+          num_inputs, 0, 0.0f, wq, num_outputs, num_outputs * batch, 2,
+          use_gemm_ex_);
 
-    addBiasBatched<DataType>(wq, wq, wqk_b_, 2, batch, num_outputs,
-                             ACTIVATION_NONE, stream);
+      addBiasBatched<DataType>(wq, wq, wqk_b_, 2, batch, num_outputs,
+                               ACTIVATION_NONE, stream);
+    }
   }
 
   // dk = tf.math.sqrt(tf.cast(tf.shape(keys)[-1], self.model_dtype))
@@ -2192,17 +2359,27 @@ void AttentionBody<DataType>::Eval(int N, DataType* output,
 
       convertNCHWtoNHWC((DataType*)scratch, input, N, inputC, N, 12, 8, 8,
                         stream);
-      cublasXgemm<DataType>(
-          cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch, num_inputs,
-          1.0f, (const DataType*)ip_emb_pre_w_, num_inputs,
-          (const DataType*)scratch, num_inputs, 0.0f, buffer1, num_outputs);
+      bool fused_preprocess_bias = false;
+#if defined(USE_CUBLAS_LT) && CUBLAS_VER_MAJOR >= 12
+      if constexpr (std::is_same<DataType, half>::value) {
+        fused_preprocess_bias = cublasLtGemmBias(
+            cublas, num_outputs, batch, num_inputs, ip_emb_pre_w_, num_inputs,
+            0, (const half*)scratch, num_inputs, 0, buffer1, num_outputs, 0,
+            ip_emb_pre_b_, 0, 1, stream);
+      }
+#endif
+      if (!fused_preprocess_bias) {
+        cublasXgemm<DataType>(
+            cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch, num_inputs,
+            1.0f, (const DataType*)ip_emb_pre_w_, num_inputs,
+            (const DataType*)scratch, num_inputs, 0.0f, buffer1, num_outputs);
 
-      // addBiasBatched(buffer1, buffer1, ip_emb_pre_b_, batch, N, num_outputs,
-      //               ACTIVATION_NONE, stream);
-      const int size = num_outputs * N;
-      // @todo addBiasBatched has a 4096 channel limit, needs refactoring.
-      addVectors(buffer1, buffer1, ip_emb_pre_b_, size, size, num_outputs,
-                 ACTIVATION_NONE, stream);
+        // addBiasBatched has a 4096 channel limit, so preserve the general
+        // addVectors fallback for this potentially wider projection.
+        const int size = num_outputs * N;
+        addVectors(buffer1, buffer1, ip_emb_pre_b_, size, size, num_outputs,
+                   ACTIVATION_NONE, stream);
+      }
       inputPreprocessForAttentionBody((DataType*)scratch, input, buffer1, N,
                                       kInputPlanes, embedding_dense_size_, true,
                                       stream);
@@ -2244,16 +2421,26 @@ void AttentionBody<DataType>::Eval(int N, DataType* output,
                             num_inputs, temp, num_inputs, 0.0f, embedding,
                             num_outputs);
       // embedding layer norm with fused in bias add of previous gemm.
-      LayerNorm<DataType>(N * 64, embedding_op_size_, temp, embedding,
-                          ip_emb_b_, (DataType*)nullptr, ip_emb_ln_g_,
-                          ip_emb_ln_b_, 1e-3, 1.0,
-                          activations_.default_activation, stream);
-    }
+      const bool fuse_input_gating =
+          has_gating_ && embedding_op_size_ % 16 == 0 &&
+          embedding_op_size_ <= 16384;
+      if (fuse_input_gating) {
+        LayerNormInputGating<DataType>(
+            N * 64, embedding_op_size_, temp, embedding, ip_emb_b_,
+            (DataType*)nullptr, ip_emb_ln_g_, ip_emb_ln_b_, ip_mult_gate_,
+            ip_add_gate_, 64, 1e-3, 1.0, activations_.default_activation,
+            stream);
+      } else {
+        LayerNorm<DataType>(N * 64, embedding_op_size_, temp, embedding,
+                            ip_emb_b_, (DataType*)nullptr, ip_emb_ln_g_,
+                            ip_emb_ln_b_, 1e-3, 1.0,
+                            activations_.default_activation, stream);
+      }
 
-    // Input gating
-    if (has_gating_) {
-      applyInputGating<DataType>(temp, temp, ip_mult_gate_, ip_add_gate_, N, 64,
-                                 embedding_op_size_, stream);
+      if (has_gating_ && !fuse_input_gating) {
+        applyInputGating<DataType>(temp, temp, ip_mult_gate_, ip_add_gate_, N,
+                                   64, embedding_op_size_, stream);
+      }
     }
 
     // embedding FFN dense 1
@@ -2261,11 +2448,21 @@ void AttentionBody<DataType>::Eval(int N, DataType* output,
       const int num_inputs = embedding_ffn_size_;
       const int num_outputs = embedding_ffn_dff_;  // encoder_dff
       const int batch = N * 64;
-      cublasXgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch,
-                  num_inputs, 1.0f, (const DataType*)ip_emb_ffn_d1_w_,
-                  num_inputs, temp, num_inputs, 0.0f, buffer1, num_outputs);
-      addBiasBatched(buffer1, buffer1, ip_emb_ffn_d1_b_, 1, batch, num_outputs,
-                     activations_.ffn_activation, stream);
+      bool fused_ffn = false;
+#ifdef USE_CUTLASS
+      if constexpr (std::is_same<DataType, half>::value) {
+        fused_ffn = fusedFfnDense1(
+            buffer1, temp, ip_emb_ffn_d1_w_, ip_emb_ffn_d1_b_, batch,
+            num_outputs, num_inputs, activations_.ffn_activation, stream);
+      }
+#endif
+      if (!fused_ffn) {
+        cublasXgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch,
+                    num_inputs, 1.0f, (const DataType*)ip_emb_ffn_d1_w_,
+                    num_inputs, temp, num_inputs, 0.0f, buffer1, num_outputs);
+        addBiasBatched(buffer1, buffer1, ip_emb_ffn_d1_b_, 1, batch,
+                       num_outputs, activations_.ffn_activation, stream);
+      }
     }
 
     // embedding FFN dense 2
@@ -2297,14 +2494,22 @@ void AttentionBody<DataType>::Eval(int N, DataType* output,
                             batch, num_inputs, 1.0f, (const DataType*)ip_emb_w_,
                             num_inputs, (DataType*)scratch, num_inputs, 0.0f,
                             embedding, num_outputs);
-      addBiasBatched(embedding, embedding, ip_emb_b_, 1, batch, num_outputs,
-                     activations_.default_activation, stream);
-    }
-    // Input gating
-    if (has_gating_) {
-      applyInputGating<DataType>(embedding, embedding, ip_mult_gate_,
-                                 ip_add_gate_, N, 64, embedding_op_size_,
-                                 stream);
+      const bool fuse_input_gating = has_gating_ && num_outputs % 4 == 0 &&
+                                     num_outputs <= 4096;
+      if (fuse_input_gating) {
+        addBiasBatchedInputGating(
+            embedding, embedding, ip_emb_b_, ip_mult_gate_, ip_add_gate_, 1,
+            batch, num_outputs, 64, activations_.default_activation, stream);
+      } else {
+        addBiasBatched(embedding, embedding, ip_emb_b_, 1, batch, num_outputs,
+                       activations_.default_activation, stream);
+      }
+
+      if (has_gating_ && !fuse_input_gating) {
+        applyInputGating<DataType>(embedding, embedding, ip_mult_gate_,
+                                   ip_add_gate_, N, 64, embedding_op_size_,
+                                   stream);
+      }
     }
   }
 
@@ -2403,13 +2608,26 @@ void ValueHead<DataType>::Eval(int N, DataType* output, const DataType* input,
     const int num_outputs = wdl_ ? 3 : 1;
     const int batch = N;
     DataType* layer_out = (DataType*)output;
-    cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch,
-                          num_inputs, 1.0f, (const DataType*)ip2_val_w_,
-                          num_inputs, (DataType*)scratch, num_inputs, 0.0f,
-                          layer_out, num_outputs);
-    addVectors(layer_out, layer_out, ip2_val_b_, num_outputs * batch,
-               num_outputs * batch, num_outputs,
-               wdl_ ? ACTIVATION_NONE : ACTIVATION_TANH, stream);
+    bool fused_wdl_bias = false;
+#if defined(USE_CUBLAS_LT) && CUBLAS_VER_MAJOR >= 12
+    if constexpr (std::is_same<DataType, half>::value) {
+      if (wdl_) {
+        fused_wdl_bias = cublasLtGemmBias(
+            cublas, num_outputs, batch, num_inputs, ip2_val_w_, num_inputs, 0,
+            (const half*)scratch, num_inputs, 0, layer_out, num_outputs, 0,
+            ip2_val_b_, 0, 1, stream);
+      }
+    }
+#endif
+    if (!fused_wdl_bias) {
+      cublasXgemm<DataType>(
+          cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch, num_inputs,
+          1.0f, (const DataType*)ip2_val_w_, num_inputs, (DataType*)scratch,
+          num_inputs, 0.0f, layer_out, num_outputs);
+      addVectors(layer_out, layer_out, ip2_val_b_, num_outputs * batch,
+                 num_outputs * batch, num_outputs,
+                 wdl_ ? ACTIVATION_NONE : ACTIVATION_TANH, stream);
+    }
   }
 }
 
