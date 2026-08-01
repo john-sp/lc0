@@ -45,6 +45,7 @@
 namespace lczero {
 namespace {
 
+using Clock = std::chrono::high_resolution_clock;
 #if __cpp_lib_hardware_interference_size >= 201703L
 constexpr size_t kCacheLineSize = std::hardware_destructive_interference_size;
 #else
@@ -134,14 +135,93 @@ class DemuxingChildBackend {
 
   AssingType UseSharedBackend(std::shared_ptr<Network> shared) {
     network_ = shared;
-    return {BackendAttributes(*network_), network_->GetCapabilities()};
+    BackendAttributes attrs(*network_);
+    batch_times_ns_ =
+        std::make_unique<std::atomic<uint32_t>[]>(attrs.maximum_batch_size);
+    IdlePrediction prediction(Clock::now().time_since_epoch().count(), 0);
+    idle_prediction_.store(prediction, std::memory_order_relaxed);
+    return {attrs, network_->GetCapabilities()};
   }
 
   AssingType ConstructBackend(const std::string& name,
                               const std::optional<WeightsFile>& weights,
                               const OptionsDict& opts) {
     network_ = NetworkFactory::Get()->Create(name, weights, opts);
-    return {BackendAttributes(*network_), network_->GetCapabilities()};
+    BackendAttributes attrs(*network_);
+    batch_times_ns_ =
+        std::make_unique<std::atomic<uint32_t>[]>(attrs.maximum_batch_size);
+    IdlePrediction prediction(Clock::now().time_since_epoch().count(), 0);
+    idle_prediction_.store(prediction, std::memory_order_relaxed);
+    return {attrs, network_->GetCapabilities()};
+  }
+
+  int32_t GetIdlePrediction(Clock::time_point now) const {
+    IdlePrediction prediction =
+        idle_prediction_.load(std::memory_order_relaxed);
+    if (prediction.queued_work_ns_ == 0) {
+      return 0;
+    }
+    int64_t idle_time_ns =
+        prediction.last_batch_completed_ - now.time_since_epoch().count();
+    int64_t queued_work_ns = prediction.queued_work_ns_;
+    return std::max<int64_t>(0, idle_time_ns + queued_work_ns);
+  }
+
+  uint32_t AddBackendWork(int batch_size) {
+    uint32_t batch_time = 0;
+    batch_time +=
+        batch_times_ns_[batch_size - 1].load(std::memory_order_relaxed);
+    auto idle = idle_prediction_.load(std::memory_order_relaxed);
+    IdlePrediction new_idle = idle;
+    do {
+      if (idle.queued_work_ns_ == 0) {
+        // Idle backend requires setting completion time to be when GPU gets the
+        // work. We use CPU time to approximate the timing.
+        auto now = Clock::now();
+        new_idle.last_batch_completed_ = now.time_since_epoch().count();
+      }
+      new_idle.queued_work_ns_ += batch_time;
+    } while (!idle_prediction_.compare_exchange_weak(
+        idle, new_idle, std::memory_order_relaxed));
+    return batch_time;
+  }
+
+  constexpr static int BatchTimeUpdateWeight = 32;
+
+  void CompleteBackendWork(int batch_size, uint32_t predicted_batch_time) {
+    auto now = Clock::now();
+    auto idle = idle_prediction_.load(std::memory_order_relaxed);
+    IdlePrediction new_idle = idle;
+    do {
+      new_idle.last_batch_completed_ = now.time_since_epoch().count();
+      new_idle.queued_work_ns_ -= predicted_batch_time;
+    } while (!idle_prediction_.compare_exchange_weak(
+        idle, new_idle, std::memory_order_relaxed));
+
+    int32_t batch_time =
+        now.time_since_epoch().count() - idle.last_batch_completed_;
+    if (batch_time < 0) {
+      // Protect against out of order clocks.
+      return;
+    }
+    if (predicted_batch_time == 0) {
+      if (batch_times_ns_[batch_size - 1].compare_exchange_strong(
+              predicted_batch_time, batch_time, std::memory_order_relaxed)) {
+        // There was no average yet so we updated it to match the first batch
+        // time.
+        return;
+      }
+      // Other thread updated the prediction. We update the average using the
+      // new prediction.
+    }
+    batch_time = static_cast<int32_t>(batch_time - predicted_batch_time) /
+                 BatchTimeUpdateWeight;
+    if (batch_time == 0) {
+      // No need to update atomic value if prediction was accurate.
+      return;
+    }
+    batch_times_ns_[batch_size - 1].fetch_sub(batch_time,
+                                              std::memory_order_relaxed);
   }
 
   void Enqueue(DemuxingWork* work) {
@@ -162,9 +242,17 @@ class DemuxingChildBackend {
   void Worker(std::atomic<bool>& abort);
 
  private:
+  struct IdlePrediction {
+    uint64_t last_batch_completed_;
+    uint64_t queued_work_ns_;
+  };
+
   // Runtime constant variables
   std::vector<std::thread> threads_;
   std::shared_ptr<Network> network_;
+  std::unique_ptr<std::atomic<uint32_t>[]> batch_times_ns_;
+  // Atomically updated variables
+  alignas(kCacheLineSize) std::atomic<IdlePrediction> idle_prediction_;
   // Mutex protected queue
   Mutex mutex_;
   std::condition_variable dataready_cv_;
@@ -411,7 +499,12 @@ void DemuxingChildBackend::Worker(std::atomic<bool>& abort) {
       for (int i = work->start_; i < work->end_; i++) {
         work->computation_->AddInput(std::move(entries[i].input));
       }
+      uint32_t batch_time = AddBackendWork(work->end_ - work->start_);
       work->computation_->ComputeBlocking();
+      // TODO: This should read the time from the backend which could use more
+      // accurate GPU timers. CPU time has potential for random extra delay
+      // sometimes.
+      CompleteBackendWork(work->end_ - work->start_, batch_time);
       int expected = 0;
       if (work->source_->first_done_.compare_exchange_strong(
               expected, 1, std::memory_order_relaxed)) {
@@ -444,19 +537,30 @@ void DemuxingComputation::ComputeBlocking(ComputationCallback callback) {
   int extra_split_backends =
       splits - split_size_per_backend * backend_->backends_.size();
 
-  int partial_split_correction = 0;
-  if (extra_split_backends == 0 && !are_all_splits_full) {
-    partial_split_correction = 1;
+  struct BackendSortingOrder {
+    uint32_t idx;
+    uint32_t work_left;
+    auto operator<=>(const BackendSortingOrder& b) const {
+      return work_left <=> b.work_left;
+    }
+  };
+
+  // Do basic load balancing based on predicted time until idle.
+  std::vector<BackendSortingOrder> backend_order;
+  backend_order.reserve(backend_->backends_.size());
+
+  auto now = Clock::now();
+  for (uint32_t idx = 0; idx < backend_->backends_.size(); idx++) {
+    const auto& b = backend_->backends_[idx];
+    int32_t idle_time = b.GetIdlePrediction(now);
+    backend_order.emplace_back(idx, static_cast<uint32_t>(idle_time));
   }
 
-  // Find the first backend which got less work from the previous batch.
-  size_t start_index = backend_->start_index_.fetch_add(
-                           extra_split_backends + partial_split_correction,
-                           std::memory_order_relaxed) %
-                       backend_->backends_.size();
+  std::sort(backend_order.begin(), backend_order.end());
 
-  size_t end_index =
-      (start_index + extra_split_backends) % backend_->backends_.size();
+  // Find the first backend which got less work from the previous batch.
+  size_t start_index = 0;
+  size_t end_index = extra_split_backends;
   size_t work_start = 0;
   int work_items = split_size_per_backend > 0 ? backend_->backends_.size()
                                               : extra_split_backends;
@@ -466,29 +570,31 @@ void DemuxingComputation::ComputeBlocking(ComputationCallback callback) {
   size_t i = start_index;
   // First send work to backends which get extra work.
   int split_size = split_size_per_backend + 1;
-  for (; i != end_index; i = (i + 1) % backend_->backends_.size()) {
+  for (; i != end_index; i++) {
     assert(work_start != UsedBatchSize());
-    size_t next_i = (i + 1) % backend_->backends_.size();
-    size_t work_end = next_i == end_index && !are_all_splits_full ?
-       work_start + last_split_size + (split_size - 1) * step
-       : work_start + split_size * step;
+    size_t next_i = i + 1;
+    size_t idx = backend_order[i].idx;
+    size_t work_end =
+        next_i == end_index && !are_all_splits_full
+            ? work_start + last_split_size + (split_size - 1) * step
+            : work_start + split_size * step;
     work_end = std::min(work_end, UsedBatchSize());
     children_.emplace_back(this, work_start, work_end);
-    backend_->backends_[i].Enqueue(&children_.back());
+    backend_->backends_[idx].Enqueue(&children_.back());
     work_start = work_end;
   }
   // Queue remaining work items which don't get extra work.
   split_size--;
   if (split_size > 0) {
-    do {
+    for (; i != backend_order.size(); i++) {
       assert(work_start != UsedBatchSize());
       size_t work_end = work_start + split_size * step;
+      size_t idx = backend_order[i].idx;
       work_end = std::min(work_end, UsedBatchSize());
       children_.emplace_back(this, work_start, work_end);
-      backend_->backends_[i].Enqueue(&children_.back());
+      backend_->backends_[idx].Enqueue(&children_.back());
       work_start = work_end;
-      i = (i + 1) % backend_->backends_.size();
-    } while (i != start_index);
+    }
   }
   assert(work_start == UsedBatchSize());
   assert(work_items == (int)children_.size());
