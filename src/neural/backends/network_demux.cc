@@ -205,7 +205,8 @@ class DemuxingChildBackend {
         idle, new_idle, std::memory_order_relaxed));
   }
 
-  constexpr static int BatchTimeUpdateWeight = 32;
+  constexpr static int BatchTimeUpdateWeightMul = 3;
+  constexpr static int BatchTimeUpdateWeightDiv = 4;
 
   void CompleteBackendWork(int batch_size,
                            std::tuple<uint32_t, uint32_t> predicted_times) {
@@ -238,8 +239,8 @@ class DemuxingChildBackend {
       // new prediction.
     }
     int32_t batch_time_delta =
-        static_cast<int32_t>(batch_time - original_batch_time) /
-        BatchTimeUpdateWeight;
+        static_cast<int32_t>(batch_time - original_batch_time) *
+        BatchTimeUpdateWeightMul / BatchTimeUpdateWeightDiv;
     if (batch_time_delta == 0) {
       // No need to update atomic value if prediction was accurate.
       return;
@@ -257,8 +258,8 @@ class DemuxingChildBackend {
       }
     }
     int32_t average_delta =
-        static_cast<int32_t>(average_per_position - average) /
-        BatchTimeUpdateWeight;
+        static_cast<int32_t>(average_per_position - average) *
+        BatchTimeUpdateWeightMul / BatchTimeUpdateWeightDiv;
     batch_times_ns_[0].fetch_add(average_delta, std::memory_order_relaxed);
   }
 
