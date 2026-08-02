@@ -635,11 +635,13 @@ void DemuxingComputation::ComputeBlocking(ComputationCallback callback) {
                    ? extra_split_backends - (are_all_splits_full ? 0 : 1)
                    : backend_order.size() - (are_all_splits_full ? 0 : 1));
   // Select backends based on predicted end time of the largest batch size.
-  std::nth_element(
-      begin, last, backend_order.end(),
-      [](const BackendSortingOrder& a, const BackendSortingOrder& b) {
-        return a.work_left + a.work_cost[0] < b.work_left + b.work_cost[0];
-      });
+  if (extra_split_backends > 0 || !are_all_splits_full) {
+    std::nth_element(
+        begin, last, backend_order.end(),
+        [](const BackendSortingOrder& a, const BackendSortingOrder& b) {
+          return a.work_left + a.work_cost[0] < b.work_left + b.work_cost[0];
+        });
+  }
   begin = last;
 
   if (!are_all_splits_full && extra_split_backends > 0) {
