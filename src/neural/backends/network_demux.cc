@@ -364,7 +364,8 @@ class DemuxingBackend final : public Backend {
     minimum_batch_step_ =
         std::clamp(minimum_batch_step_, 1, attrs_.recommended_batch_size);
 
-    const int default_min_batch_step = minimum_batch_step_ * (backends_.size() - 1) / 2;
+    const int default_min_batch_step =
+        attrs_.preferred_batch_step * (backends_.size() + 1) / 2;
     lower_limit_batch_step_ = backend_options.GetOrDefault<int>(
         "lower_limit_min_batch_step", default_min_batch_step);
 
@@ -573,7 +574,7 @@ void DemuxingComputation::ComputeBlocking(ComputationCallback callback) {
   int step = backend_->attrs_.preferred_batch_step;
   if (UsedBatchSize() <
           backend_->minimum_batch_step_ * backend_->backends_.size() &&
-      UsedBatchSize() >= backend_->lower_limit_batch_step_) {
+      UsedBatchSize() > backend_->lower_limit_batch_step_) {
     step = backend_->minimum_batch_step_;
   }
   int splits = 1 + (UsedBatchSize() - 1) / step;
