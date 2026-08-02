@@ -450,7 +450,7 @@ class DemuxingBackend final : public Backend {
   unsigned lower_limit_batch_step_ = 1;
   bool uses_cpu_backend_ = false;
 
-  alignas(kCacheLineSize) SpinMutex load_balancing_mutex_;
+  alignas(kCacheLineSize) Mutex load_balancing_mutex_;
   alignas(kCacheLineSize) std::atomic<bool> abort_ = false;
 
   // Cache cold variables
@@ -619,7 +619,7 @@ void DemuxingComputation::ComputeBlocking(ComputationCallback callback) {
   std::vector<BackendSortingOrder> backend_order;
   backend_order.reserve(backend_->backends_.size());
 
-  SpinMutex::Lock lock(backend_->load_balancing_mutex_);
+  Mutex::Lock lock(backend_->load_balancing_mutex_);
 
   auto now = Clock::now();
   int batch_size1 = extra_split_backends == 0 ? split_size_per_backend * step

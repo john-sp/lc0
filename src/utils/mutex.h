@@ -78,6 +78,10 @@ class CAPABILITY("mutex") Mutex {
     ~Lock() RELEASE() {}
     std::unique_lock<std::mutex>& get_raw() { return lock_; }
 
+    void lock() ACQUIRE() { lock_.lock(); }
+    void unlock() RELEASE() { lock_.unlock(); }
+    bool owns_lock() const { return lock_.owns_lock(); }
+
    private:
     std::unique_lock<std::mutex> lock_;
   };
