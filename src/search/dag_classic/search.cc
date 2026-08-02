@@ -2515,7 +2515,7 @@ SearchWorker::PickNodesToExtendTask(int collision_limit, int tid,
 
         if (task_count > 0) {
           PickTaskGather::Initializer gather_init(full_path, history);
-          Node* node = node;
+          Node* node_copy = node;
 
           end = std::copy_if(
               visits_to_perform.begin() + 1, end, visits_to_perform.begin() + 1,
@@ -2524,7 +2524,7 @@ SearchWorker::PickNodesToExtendTask(int collision_limit, int tid,
                 if (IsBranchWorthSplitting(v)) {
                   int i = v.index_;
                   Node* child_node =
-                      cur_iters[i].GetOrSpawnNode(/* parent */ node);
+                      cur_iters[i].GetOrSpawnNode(/* parent */ node_copy);
                   Move move = cur_iters[i].GetMove();
                   tasks.emplace_back(*this, gather_init, child_node, move,
                                      int(v.visits_));
