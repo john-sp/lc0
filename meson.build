@@ -899,6 +899,7 @@ endif
         endif
       endif
     endforeach
+    deps += cc.find_library('dl', required: false)
     if not nvtx_header_found
       error('nvtx3/nvtx3.hpp header not found in cudnn_include paths')
     endif
