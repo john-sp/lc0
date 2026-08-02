@@ -235,12 +235,14 @@ class DemuxingChildBackend {
       // Protect against out of order clocks.
       return;
     }
+
+    bool updated = false;
     if (original_batch_time == 0) {
       if (batch_times_ns_[batch_size].compare_exchange_strong(
               original_batch_time, batch_time, std::memory_order_relaxed)) {
         // There was no average yet so we updated it to match the first batch
         // time.
-        return;
+        updated = true;
       }
       // Other thread updated the prediction. We update the average using the
       // new prediction.
@@ -250,10 +252,12 @@ class DemuxingChildBackend {
         BatchTimeUpdateWeightMul / BatchTimeUpdateWeightDiv;
     if (batch_time_delta == 0) {
       // No need to update atomic value if prediction was accurate.
-      return;
+      updated = true;
     }
-    batch_times_ns_[batch_size].fetch_add(batch_time_delta,
-                                          std::memory_order_relaxed);
+    if (!updated) {
+      batch_times_ns_[batch_size].fetch_add(batch_time_delta,
+                                            std::memory_order_relaxed);
+    }
 
     uint32_t average = batch_times_ns_[0].load(std::memory_order_relaxed);
     if (average == 0) {
