@@ -157,16 +157,23 @@ class DemuxingChildBackend {
     return {attrs, network_->GetCapabilities()};
   }
 
-  int32_t GetIdlePrediction(Clock::time_point now) const {
+  std::tuple<uint32_t, uint32_t, uint32_t> GetIdlePrediction(
+      Clock::time_point now, int size1, int size2) const {
     IdlePrediction prediction =
         idle_prediction_.load(std::memory_order_relaxed);
+    uint32_t cost1 = batch_times_ns_[size1].load(std::memory_order_relaxed);
+    uint32_t cost2 = 0;
+    if (size2 > 0) {
+      cost2 = batch_times_ns_[size2].load(std::memory_order_relaxed);
+    }
+
     if (prediction.queued_work_ns_ == 0) {
-      return 0;
+      return {0, cost1, cost2};
     }
     int64_t idle_time_ns =
         prediction.last_batch_completed_ - now.time_since_epoch().count();
     int64_t queued_work_ns = prediction.queued_work_ns_;
-    return std::max<int64_t>(0, idle_time_ns + queued_work_ns);
+    return {std::max<int64_t>(0, idle_time_ns + queued_work_ns), cost1, cost2};
   }
 
   std::tuple<uint32_t, uint32_t> AddBackendWork(int batch_size) {
@@ -589,6 +596,7 @@ void DemuxingComputation::ComputeBlocking(ComputationCallback callback) {
   struct BackendSortingOrder {
     uint32_t idx;
     uint32_t work_left;
+    std::array<uint32_t, 2> work_cost;
     auto operator<=>(const BackendSortingOrder& b) const {
       return work_left <=> b.work_left;
     }
@@ -601,13 +609,45 @@ void DemuxingComputation::ComputeBlocking(ComputationCallback callback) {
   SpinMutex::Lock lock(backend_->load_balancing_mutex_);
 
   auto now = Clock::now();
+  int batch_size1 = extra_split_backends == 0 ? split_size_per_backend * step
+                    : extra_split_backends > 1 ||
+                            (extra_split_backends == 1 && !are_all_splits_full)
+                        ? (split_size_per_backend + 1) * step
+                        : last_split_size + split_size_per_backend * step;
+  int batch_size2 = are_all_splits_full ? 0
+                    : extra_split_backends == 0
+                        ? last_split_size + (split_size_per_backend - 1) * step
+                        : last_split_size + split_size_per_backend * step;
   for (uint32_t idx = 0; idx < backend_->backends_.size(); idx++) {
     const auto& b = backend_->backends_[idx];
-    int32_t idle_time = b.GetIdlePrediction(now);
-    backend_order.emplace_back(idx, static_cast<uint32_t>(idle_time));
+    auto [idle_time, cost1, cost2] =
+        b.GetIdlePrediction(now, batch_size1, batch_size2);
+    backend_order.emplace_back(idx, idle_time, std::array{cost1, cost2});
   }
 
-  std::sort(backend_order.begin(), backend_order.end());
+  auto begin = backend_order.begin();
+  auto last = backend_order.begin() +
+              (extra_split_backends > 0
+                   ? extra_split_backends - (are_all_splits_full ? 0 : 1)
+                   : backend_order.size() - (are_all_splits_full ? 0 : 1));
+  // Select backends based on predicted end time of the largest batch size.
+  std::nth_element(
+      begin, last, backend_order.end(),
+      [](const BackendSortingOrder& a, const BackendSortingOrder& b) {
+        return a.work_left + a.work_cost[0] < b.work_left + b.work_cost[0];
+      });
+  begin = last;
+
+  if (!are_all_splits_full && extra_split_backends > 0) {
+    // Select the shortest predicted end time for the batch with a partial
+    // split to be the middle point.
+    std::nth_element(
+        begin, begin + 1, backend_order.end(),
+        [](const BackendSortingOrder& a, const BackendSortingOrder& b) {
+          return a.work_left + a.work_cost[1] < b.work_left + b.work_cost[1];
+        });
+    begin = begin + 1;
+  }
 
   // Find the first backend which got less work from the previous batch.
   size_t start_index = 0;
