@@ -55,12 +55,16 @@ constexpr size_t kCacheLineSize = 64;
 class DemuxingComputation;
 
 struct DemuxingWork {
+  struct PredictedTimes {
+    uint32_t prediction = 0;
+    uint32_t original : 31 = 0;
+    bool queue_was_idle_ : 1 = false;
+  };
   DemuxingComputation* source_ = nullptr;
   std::unique_ptr<NetworkComputation> computation_;
   int start_ = 0;
-  int end_ : 31 = 0;
-  bool first_in_queue_ : 1 = false;
-  std::tuple<uint32_t, uint32_t> predicted_times_;
+  int end_ = 0;
+  PredictedTimes predicted_times_;
 
   DemuxingWork(int sample) : end_(sample) {}
   DemuxingWork(DemuxingComputation* source, int start, int end)
@@ -187,11 +191,13 @@ class DemuxingChildBackend {
     return {batch_time, original_batch_time};
   }
 
-  std::tuple<uint32_t, uint32_t> AddBackendWork(int batch_size) {
+  DemuxingWork::PredictedTimes AddBackendWork(int batch_size) {
     auto [batch_time, original_batch_time] = GetBatchTime(batch_size);
     auto idle = idle_prediction_.load(std::memory_order_relaxed);
     IdlePrediction new_idle = idle;
+    bool backend_idle = false;
     do {
+      backend_idle = new_idle.queued_work_ns_ == 0;
       if (idle.queued_work_ns_ == 0) {
         // Idle backend requires setting completion time to be when GPU gets the
         // work. We use CPU time to approximate the timing.
@@ -201,7 +207,7 @@ class DemuxingChildBackend {
       new_idle.queued_work_ns_ += batch_time;
     } while (!idle_prediction_.compare_exchange_weak(
         idle, new_idle, std::memory_order_relaxed));
-    return {batch_time, original_batch_time};
+    return {batch_time, original_batch_time, backend_idle};
   }
 
   void StartComputationWhenIdle() {
@@ -220,8 +226,8 @@ class DemuxingChildBackend {
   constexpr static int BatchTimeUpdateWeightDiv = 4;
 
   void CompleteBackendWork(int batch_size,
-                           std::tuple<uint32_t, uint32_t> predicted_times) {
-    auto [predicted_batch_time, original_batch_time] = predicted_times;
+                           DemuxingWork::PredictedTimes predicted_times) {
+    auto predicted_batch_time = predicted_times.prediction, original_batch_time= predicted_times.original;
     auto now = Clock::now();
     auto idle = idle_prediction_.load(std::memory_order_relaxed);
     IdlePrediction new_idle = idle;
@@ -281,7 +287,6 @@ class DemuxingChildBackend {
   void Enqueue(DemuxingWork* work) {
     {
       Mutex::Lock lock(mutex_);
-      work->first_in_queue_ = queue_.empty();
       work->predicted_times_ = AddBackendWork(work->end_ - work->start_);
       queue_.push(work);
     }
@@ -562,7 +567,7 @@ void DemuxingChildBackend::Worker(std::atomic<bool>& abort) {
       for (int i = work->start_; i < work->end_; i++) {
         work->computation_->AddInput(std::move(entries[i].input));
       }
-      if (work->first_in_queue_) {
+      if (work->predicted_times_.queue_was_idle_) {
         StartComputationWhenIdle();
       }
       work->computation_->ComputeBlocking();
