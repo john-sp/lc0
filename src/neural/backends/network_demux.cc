@@ -619,13 +619,15 @@ void DemuxingComputation::ComputeBlocking(ComputationCallback callback) {
   auto now = Clock::now();
   int batch_size1 = extra_split_backends == 0 ? split_size_per_backend * step
                     : extra_split_backends > 1 ||
-                            (extra_split_backends == 1 && !are_all_splits_full)
+                            (extra_split_backends == 1 && are_all_splits_full)
                         ? (split_size_per_backend + 1) * step
                         : last_split_size + split_size_per_backend * step;
-  int batch_size2 = are_all_splits_full ? 0
-                    : extra_split_backends == 0
-                        ? last_split_size + (split_size_per_backend - 1) * step
-                        : last_split_size + split_size_per_backend * step;
+  int batch_size2 =
+      are_all_splits_full || (extra_split_backends == 1 && !are_all_splits_full)
+          ? 0
+      : extra_split_backends == 0
+          ? last_split_size + (split_size_per_backend - 1) * step
+          : last_split_size + split_size_per_backend * step;
   for (uint32_t idx = 0; idx < backend_->backends_.size(); idx++) {
     const auto& b = backend_->backends_[idx];
     auto [idle_time, cost1, cost2] =
