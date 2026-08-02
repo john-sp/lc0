@@ -161,10 +161,10 @@ class DemuxingChildBackend {
       Clock::time_point now, int size1, int size2) const {
     IdlePrediction prediction =
         idle_prediction_.load(std::memory_order_relaxed);
-    uint32_t cost1 = batch_times_ns_[size1].load(std::memory_order_relaxed);
+    uint32_t cost1 = std::get<0>(GetBatchTime(size1));
     uint32_t cost2 = 0;
     if (size2 > 0) {
-      cost2 = batch_times_ns_[size2].load(std::memory_order_relaxed);
+      cost2 = std::get<0>(GetBatchTime(size2));
     }
 
     if (prediction.queued_work_ns_ == 0) {
@@ -176,15 +176,19 @@ class DemuxingChildBackend {
     return {std::max<int64_t>(0, idle_time_ns + queued_work_ns), cost1, cost2};
   }
 
-  std::tuple<uint32_t, uint32_t> AddBackendWork(int batch_size) {
-    uint32_t batch_time = 0, original_batch_time = 0;
+  std::tuple<uint32_t, uint32_t> GetBatchTime(int batch_size) const {
+    uint32_t batch_time, original_batch_time;
     original_batch_time = batch_time =
         batch_times_ns_[batch_size].load(std::memory_order_relaxed);
-
     if (batch_time == 0) {
       batch_time =
           batch_times_ns_[0].load(std::memory_order_relaxed) * batch_size;
     }
+    return {batch_time, original_batch_time};
+  }
+
+  std::tuple<uint32_t, uint32_t> AddBackendWork(int batch_size) {
+    auto [batch_time, original_batch_time] = GetBatchTime(batch_size);
     auto idle = idle_prediction_.load(std::memory_order_relaxed);
     IdlePrediction new_idle = idle;
     do {
