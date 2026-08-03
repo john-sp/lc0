@@ -27,6 +27,8 @@
 
 #include "utils/numa.h"
 
+#include <numeric>
+
 #include "numa_config.h"
 #if HAVE_LIBHWLOC
 #include <hwloc.h>
@@ -75,6 +77,14 @@ const OptionId kSearchNodeOptionId{
     {.long_flag = "search-numa-node",
      .uci_option = "SearchNUMANode",
      .help_text = "The NUMA node to use for the search threads.",
+     .visibility = OptionId::kProOnly}};
+const OptionId kSearchWorkerShareCoreId{
+    {.long_flag = "use-search-worker-share-core",
+     .uci_option = "UseSearchWorkerShareCore",
+     .help_text = "Make two search workers share the same physical CPU if CPU "
+                  "supports SMT. It can be useful if the search worker thread "
+                  "won't be a bottleneck so they only reserve a physical core "
+                  "instead of default two.",
      .visibility = OptionId::kProOnly}};
 const OptionId kShuffleCoreReservationOptionId{
     {.long_flag = "shuffle-core-reservation",
@@ -318,9 +328,8 @@ struct Config {
   void SetMembind(const CpuSet& cpuset) {
     assert(topology_);
     assert(cpuset);
-    ReportHWLocError(
-        hwloc_set_membind(topology_, cpuset, HWLOC_MEMBIND_BIND,
-                          HWLOC_MEMBIND_THREAD));
+    ReportHWLocError(hwloc_set_membind(topology_, cpuset, HWLOC_MEMBIND_BIND,
+                                       HWLOC_MEMBIND_THREAD));
   }
 
   void GetAffinity(CpuSet& cpuset) {
@@ -394,9 +403,11 @@ struct Config {
 
   void GetNumaSet(size_t numa_id, CpuSet& cpuset) const {
     assert(numa_id < GetNodeCount());
+    auto node_type =
+        GetNodeCount() == 1 ? HWLOC_OBJ_MACHINE : HWLOC_OBJ_NUMANODE;
     hwloc_obj_t node_obj;
-    ReportHWLocError(node_obj = hwloc_get_obj_by_type(
-                         topology_, HWLOC_OBJ_NUMANODE, numa_id));
+    ReportHWLocError(node_obj =
+                         hwloc_get_obj_by_type(topology_, node_type, numa_id));
     cpuset |= node_obj->cpuset;
     cpuset &= ~reserved_set_;
     if (!cpuset) {
@@ -467,27 +478,17 @@ struct Config {
     hwloc_obj_t numa_obj;
     reserved_set_.Clear();
     reserved_cores_.clear();
+    auto nodetype =
+        GetNodeCount() == 1 ? HWLOC_OBJ_MACHINE : HWLOC_OBJ_NUMANODE;
 
-    ReportHWLocError(numa_obj = hwloc_get_obj_by_type(
-                         topology_, HWLOC_OBJ_NUMANODE, node_id));
+    ReportHWLocError(numa_obj =
+                         hwloc_get_obj_by_type(topology_, nodetype, node_id));
     ReserveCores(numa_obj, count);
   }
 
-  void ReserveCores(size_t count) {
-    CERR << "Reserving " << count << " cores for search workers.";
-    hwloc_obj_t root_obj = hwloc_get_root_obj(topology_);
-    reserved_set_.Clear();
-    reserved_cores_.clear();
-
-    ReserveCores(root_obj, count);
-  }
-
   void ReserveCores(hwloc_obj_t parent, size_t count) {
-    CERR << "Reserving " << parent << " with " << count
-         << " cores for search workers.";
     ObjectRange cores{topology_, parent, HWLOC_OBJ_CORE};
     std::vector<hwloc_obj_t> core_objs;
-    CERR << "Found " << &cores;
     std::copy(cores.begin(), cores.end(), std::back_inserter(core_objs));
     // Use random shuffle to avoid using same cores for all SearchWorkers when
     // multiple lc0 process are runnig at the same time.
@@ -521,12 +522,20 @@ struct Config {
                    [arity](hwloc_obj_t obj) { return obj->arity >= arity; });
       arity++;
     }
-    if (core_objs.size() > count) {
-      CERR << "Only " << count
-           << " cores requested, trimming reserved cores from "
-           << core_objs.size() << ".";
-      core_objs.erase(core_objs.begin() + count, core_objs.end());
+
+    auto end = std::find_if(
+        core_objs.begin(), core_objs.end(),
+        [selected = size_t{0}, this, count](hwloc_obj_t obj) mutable {
+          bool rv = count <= selected;
+          selected += use_search_shared_core_ ? obj->arity : 1;
+          return rv;
+        });
+    if (end != core_objs.end()) {
+      core_objs.erase(end, core_objs.end());
     }
+    CERR << "Reserved " << core_objs.size()
+         << (use_search_shared_core_ ? " shared cores for " : " cores for ")
+         << count << " search workers.";
     std::for_each(core_objs.begin(), core_objs.end(),
                   [&](hwloc_obj_t obj) { reserved_set_ |= obj->cpuset; });
     reserved_cores_ = std::move(core_objs);
@@ -540,12 +549,15 @@ struct Config {
     cpuset |= core->cpuset;
   }
 
-  bool CheckReservedCores(size_t num_workers) {
-    return reserved_cores_.size() == num_workers;
-  }
-
   bool CheckReservedCores(size_t node_id, size_t num_workers) {
-    if (reserved_cores_.size() != num_workers) return false;
+    if (use_search_shared_core_) {
+      if (reserved_cores_.size() != num_workers) return false;
+    } else {
+      size_t threads = std::accumulate(
+          reserved_cores_.begin(), reserved_cores_.end(), size_t{0},
+          [](size_t sum, hwloc_obj_t obj) { return sum + obj->arity; });
+      if (threads < num_workers || threads > num_workers + 1) return false;
+    }
     hwloc_obj_t node_obj;
     ReportHWLocError(node_obj = hwloc_get_obj_by_type(
                          topology_, HWLOC_OBJ_NUMANODE, node_id));
@@ -579,12 +591,18 @@ struct Config {
         options_->Get<bool>(kShuffleCoreReservationOptionId);
     use_search_thread_affinity_ =
         options_->Get<bool>(kUseThreadAfinityOptionId) && IsAffinitySupported();
+    bool use_search_shared_core = options_->Get<bool>(kSearchWorkerShareCoreId);
     size_t node_id = options_->Get<int>(kSearchNodeOptionId);
     if (all_cores != use_all_cores_) {
       use_all_cores_ = all_cores;
       reserved_set_.Clear();
       reserved_cores_.clear();
       ProcessProcessors();
+    }
+    if (use_search_shared_core != use_search_shared_core_) {
+      use_search_shared_core_ = use_search_shared_core;
+      reserved_set_.Clear();
+      reserved_cores_.clear();
     }
     if (shuffle_reservations != shuffle_reservations_) {
       shuffle_reservations_ = shuffle_reservations;
@@ -632,6 +650,7 @@ struct Config {
   bool use_search_thread_affinity_ = true;
   bool use_all_cores_ = false;
   bool shuffle_reservations_ = true;
+  bool use_search_shared_core_ = false;
   size_t search_node_id_ = 0;
   GeneratorType rng_;
 
@@ -648,6 +667,7 @@ void Numa::Init(OptionsParser* parser) {
   parser->Add<BoolOption>(kUseThreadAfinityOptionId) = false;
   parser->Add<BoolOption>(kUseAllCoresOptionId) = false;
   parser->Add<BoolOption>(kShuffleCoreReservationOptionId) = true;
+  parser->Add<BoolOption>(kSearchWorkerShareCoreId) = false;
   parser->Add<IntOption>(kSearchNodeOptionId, 0, 512) = 0;
 #if HAVE_LIBHWLOC
   auto config = Config::Lock();
@@ -677,24 +697,16 @@ void Numa::BindThread([[maybe_unused]] size_t id) {
 #endif
 }
 
-void Numa::ReserveSearchWorkers([[maybe_unused]] size_t num_workers,
-                                bool runs_on_cpu) {
+void Numa::ReserveSearchWorkers([[maybe_unused]] size_t num_workers) {
 #if HAVE_LIBHWLOC
   auto config = Config::Lock();
   config->UpdateOptions();
   if (!config->use_search_thread_affinity_) return;
   unsigned node_id = config->search_node_id_;
-  if (runs_on_cpu) {
-    if (config->CheckReservedCores(node_id, num_workers)) {
-      return;
-    }
-    config->ReserveCoresOnNode(node_id, num_workers);
-  } else {
-    if (config->CheckReservedCores(num_workers)) {
-      return;
-    }
-    config->ReserveCores(num_workers);
+  if (config->CheckReservedCores(node_id, num_workers)) {
+    return;
   }
+  config->ReserveCoresOnNode(node_id, num_workers);
 
   CpuSet cpuset;
   cpuset |= config->initial_affinity_;

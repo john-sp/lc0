@@ -45,7 +45,7 @@ class Numa {
 
   // Reserve cores for SearchWorkers.
   // Mustbe called before any threads are bound.
-  static void ReserveSearchWorkers(size_t num_search_workers, bool runs_on_cpu = false);
+  static void ReserveSearchWorkers(size_t num_search_workers);
 
   // Bind task workers to a socket.
   static void BindTaskWorkersToSocket();
