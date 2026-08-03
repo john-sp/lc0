@@ -421,13 +421,30 @@ struct Config {
 
 #if HAVE_CUDART
   void GetCudaDeviceSet(int device_id, CpuSet& cpuset) const {
-    cudaDeviceProp cuda_props;
-    cudaGetDeviceProperties(&cuda_props, device_id);
+#if CUDART_VERSION >= 12020
+    int host_numa_id = 0;
+    cudaError_t err =
+        cudaDeviceGetAttribute(&host_numa_id, cudaDevAttrHostNumaId, device_id);
+    if (err != cudaSuccess) {
+      CERR << "Failed to get NUMA node for CUDA device " << device_id << ": "
+           << cudaGetErrorString(err);
+      throw Exception("Failed to get NUMA node for CUDA device " +
+                      std::to_string(device_id) + ": " +
+                      std::string(cudaGetErrorString(err)));
+    }
 
-    CERR << "Bind GPU " << device_id << " thread to NUMA node "
-         << cuda_props.hostNumaId;
+    CERR << "Bind GPU " << device_id << " thread to NUMA node " << host_numa_id;
 
-    GetNumaSet(cuda_props.hostNumaId, cpuset);
+    if (host_numa_id < 0 || (size_t)host_numa_id >= GetNodeCount()) {
+      cpuset |= initial_affinity_ & ~reserved_set_;
+      return;
+    }
+
+    GetNumaSet(host_numa_id, cpuset);
+#else
+    cpuset |= initial_affinity_ & ~reserved_set_;
+    return;
+#endif
   }
 #endif
 
