@@ -35,6 +35,9 @@
 #ifdef _WIN32
 #include <hwloc/windows.h>
 #endif
+#if HAVE_CUDART
+#include <cuda_runtime.h>
+#endif
 #endif
 
 #include <cassert>
@@ -416,6 +419,18 @@ struct Config {
     }
   }
 
+#if HAVE_CUDART
+  void GetCudaDeviceSet(int device_id, CpuSet& cpuset) const {
+    cudaDeviceProp cuda_props;
+    cudaGetDeviceProperties(&cuda_props, device_id);
+
+    CERR << "Bind GPU " << device_id << " thread to NUMA node "
+         << cuda_props.hostNumaId;
+
+    GetNumaSet(cuda_props.hostNumaId, cpuset);
+  }
+#endif
+
   struct ObjectIterator {
     using iterator_category = std::bidirectional_iterator_tag;
     using value_type = hwloc_obj_t;
@@ -740,4 +755,15 @@ void Numa::BindThreadToNode(int node_id) {
   config->SetMembind(cpuset);
 #endif
 }
+
+void Numa::BindThreadToCudaDevice(int device_id) {
+#if HAVE_LIBHWLOC && HAVE_CUDART
+  auto config = Config::Lock();
+  CpuSet cpuset;
+  config->GetCudaDeviceSet(device_id, cpuset);
+  config->SetAffinity(cpuset);
+  config->SetMembind(cpuset);
+#endif
+}
+
 }  // namespace lczero

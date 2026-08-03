@@ -51,6 +51,8 @@ class Numa {
   static void BindTaskWorkersToSocket();
 
   static void BindThreadToNode(int node_id);
+
+  static void BindThreadToCudaDevice(int device_id);
 };
 
 }  // namespace lczero

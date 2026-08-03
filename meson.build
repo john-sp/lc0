@@ -115,18 +115,6 @@ elif get_option('malloc') != ''
   deps += cc.find_library(get_option('malloc'), required: true)
 endif
 
-
-# libhwloc for thread affinity and numa support
-numa_config = configuration_data()
-hwloc_dep = dependency('hwloc', required: false, fallback: ['hwloc'])
-if hwloc_dep.found()
-  deps += hwloc_dep
-  numa_config.set('HAVE_LIBHWLOC', '1')
-else
-  numa_config.set('HAVE_LIBHWLOC', '0')
-endif
-configure_file(output: 'numa_config.h', configuration: numa_config)
-
 # ONNX and HLO protobufs.
 files += gen.process('proto/onnx.proto',
   preserve_path_from : meson.current_source_dir())
@@ -869,6 +857,24 @@ endif
   else
     deps += dependency('zlib', fallback: ['zlib', 'zlib_dep'])
   endif
+
+  ## ~~~~~
+  ## hwloc
+  ## ~~~~~
+  hwloc_dep = dependency('hwloc', required: false, fallback: ['hwloc'])
+  numa_config = configuration_data()
+  if hwloc_dep.found()
+    deps += hwloc_dep
+    numa_config.set('HAVE_LIBHWLOC', '1')
+  else
+    numa_config.set('HAVE_LIBHWLOC', '0')
+  endif
+  if cu_dart.found()
+    numa_config.set('HAVE_CUDART', '1')
+  else
+    numa_config.set('HAVE_CUDART', '0')
+  endif
+  configure_file(output: 'numa_config.h', configuration: numa_config)
 
   trace_lib = get_option('trace_library')
   trace_config = configuration_data()

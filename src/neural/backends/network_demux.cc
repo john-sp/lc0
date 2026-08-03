@@ -92,15 +92,20 @@ class DemuxingChildBackend {
                       const std::optional<WeightsFile>& weights,
                       const OptionsDict& opts, std::atomic<bool>& abort,
                       size_t shared_count, size_t shared_stride) {
-    int numa_node = opts.GetOrDefault<int>("numa_node", -1);
     AssignPromise promise;
     auto rv = promise.get_future();
     threads_.emplace_back([this, name, &weights, opts,
-                           promise = std::move(promise), &abort, numa_node,
+                           promise = std::move(promise), &abort,
                            shared_count, shared_stride]() mutable {
       try {
+        int numa_node = opts.GetOrDefault<int>("numa_node", -1);
+        bool numa_cuda_gpu = opts.GetOrDefault<bool>("numa_cuda_gpu", false);
         if (numa_node >= 0) {
           Numa::BindThreadToNode(numa_node);
+        }
+        if (numa_cuda_gpu) {
+          int gpu = opts.GetOrDefault<int>("gpu", 0);
+          Numa::BindThreadToCudaDevice(gpu);
         }
         AssingType result =
             shared_count > 0 ? ConstructBackend(name, weights, opts)
