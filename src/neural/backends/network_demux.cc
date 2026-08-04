@@ -82,7 +82,7 @@ class DemuxingChildBackend;
 
 class DemuxingChildBackend {
  public:
-  using AssingType = std::tuple<BackendAttributes, const NetworkCapabilities&>;
+  using AssingType = std::tuple<BackendAttributes, const NetworkCapabilities*>;
   using AssignFuture = std::future<AssingType>;
   using AssignPromise = std::promise<AssingType>;
 
@@ -151,7 +151,7 @@ class DemuxingChildBackend {
         std::make_unique<std::atomic<uint32_t>[]>(attrs.maximum_batch_size + 1);
     IdlePrediction prediction(Clock::now().time_since_epoch().count(), 0);
     idle_prediction_.store(prediction, std::memory_order_relaxed);
-    return {attrs, network_->GetCapabilities()};
+    return {attrs, &network_->GetCapabilities()};
   }
 
   AssingType ConstructBackend(const std::string& name,
@@ -163,7 +163,7 @@ class DemuxingChildBackend {
         std::make_unique<std::atomic<uint32_t>[]>(attrs.maximum_batch_size + 1);
     IdlePrediction prediction(Clock::now().time_since_epoch().count(), 0);
     idle_prediction_.store(prediction, std::memory_order_relaxed);
-    return {attrs, network_->GetCapabilities()};
+    return {attrs, &network_->GetCapabilities()};
   }
 
   std::tuple<uint32_t, uint32_t, uint32_t> GetIdlePrediction(
@@ -366,13 +366,13 @@ class DemuxingBackend final : public Backend {
       if (i == 0) {
         i = 1;
         attrs_ = attr;
-        input_format_ = caps.input_format;
+        input_format_ = caps->input_format;
       } else {
         attrs_ += attr;
-        if (input_format_ != caps.input_format) {
+        if (input_format_ != caps->input_format) {
           throw Exception("Incompatible input formats, " +
                           std::to_string(input_format_) + " vs " +
-                          std::to_string(caps.input_format));
+                          std::to_string(caps->input_format));
         }
       }
       if (attr.runs_on_cpu) {
