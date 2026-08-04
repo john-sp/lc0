@@ -36,7 +36,7 @@
 #include <hwloc/windows.h>
 #endif
 #if HAVE_CUDART
-#include <cuda_runtime.h>
+#include <hwloc/cudart.h>
 #endif
 #endif
 
@@ -235,8 +235,26 @@ struct Config {
   };
   Config() : rng_(std::random_device{}()) {
     ReportHWLocError(hwloc_topology_init(&initial_topology_));
-    // TODO: Add filters to make discovery faster.
     // TODO: Maybe use xml loading instead of detection.
+    // Blacklist gl component because we don't use OpenGL and it has a risk of
+    // hanging when trying to connect to X server.
+    // hwloc_topoplogy_set_components gives an error if named component isn't
+    // installed. We want to try to disable components without checking their
+    // existence first. These calls don't check for errors.
+    hwloc_topology_set_components(
+        initial_topology_, HWLOC_TOPOLOGY_COMPONENTS_FLAG_BLACKLIST, "gl");
+    // Blacklist components we don't use to speed up detection.
+    hwloc_topology_set_components(
+        initial_topology_, HWLOC_TOPOLOGY_COMPONENTS_FLAG_BLACKLIST, "opencl");
+    hwloc_topology_set_components(
+        initial_topology_, HWLOC_TOPOLOGY_COMPONENTS_FLAG_BLACKLIST, "cuda");
+    hwloc_topology_set_components(
+        initial_topology_, HWLOC_TOPOLOGY_COMPONENTS_FLAG_BLACKLIST, "rocm");
+    hwloc_topology_set_components(initial_topology_,
+                                  HWLOC_TOPOLOGY_COMPONENTS_FLAG_BLACKLIST,
+                                  "levelzero");
+    ReportHWLocError(hwloc_topology_set_io_types_filter(
+        initial_topology_, HWLOC_TYPE_FILTER_KEEP_IMPORTANT));
     ReportHWLocError(hwloc_topology_load(initial_topology_));
     ReportHWLocError(hwloc_topology_dup(&topology_, initial_topology_));
 #if HWLOC_API_VERSION >= 0x00020400
@@ -421,30 +439,18 @@ struct Config {
 
 #if HAVE_CUDART
   void GetCudaDeviceSet(int device_id, CpuSet& cpuset) const {
-#if CUDART_VERSION >= 12020
-    int host_numa_id = 0;
-    cudaError_t err =
-        cudaDeviceGetAttribute(&host_numa_id, cudaDevAttrHostNumaId, device_id);
-    if (err != cudaSuccess) {
-      CERR << "Failed to get NUMA node for CUDA device " << device_id << ": "
-           << cudaGetErrorString(err);
-      throw Exception("Failed to get NUMA node for CUDA device " +
-                      std::to_string(device_id) + ": " +
-                      std::string(cudaGetErrorString(err)));
+    hwloc_obj_t device_obj = hwloc_get_next_pcidev(topology_, nullptr);
+    ReportHWLocError(device_obj =
+                         hwloc_cudart_get_device_pcidev(topology_, device_id));
+    hwloc_obj_t numa_obj;
+    ReportHWLocError(numa_obj =
+                         hwloc_get_non_io_ancestor_obj(topology_, device_obj));
+    cpuset |= numa_obj->cpuset;
+    cpuset &= ~reserved_set_;
+    if (!cpuset) {
+      // all reserved, return full socket
+      cpuset |= numa_obj->cpuset;
     }
-
-    CERR << "Bind GPU " << device_id << " thread to NUMA node " << host_numa_id;
-
-    if (host_numa_id < 0 || (size_t)host_numa_id >= GetNodeCount()) {
-      cpuset |= initial_affinity_ & ~reserved_set_;
-      return;
-    }
-
-    GetNumaSet(host_numa_id, cpuset);
-#else
-    cpuset |= initial_affinity_ & ~reserved_set_;
-    return;
-#endif
   }
 #endif
 
