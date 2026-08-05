@@ -123,15 +123,16 @@ class DemuxingChildBackend {
           nn_threads = network_->GetThreads() + !network_->IsCpu();
         }
         for (int i = 1; i < nn_threads; i++) {
-          threads_.emplace_back([&] {
-            if (numa_node >= 0) {
-              Numa::BindThreadToNode(numa_node);
-            }
-            if (numa_cuda_gpu) {
-              Numa::BindThreadToCudaDevice(gpu);
-            }
-            Worker(abort);
-          });
+          threads_.emplace_back(
+              [&abort, this, numa_node, numa_cuda_gpu, gpu]() {
+                if (numa_node >= 0) {
+                  Numa::BindThreadToNode(numa_node);
+                }
+                if (numa_cuda_gpu) {
+                  Numa::BindThreadToCudaDevice(gpu);
+                }
+                Worker(abort);
+              });
         }
         for (auto& f : other_backends) {
           // Wait for the other shared backends and check for exceptions.
