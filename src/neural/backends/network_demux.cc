@@ -95,16 +95,16 @@ class DemuxingChildBackend {
     AssignPromise promise;
     auto rv = promise.get_future();
     threads_.emplace_back([this, name, &weights, opts,
-                           promise = std::move(promise), &abort,
-                           shared_count, shared_stride]() mutable {
+                           promise = std::move(promise), &abort, shared_count,
+                           shared_stride]() mutable {
       try {
         int numa_node = opts.GetOrDefault<int>("numa_node", -1);
         bool numa_cuda_gpu = opts.GetOrDefault<bool>("numa_cuda_gpu", false);
         if (numa_node >= 0) {
           Numa::BindThreadToNode(numa_node);
         }
+        int gpu = opts.GetOrDefault<int>("gpu", 0);
         if (numa_cuda_gpu) {
-          int gpu = opts.GetOrDefault<int>("gpu", 0);
           Numa::BindThreadToCudaDevice(gpu);
         }
         AssingType result =
@@ -126,6 +126,9 @@ class DemuxingChildBackend {
           threads_.emplace_back([&] {
             if (numa_node >= 0) {
               Numa::BindThreadToNode(numa_node);
+            }
+            if (numa_cuda_gpu) {
+              Numa::BindThreadToCudaDevice(gpu);
             }
             Worker(abort);
           });
@@ -232,7 +235,8 @@ class DemuxingChildBackend {
 
   void CompleteBackendWork(int batch_size,
                            DemuxingWork::PredictedTimes predicted_times) {
-    auto predicted_batch_time = predicted_times.prediction, original_batch_time= predicted_times.original;
+    auto predicted_batch_time = predicted_times.prediction,
+         original_batch_time = predicted_times.original;
     auto now = Clock::now();
     auto idle = idle_prediction_.load(std::memory_order_relaxed);
     IdlePrediction new_idle = idle;
