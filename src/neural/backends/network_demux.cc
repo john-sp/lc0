@@ -122,6 +122,9 @@ class DemuxingChildBackend {
         if (nn_threads == 0) {
           nn_threads = network_->GetThreads() + !network_->IsCpu();
         }
+        while (!thread_init_ordering_.load(std::memory_order_acquire)) {
+          SpinloopPause();
+        }
         for (int i = 1; i < nn_threads; i++) {
           threads_.emplace_back(
               [&abort, this, numa_node, numa_cuda_gpu, gpu]() {
@@ -145,6 +148,7 @@ class DemuxingChildBackend {
       }
       Worker(abort);
     });
+    thread_init_ordering_.store(1, std::memory_order_release);
     return rv;
   }
 
@@ -321,6 +325,7 @@ class DemuxingChildBackend {
   // Runtime constant variables
   std::vector<std::thread> threads_;
   std::shared_ptr<Network> network_;
+  std::atomic<int> thread_init_ordering_ = 0;
   std::unique_ptr<std::atomic<uint32_t>[]> batch_times_ns_;
   // Atomically updated variables
   alignas(kCacheLineSize) std::atomic<IdlePrediction> idle_prediction_;
