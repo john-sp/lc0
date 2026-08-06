@@ -268,7 +268,7 @@ class DemuxingChildBackend {
       // new prediction.
     }
     int32_t batch_time_delta =
-        static_cast<int32_t>(batch_time - original_batch_time) *
+        static_cast<int64_t>(batch_time - original_batch_time) *
         BatchTimeUpdateWeightMul / BatchTimeUpdateWeightDiv;
     if (batch_time_delta == 0) {
       // No need to update atomic value if prediction was accurate.
@@ -289,7 +289,7 @@ class DemuxingChildBackend {
       }
     }
     int32_t average_delta =
-        static_cast<int32_t>(average_per_position - average) *
+        static_cast<int64_t>(average_per_position - average) *
         BatchTimeUpdateWeightMul / BatchTimeUpdateWeightDiv;
     batch_times_ns_[0].fetch_add(average_delta, std::memory_order_relaxed);
   }
