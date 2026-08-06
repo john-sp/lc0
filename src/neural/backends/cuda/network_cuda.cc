@@ -1147,7 +1147,7 @@ class CudaNetwork : public Network {
   int preferred_batch_size_;
   bool enable_graph_capture_;
   bool wdl_;
-  bool wdl_err_ = true;
+  bool wdl_err_ = false;
   bool moves_left_;
   bool use_res_block_winograd_fuse_opt_;  // fuse operations inside the residual
                                           // tower
