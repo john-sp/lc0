@@ -27,6 +27,11 @@
 
 #include "utils/logging.h"
 
+#include <version>
+#if __cpp_lib_format >= 201907L
+#include <chrono>
+#include <format>
+#endif
 #include <iomanip>
 #include <iostream>
 #include <thread>
@@ -102,6 +107,11 @@ std::chrono::time_point<std::chrono::system_clock> SteadyClockToSystemClock(
 
 std::string FormatTime(
     std::chrono::time_point<std::chrono::system_clock> time) {
+
+#if __cpp_lib_format >= 201907L
+  static auto* zone = std::chrono::current_zone();
+  return std::format("{0:%m%d %T}", zone->to_local(time));
+#else
   static Mutex mutex;
 
   std::ostringstream ss;
@@ -121,6 +131,7 @@ std::string FormatTime(
        << std::setfill('0') << std::setw(6) << us;
   }
   return ss.str();
+#endif
 }
 
 }  // namespace lczero
