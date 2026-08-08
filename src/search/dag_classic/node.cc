@@ -500,15 +500,23 @@ LowNode::ChildAndEdges* LowNode::ChildAndEdges::Allocate(size_t count) {
   // Allocates aligned memory for variable size class.
   size_t size = sizeof(ChildAndEdges) + count * sizeof(Edge);
   size = (size + Node::kAlignment - 1) & ~(Node::kAlignment - 1);
+#if defined(_MSC_VER)
+  return reinterpret_cast<ChildAndEdges*>(_aligned_malloc(size, Node::kAlignment));
+#else
   return reinterpret_cast<ChildAndEdges*>(
       std::aligned_alloc(Node::kAlignment, size));
+#endif
 }
 
 void LowNode::ChildAndEdges::operator delete(ChildAndEdges* ptr,
                                              std::destroying_delete_t) {
   // Custom delete operator to free aligned memory allocations.
   std::destroy_at(ptr);
+#if defined(_MSC_VER)
+  _aligned_free(ptr);
+#else
   std::free(ptr);
+#endif
 }
 
 LowNode::SolidChildren* LowNode::SolidChildren::Allocate(size_t count) {
@@ -516,15 +524,23 @@ LowNode::SolidChildren* LowNode::SolidChildren::Allocate(size_t count) {
   size_t size =
       sizeof(SolidChildren) + count * sizeof(Node) + count * sizeof(Edge);
   size = (size + Node::kAlignment - 1) & ~(Node::kAlignment - 1);
+#if defined(_MSC_VER)
+  return reinterpret_cast<SolidChildren*>(_aligned_malloc(size, Node::kAlignment));
+#else
   return reinterpret_cast<SolidChildren*>(
       std::aligned_alloc(Node::kAlignment, size));
+#endif
 }
 
 void LowNode::SolidChildren::operator delete(SolidChildren* ptr,
                                              std::destroying_delete_t) {
   // Custom delete operator to free aligned memory allocations.
   std::destroy_at(ptr);
+#if defined(_MSC_VER)
+  _aligned_free(ptr);
+#else
   std::free(ptr);
+#endif
 }
 
 std::unique_ptr<LowNode::SolidChildren> LowNode::SolidChildren::Make(
