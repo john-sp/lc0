@@ -684,9 +684,8 @@ void TaskQueue::ShutdownThreads() {
   if (task_threads_.empty()) return;
   {
     assert(IsTasksIdle());
-    Mutex::Lock lock(picking_tasks_mutex_);
-    exiting_ = true;
-    task_added_.notify_all();
+    state_.store(kExiting, std::memory_order_relaxed);
+    state_.notify_all();
   }
   for (auto& t : task_threads_) {
     t.join();
@@ -702,16 +701,11 @@ bool TaskQueue::IsTasksIdle() const {
 size_t TaskQueue::Size() const { return task_threads_.size(); }
 
 void TaskQueue::StartANewSearch(size_t task_workers) {
-  int tasks = task_threads_.size();
-  while (sleeping_threads_.load(std::memory_order_acquire) < tasks) {
-    SpinloopPause();
-  }
-
   if (task_threads_.size() == task_workers) return;
 
   ShutdownThreads();
 
-  exiting_ = false;
+  state_.store(kSleeping, std::memory_order_relaxed);
 
   for (size_t i = 0; i < task_workers; i++) {
     task_threads_.emplace_back([this, i]() {
@@ -757,6 +751,15 @@ void TaskQueue::ProcessTask(int tid) {
   if (task != nullptr) {
     (*task)(tid);
   }
+}
+bool TaskQueue::ProcessTaskWorker(int tid) {
+  bool done_work = false;
+  PickTask* task;
+  while ((task = PickTaskToProcess()) != nullptr) {
+    done_work = true;
+    (*task)(tid);
+  }
+  return done_work;
 }
 
 // Queue a list of task to workers.
@@ -835,14 +838,34 @@ void TaskQueue::ActivateTasks() {
   if (task_threads_.empty()) return;
   int active = active_users_.fetch_add(1, std::memory_order_relaxed);
   if (active == 0) {
-    Mutex::Lock lock(picking_tasks_mutex_);
-    task_added_.notify_one();
+    auto old = state_.load(std::memory_order_relaxed);
+    do {
+      if (old == kExiting) return;
+    } while (!state_.compare_exchange_weak(old, kWakeAll,
+                                           std::memory_order_relaxed));
+    state_.notify_one();
   }
 }
 
 void TaskQueue::DeactivateTasks() {
   if (task_threads_.empty()) return;
-  active_users_.fetch_sub(1, std::memory_order_relaxed);
+  auto old = active_users_.fetch_sub(1, std::memory_order_relaxed);
+  if (old == 1) {
+    State s = state_.load(std::memory_order_relaxed);
+    if (s == kExiting) return;
+    state_.compare_exchange_strong(s, kSleeping, std::memory_order_relaxed);
+  }
+}
+
+namespace {
+static constexpr auto kSpinsToCheckClock = 512;
+static constexpr auto kSpinStartLimit = std::chrono::microseconds(100);
+}  // namespace
+
+bool TaskQueue::ShouldRun(State s) const {
+  if (s == kExiting) return false;
+  if (s == kSleeping) return false;
+  return true;
 }
 
 void TaskQueue::RunTasks(int tid) {
@@ -850,12 +873,27 @@ void TaskQueue::RunTasks(int tid) {
   while (true) {
     int nta = 0;
     int tc = 0;
+    auto spin_start = std::chrono::high_resolution_clock::now();
     int spins = 0;
-    while (active_users_.load(std::memory_order_relaxed) > 0) {
-      ProcessTask(tid);
+    bool work_done = false;
+    State s;
+    while (ShouldRun(s = state_.load(std::memory_order_relaxed))) {
+      work_done |= ProcessTaskWorker(tid);
       spins++;
-      if (spins >= 4096) {
+      if (spins >= kSpinsToCheckClock) {
+        auto now = std::chrono::high_resolution_clock::now();
+        if (work_done) {
+          spins = 0;
+          work_done = false;
+          spin_start = now;
+          continue;
+        }
+        if (now - spin_start < kSpinStartLimit) {
+          spins = 0;
+          continue;
+        }
         std::this_thread::yield();
+        spin_start = std::chrono::high_resolution_clock::now();
         spins = 0;
       } else {
         SpinloopPause();
@@ -863,24 +901,20 @@ void TaskQueue::RunTasks(int tid) {
     }
     spins = 0;
     // Looks like sleep time.
-    Mutex::Lock lock(picking_tasks_mutex_);
     // Refresh them now we have the lock.
     std::tie(std::ignore, nta, tc) = ReadTaskCount(task_count_);
-    if (active_users_.load(std::memory_order_relaxed) > 0 || nta != tc) {
+    if (nta != tc) {
       continue;
     }
-    if (exiting_) return;
-    sleeping_threads_.fetch_add(1, std::memory_order_release);
-    task_added_.wait(lock.get_raw(), [&] {
-      return exiting_ || active_users_.load(std::memory_order_relaxed) > 0;
-    });
-    auto old = sleeping_threads_.fetch_sub(1, std::memory_order_relaxed);
-    if (old > 1) {
-      // There are still other sleeping threads. Wake all of them.
-      task_added_.notify_all();
+    s = state_.load(std::memory_order_relaxed);
+    if (s == kExiting) return;
+    if (ShouldRun(s)) continue;
+    state_.wait(s, std::memory_order_relaxed);
+    s = state_.load(std::memory_order_relaxed);
+    if (s == kWakeAll) {
+      state_.compare_exchange_strong(s, kRunning, std::memory_order_relaxed);
+      state_.notify_all();
     }
-    std::tie(std::ignore, nta, tc) = ReadTaskCount(task_count_);
-    if (nta == tc && exiting_) return;
   }
 }
 
@@ -937,7 +971,8 @@ Search::Search(SearchCachedState& state, const NodeTree& tree, Backend* backend,
   // Make sure the contempt mode is never "play" beyond this point.
   if (contempt_mode_ == ContemptMode::PLAY) {
     if (infinite) {
-      // For infinite search disable contempt, only "white"/"black" make sense.
+      // For infinite search disable contempt, only "white"/"black" make
+      // sense.
       contempt_mode_ = ContemptMode::NONE;
       // Issue a warning only if contempt mode would have an effect.
       if (params_.GetWDLRescaleDiff() != 0.0f) {
@@ -1596,9 +1631,9 @@ std::vector<EdgeAndNode> Search::GetBestChildrenNoTemperature(Node* parent,
         if (a_rank == kNonTerminal) {
           // Prefer largest playouts then eval then prior.
           if (a.GetN() != b.GetN()) return a.GetN() > b.GetN();
-          // Default doesn't matter here so long as they are the same as either
-          // both are N==0 (thus we're comparing equal defaults) or N!=0 and
-          // default isn't used.
+          // Default doesn't matter here so long as they are the same as
+          // either both are N==0 (thus we're comparing equal defaults) or
+          // N!=0 and default isn't used.
           if (a.GetQ(0.0f, draw_score) != b.GetQ(0.0f, draw_score)) {
             return a.GetQ(0.0f, draw_score) > b.GetQ(0.0f, draw_score);
           }
@@ -2013,8 +2048,8 @@ void ScheduleBackupUpdateTasks(MakeSolidList& solid_tasks,
 
   const size_t tail_share = 5;
 
-  // Use two tasks per thread where the second tasks is a smaller load balancing
-  // tasks. Faster threads can take more than one smaller task.
+  // Use two tasks per thread where the second tasks is a smaller load
+  // balancing tasks. Faster threads can take more than one smaller task.
   bool use_small_tail = paths >= (state.task_queue_.Size() + 1) * tail_share;
   size_t threads = state.task_queue_.Size() + 1;
 
@@ -2114,8 +2149,8 @@ void SearchWorker::RunBlocking() {
 #endif
   }
   try {
-    // Start task workers early. This leaves scheduler a little extra time if it
-    // needs to wake up a new CPU core.
+    // Start task workers early. This leaves scheduler a little extra time if
+    // it needs to wake up a new CPU core.
     search_->state_.task_queue_.ActivateTasks();
     // A very early stop may arrive before this point, so the test is at the
     // end to ensure at least one iteration runs before exiting.
@@ -2152,9 +2187,9 @@ void SearchWorker::ExecuteOneIteration() {
     }
 
     while (true) {
-      // If search is stopped, we've not gathered or done anything and we don't
-      // want to, so we can safely skip all below. But make sure we have done
-      // at least one iteration.
+      // If search is stopped, we've not gathered or done anything and we
+      // don't want to, so we can safely skip all below. But make sure we have
+      // done at least one iteration.
       if (search_->stop_.load(std::memory_order_acquire) &&
           search_->GetTotalPlayouts() + search_->initial_visits_ > 0) {
         return;
@@ -2333,14 +2368,15 @@ void SearchWorker::GatherMinibatch() {
   // that search can exit.
   while (minibatch_size < target_minibatch_size_ &&
          number_out_of_order_ < max_out_of_order_ && collisions_left > 0) {
-    // If there's something to process without touching slow neural net, do it.
+    // If there's something to process without touching slow neural net, do
+    // it.
     if (minibatch_size > 0 && computation_->UsedBatchSize() == 0) return;
 
     // If there is backend work to be done, and the backend is idle - exit
     // immediately.
     // Only do this fancy work if there are multiple threads as otherwise we
-    // early exit from every batch since there is never another search thread to
-    // be keeping the backend busy. Which would mean that threads=1 has a
+    // early exit from every batch since there is never another search thread
+    // to be keeping the backend busy. Which would mean that threads=1 has a
     // massive nps drop.
     int thread_count = search_->thread_count_.load(std::memory_order_relaxed);
 
@@ -2563,8 +2599,8 @@ SearchWorker::PickNodesToExtendTask(int collision_limit, int tid,
   const bool visit_root = stop_root && node->TryStartScoreUpdate();
   const size_t starting_path_size = current_path.size();
   current_path.emplace_back(collision_limit, true, visit_root, stop_root, 0);
-  // take base sqrt(2) logarithm of root node for large subbranch N limit. It is
-  // used to split tasks.
+  // take base sqrt(2) logarithm of root node for large subbranch N limit. It
+  // is used to split tasks.
   const unsigned large_branch_limit =
       std::bit_width<uint32_t>(search_->root_node_->GetN()) * 2;
   while (current_path.size() > starting_path_size) {
@@ -2600,9 +2636,8 @@ SearchWorker::PickNodesToExtendTask(int collision_limit, int tid,
       assert(!full_path.empty());
       std::tie(node, repetitions, moves_left) = full_path.back();
     } else {
-      // Compiler can overwrite these stack variables if there is recursion to a
-      // task.
-      // This 1 is 'filled pre-emptively'.
+      // Compiler can overwrite these stack variables if there is recursion to
+      // a task. This 1 is 'filled pre-emptively'.
       std::array<float, kMaxMovesInPosition> current_util;
 
       // These 3 are 'filled on demand'.
@@ -2610,8 +2645,9 @@ SearchWorker::PickNodesToExtendTask(int collision_limit, int tid,
       std::array<float, kMaxMovesInPosition> current_nstarted;
       std::array<CurrentPath, kMaxMovesInPosition> visits_to_perform;
       if (is_root_node) {
-        // Root node is again special - needs its n in flight updated separately
-        // as its not handled on the path to it, since there isn't one.
+        // Root node is again special - needs its n in flight updated
+        // separately as its not handled on the path to it, since there isn't
+        // one.
         node->IncrementNInFlight(cur_limit);
       }
 
@@ -2624,8 +2660,8 @@ SearchWorker::PickNodesToExtendTask(int collision_limit, int tid,
       for (int i = 0; i < max_needed; i++) {
         current_util[i] = std::numeric_limits<float>::lowest();
       }
-      // Root depth is 1 here, while for GetDrawScore() it's 0-based, that's why
-      // the weirdness.
+      // Root depth is 1 here, while for GetDrawScore() it's 0-based, that's
+      // why the weirdness.
       const float draw_score =
           (full_path.size() % 2 == 0) ? odd_draw_score : even_draw_score;
       m_evaluator.SetParent(node);
@@ -2681,8 +2717,8 @@ SearchWorker::PickNodesToExtendTask(int collision_limit, int tid,
             // If there's no chance to catch up to the current best node with
             // remaining playouts, don't consider it.
             // best_move_node_ could have changed since best_node_n was
-            // retrieved. To ensure we have at least one node to expand, always
-            // include current best node.
+            // retrieved. To ensure we have at least one node to expand,
+            // always include current best node.
             if (cur_iters[idx] != current_best_edge &&
                 latest_time_manager_hints_.GetEstimatedRemainingPlayouts() <
                     best_node_n - cur_iters[idx].GetN()) {
@@ -2710,9 +2746,9 @@ SearchWorker::PickNodesToExtendTask(int collision_limit, int tid,
           }
           if (can_exit) break;
           if (nstarted == 0) {
-            // One more loop will get 2 unvisited nodes, which is sufficient to
-            // ensure second best is correct. This relies upon the fact that
-            // edges are sorted in policy decreasing order.
+            // One more loop will get 2 unvisited nodes, which is sufficient
+            // to ensure second best is correct. This relies upon the fact
+            // that edges are sorted in policy decreasing order.
             can_exit = true;
           }
         }
@@ -2737,8 +2773,8 @@ SearchWorker::PickNodesToExtendTask(int collision_limit, int tid,
         bool already_visited = !!visits_to_perform[best_idx];
         visits_to_perform[best_idx] += new_visits;
         cur_limit -= new_visits;
-        // We have already checked this child. We can use simplified process to
-        // add more visits to the node.
+        // We have already checked this child. We can use simplified process
+        // to add more visits to the node.
         if (already_visited) {
           if (visits_to_perform[best_idx].stop_picking_) {
             // We found a collision. All remaining visits go here.
@@ -2926,8 +2962,8 @@ int GetEvalIndex(std::atomic<int>& eval_used, int size) {
   // First select only even indexes.
   index <<= 1;
   if (index >= size) {
-    // Then go back to odd indexes. Even size means subtract size - 1. Odd size
-    // means subtract size.
+    // Then go back to odd indexes. Even size means subtract size - 1. Odd
+    // size means subtract size.
     index -= size - 1;
     index -= size & 1;
   }
@@ -3250,8 +3286,8 @@ bool SearchWorker::MaybeAdjustForTerminalOrTransposition(
     v = -nl->GetWL();
     d = nl->GetD();
     m = nl->GetM() + 1;
-    // When starting at or going through a transposition/terminal, make sure to
-    // use the information it has already acquired.
+    // When starting at or going through a transposition/terminal, make sure
+    // to use the information it has already acquired.
     weight_to_fix = n->GetWeight();
     v_delta = v - n->GetWL();
     d_delta = d - n->GetD();
@@ -3461,9 +3497,9 @@ void SearchWorker::DoBackupUpdateSingleNode(
     // If update_parent_bounds was set, we just adjusted bounds on the
     // previous loop or there was no previous loop, so if n is a terminal, it
     // just became that way and could be a candidate for changing the current
-    // best edge. Otherwise a visit can only change best edge if its to an edge
-    // that isn't already the best and the new n is equal or greater to the old
-    // n.
+    // best edge. Otherwise a visit can only change best edge if its to an
+    // edge that isn't already the best and the new n is equal or greater to
+    // the old n.
     if (p == search_->root_node_ &&
         ((old_update_parent_bounds && n->IsTerminal()) ||
          (n != search_->current_best_edge_.node() &&
@@ -3531,8 +3567,8 @@ bool SearchWorker::MaybeSetBounds(Node* p, float m, double* weight_to_fix,
   if (lower == GameResult::BLACK_WON && upper == GameResult::WHITE_WON) {
     return false;
   } else if (lower == upper) {
-    // Search can stop at the parent if the bounds can't change anymore, so make
-    // it terminal preferring shorter wins and longer losses.
+    // Search can stop at the parent if the bounds can't change anymore, so
+    // make it terminal preferring shorter wins and longer losses.
     *weight_to_fix = p->GetWeight();
     assert(*weight_to_fix > 0);
     pl->MakeTerminal(

@@ -31,6 +31,7 @@
 
 #include <array>
 #include <bit>
+#include <chrono>
 #include <condition_variable>
 #include <optional>
 #include <span>
@@ -44,6 +45,7 @@
 #include "search/dag_classic/node.h"
 #include "search/dag_classic/params.h"
 #include "syzygy/syzygy.h"
+#include "utils/atomic.h"
 #include "utils/atomic_vector.h"
 #include "utils/logging.h"
 #include "utils/mutex.h"
@@ -213,21 +215,28 @@ class TaskQueue {
   void StartANewSearch(size_t task_workers);
 
  private:
+  enum State : int {
+    kRunning = 0,
+    kWakeAll = 2,
+    kSleeping = 3,
+    kExiting = 4,
+  };
+
+  bool ProcessTaskWorker(int tid);
   void ShutdownThreads();
   void RunTasks(int tid);
 
+  bool ShouldRun(State s) const;
+
   std::vector<std::thread> task_threads_;
-  bool exiting_ = false;
-  alignas(kCacheLineSize) std::condition_variable task_added_;
-  Mutex picking_tasks_mutex_;
-  // Size is the smalles power of two which has enough space to hold all child
+  alignas(kCacheLineSize) WaitableAtomic<State> state_ = State::kSleeping;
+  // Size is the smallest power of two which has enough space to hold all child
   // nodes in any positions. Typically there is much less visited children. The
   // bigger size helps avoid cache line contention when scaling to more threads.
-  std::array<PickTaskPtr, 256> picking_tasks_;
+  alignas(kCacheLineSize) std::array<PickTaskPtr, 256> picking_tasks_;
   // A packed atomic. LSB half is task_count_. MSB half is tasks_taken_.
   alignas(kCacheLineSize) std::atomic<int> task_count_ = 0;
   alignas(kCacheLineSize) std::atomic<int> active_users_ = 0;
-  alignas(kCacheLineSize) std::atomic<int> sleeping_threads_ = 0;
 };
 
 class Search {
