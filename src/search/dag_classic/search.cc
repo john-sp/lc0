@@ -3597,7 +3597,6 @@ void SearchWorker::UpdateCounters(bool work_done) {
   LCTRACE_FUNCTION_SCOPE;
   search_->PopulateCommonIterationStats(&iteration_stats_);
   search_->MaybeTriggerStop(iteration_stats_, &latest_time_manager_hints_);
-  search_->MaybeOutputInfo(iteration_stats_);
   if (!work_done) {
     int tc = search_->thread_count_.fetch_sub(1, std::memory_order_relaxed) - 1;
     if (tc <= 0) return;
