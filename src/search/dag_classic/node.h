@@ -242,7 +242,7 @@ class Edge_Iterator;
 template <bool is_const>
 class VisitedNode_Iterator;
 
-class NodeGarbageCollector;
+template <typename Types>
 class ReleaseNodesWork;
 
 class LowNode;
@@ -585,9 +585,6 @@ class LowNode {
   // Like FinalizeScoreUpdate, but it updates n existing visits by delta amount.
   void AdjustForTerminal(double v, double d, float m, double divisor,
                          double multiweight);
-
-  // Deletes all children.
-  void ReleaseChildren();
 
   // Deletes all children except one.
   // The node provided may be moved, so should not be relied upon to exist
@@ -1011,6 +1008,7 @@ class NodeTree {
 
 // Implement thread local queues. It tracks GC thread to allow faster removal in
 // the thread.
+template <typename Types>
 class ReleaseNodesWork {
   static constexpr size_t kCapacity = 32;
 
@@ -1020,7 +1018,8 @@ class ReleaseNodesWork {
   bool IsWorker() const;
 
   // A limited vector like interface to operate on the container.
-  void emplace_back(std::unique_ptr<Node>&& node);
+  template <typename Type>
+  void emplace_back(std::unique_ptr<Type>&& node);
   bool empty() const;
 
   // Swap is used to transfer queue into a new stack variable. The stack
@@ -1032,19 +1031,23 @@ class ReleaseNodesWork {
   void Submit();
 
   // No locks required because only one thread can access this object.
-  std::vector<std::unique_ptr<Node>> released_nodes_;
+  std::vector<Types> released_nodes_;
   bool is_gc_thread_;
 };
 
+template <typename Types>
 class NodeGarbageCollector {
   NodeGarbageCollector();
   ~NodeGarbageCollector();
 
  public:
+  static constexpr size_t kQueueWakeupThreshold = 50;
+
   enum State {
     Running,
-    GoToSleep,
+    Waiting,
     Sleeping,
+    GoToSleep,
     Exit,
   };
 
@@ -1073,13 +1076,13 @@ class NodeGarbageCollector {
   // Helper to transition between states safely
   bool SetState(State& old, State desired);
   bool IsActive() const;
-  bool ShouldQueue(std::unique_ptr<Node>& node) const;
+  bool ShouldQueue(bool holds_node) const;
   // The collection thread implementation.
   void GCThread();
   // Thread local collection queue. Local queues flush to the shared queue
   // in batches to avoid lock contention.
-  static ReleaseNodesWork& LocalWork(bool gc_thread = false) {
-    static thread_local ReleaseNodesWork shared{gc_thread};
+  static ReleaseNodesWork<Types>& LocalWork(bool gc_thread = false) {
+    static thread_local ReleaseNodesWork<Types> shared{gc_thread};
     return shared;
   }
 
@@ -1092,11 +1095,13 @@ class NodeGarbageCollector {
 #endif
   std::thread gc_thread_;
   SpinMutex mutex_;
-  std::deque<std::vector<std::unique_ptr<Node>>> released_nodes_
-      GUARDED_BY(mutex_);
+  std::deque<std::vector<Types>> released_nodes_ GUARDED_BY(mutex_);
 
-  friend class ReleaseNodesWork;
+  friend class ReleaseNodesWork<Types>;
 };
+
+using NGCTypes = std::unique_ptr<Node>;
+using NGC = NodeGarbageCollector<NGCTypes>;
 
 }  // namespace dag_classic
 }  // namespace lczero
