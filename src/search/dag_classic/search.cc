@@ -263,8 +263,11 @@ struct TaskArray {
 
   bool empty() const { return size_ == 0; }
   size_t size() const { return size_; }
+  size_t capacity() const { return capacity_; }
   TaskType* begin() { return tasks_; }
   TaskType* end() { return tasks_ + size_; }
+  const TaskType* begin() const { return tasks_; }
+  const TaskType* end() const { return tasks_ + size_; }
   TaskType& operator[](size_t idx) {
     assert(idx < size_);
     return tasks_[idx];
@@ -341,6 +344,193 @@ static T DivUp(T dividend, T divisor) {
   assert(divisor > 0);
   return 1 + (dividend - 1) / divisor;
 }
+
+class MakeSolidQueue;
+class MakeSolidTask;
+using MakeSolidList =
+    std::forward_list<MakeSolidTask, IterationMemoryAllocator<MakeSolidTask>>;
+
+// Queue to transfer pointer change lists from MakeSolidTask to
+// UpdatePathPointers. Readers uses spin loop on an atomic variable to wait data
+// be available.
+class MakeSolidQueue {
+ public:
+  using ChangeType = LowNode::PointerChanges;
+  using Allocator = IterationMemoryAllocator<char>;
+  MakeSolidQueue() {}
+
+  ~MakeSolidQueue() {
+    // Make sure the synchronization has worked.
+    assert(total_changes_ == inserted_.load(std::memory_order_relaxed));
+    // No need to free memory because it is managed by iteration memory manager.
+    // The memory will be freed when the next iteration starts.
+  }
+
+  // Reserve memory for pointer changes.
+  void Allocate() {
+    assert(!queue_);
+    assert(total_edges_ > 0);
+    queue_ = ChangeType::Allocate(total_edges_);
+  }
+
+  // Add range of pointer changes to the shared queue
+  void Push(ChangeType* changes) {
+    assert(queue_);
+    // Reserve range from the destination.
+    std::atomic_ref<size_t> insert(queue_->num_edges_);
+    size_t idx =
+        insert.fetch_add(changes->num_edges_, std::memory_order_relaxed);
+
+    // Copy our data to the reserved range which other threads don't access.
+    std::copy(changes->begin(), changes->end(), queue_->begin() + idx);
+
+    // Release ordering to store all copied data and notify other thread about
+    // copy completion.
+    inserted_.fetch_add(1, std::memory_order_release);
+  }
+
+  // Get all modifications. It will spin on atomic variable until all data is
+  // ready.
+  const ChangeType* Get() const {
+    assert(queue_);
+    while (inserted_.load(std::memory_order_acquire) != total_changes_) {
+      SpinloopPause();
+    }
+    return queue_;
+  }
+
+  size_t Size() const { return total_changes_; }
+
+  // AddSource is called when MakeSolidTask is created to calculate how much
+  // memory this queue will need.
+  void AddSource(size_t num_edges) {
+    total_changes_++;
+    total_edges_ += num_edges;
+  }
+
+ private:
+  ChangeType* queue_ = nullptr;
+  size_t total_changes_ = 0;
+  size_t total_edges_ = 0;
+  alignas(kCacheLineSize) std::atomic<size_t> inserted_ = 0;
+};
+
+// A task to solidify edges data of a LowNode.
+class MakeSolidTask final : public TaskQueue::PickTask {
+ public:
+  using Allocator = IterationMemoryAllocator<MakeSolidTask>;
+  MakeSolidTask(SearchWorker& worker, MakeSolidQueue& queue, LowNode* node)
+      : worker_(worker), queue_(queue), node_(node) {
+    queue.AddSource(node->GetNumEdges());
+  }
+
+  void Wait(int tid) const override {
+    while (!completed_.load(std::memory_order_acquire)) {
+      worker_.ProcessTask(tid);
+    }
+  }
+
+  LowNode* GetNode() const { return node_; }
+
+ private:
+  void DoTask(int tid) override {
+    IterationMemoryManager::ResetLocalManager(worker_, tid);
+    Solidify();
+    completed_.store(true, std::memory_order_release);
+  }
+
+  void Solidify() {
+    LCTRACE_FUNCTION_SCOPE;
+    queue_.Push(node_->MakeSolid());
+  }
+  SearchWorker& worker_;
+  MakeSolidQueue& queue_;
+  LowNode* node_;
+  std::atomic<bool> completed_ = false;
+};
+
+class UpdatePathPointers : public TaskQueue::PickTask {
+ public:
+  UpdatePathPointers(MakeSolidQueue& queue, SearchCachedState& state,
+                     size_t tid, size_t start, size_t size)
+      : queue_(queue), state_(state), tid_(tid), start_(start), size_(size) {}
+
+  void Wait(int tid) const override {
+    while (!completed_.load(std::memory_order_acquire)) {
+      state_.task_queue_.ProcessTask(tid);
+    }
+  }
+
+ private:
+  void DoTask(int tid) override { UpdatePointers(tid); }
+  void UpdatePointers(int) {
+    LCTRACE_FUNCTION_SCOPE;
+    std::vector<std::span<BackupPath>> ranges;
+    size_t index = 0;
+    size_t size = size_;
+    for (size_t t = 0; t < state_.worker_states_.size(); t++) {
+      if (t == tid_) continue;
+      auto& worker_state = state_.worker_states_[t];
+      if (index + worker_state.minibatch_.size() > start_) {
+        size_t begin = index < start_ ? start_ - index : 0;
+        size_t count = std::min(size, worker_state.minibatch_.size() - begin);
+        ranges.emplace_back(worker_state.node_paths_.begin() + begin,
+                            worker_state.node_paths_.begin() + begin + count);
+        size -= count;
+        if (size == 0) break;
+      }
+      index += worker_state.minibatch_.size();
+
+      if (index + worker_state.collisions_.size() > start_) {
+        size_t begin = index < start_ ? start_ - index : 0;
+        size_t count = std::min(size, worker_state.collisions_.size() - begin);
+        ranges.emplace_back(worker_state.node_paths_.begin() +
+                                worker_state.minibatch_.capacity() +
+                                worker_state.ooobatch_.capacity() + begin,
+                            worker_state.node_paths_.begin() +
+                                worker_state.minibatch_.capacity() +
+                                worker_state.ooobatch_.capacity() + begin +
+                                count);
+        size -= count;
+        if (size == 0) break;
+      }
+      index += worker_state.collisions_.size();
+    }
+
+    assert(size == 0);
+
+    assert(size_ == std::accumulate(ranges.begin(), ranges.end(), 0ull,
+                                    [](size_t sum, const auto& range) {
+                                      return sum + range.size();
+                                    }));
+
+    const auto* changes = queue_.Get();
+    for (auto& range : ranges) {
+      for (auto& path : range) {
+        for (auto& node : path) {
+          // This uses simple linear scan for a match because it was faster than
+          // binary search or auto vectorization. If BackupPath structure would
+          // be refactored to use continues memory for pointers, then vectorized
+          // version might be competitive.
+          auto it = std::find_if(changes->begin(), changes->end(),
+                                 [&node](const auto& change) {
+                                   return change.old_ == std::get<0>(node);
+                                 });
+          if (it == changes->end()) continue;
+          std::get<0>(node) = (*it).new_;
+        }
+      }
+    }
+    completed_.store(true, std::memory_order_release);
+  }
+
+  MakeSolidQueue& queue_;
+  SearchCachedState& state_;
+  size_t tid_;
+  size_t start_;
+  size_t size_;
+  std::atomic<bool> completed_ = false;
+};
 
 }  // namespace
 
@@ -484,6 +674,8 @@ void IterationMemoryAllocator<T>::deallocate(T* ptr, size_t n) noexcept {
 #endif
 }
 
+template class IterationMemoryAllocator<char>;
+
 TaskQueue::TaskQueue() {}
 
 TaskQueue::~TaskQueue() { ShutdownThreads(); }
@@ -572,27 +764,29 @@ template <typename TaskVector>
 void TaskQueue::SubmitTasks(const TaskVector& tasks, int tid) {
   if (tasks.empty()) return;
 
-  const size_t size = picking_tasks_.size();
-  assert(tasks.size() < size);
+  const size_t capacity = picking_tasks_.size();
+  const size_t size = std::distance(tasks.begin(), tasks.end());
+  assert(size < capacity);
   unsigned nta, tc;
   int packed_value, new_value;
-  int mask = -1 << kTasksTakenShift | (size - 1);
+  int mask = -1 << kTasksTakenShift | (static_cast<int>(capacity) - 1);
   std::tie(packed_value, nta, tc) = ReadTaskCount(task_count_);
   do {
     std::tie(packed_value, nta, tc) = ReadTaskCount(packed_value);
     // Check that there is enough space for all tasks in the list.
-    while (size - (tc - nta) % size <= tasks.size()) {
+    while (capacity - (tc - nta) % capacity <= size) {
       ProcessTask(tid);
       std::tie(packed_value, nta, tc) = ReadTaskCount(task_count_);
     }
-    new_value = (packed_value + tasks.size()) & mask;
+    new_value = (packed_value + size) & mask;
   } while (!task_count_.compare_exchange_weak(packed_value, new_value,
                                               std::memory_order_acq_rel));
 
   // tc and nta must be equal only when the ring buffer is empty.
-  assert(nta != (tc + tasks.size()) % size);
-  for (unsigned i = 0; i < tasks.size(); i++) {
-    auto& bucket = PickingTaskIndex(picking_tasks_, (tc + i) % size);
+  assert(nta != (tc + size) % capacity);
+  auto task = tasks.begin();
+  for (unsigned i = 0; i < size; i++, task++) {
+    auto& bucket = PickingTaskIndex(picking_tasks_, (tc + i) % capacity);
     // Make sure that previous read has completed.
     const PickTask* expected;
     do {
@@ -601,7 +795,7 @@ void TaskQueue::SubmitTasks(const TaskVector& tasks, int tid) {
       }
       expected = nullptr;
     } while (!bucket.compare_exchange_strong(
-        expected, static_cast<const PickTask*>(tasks.data() + i),
+        expected, static_cast<const PickTask*>(&*task),
         std::memory_order_release));
   }
 }
@@ -612,7 +806,7 @@ void TaskQueue::SubmitTask(const TaskType& task, int tid) {
   const size_t size = picking_tasks_.size();
   unsigned nta, tc;
   int packed_value, new_value;
-  int mask = -1 << kTasksTakenShift | (size - 1);
+  int mask = -1 << kTasksTakenShift | (static_cast<int>(size) - 1);
   std::tie(packed_value, nta, tc) = ReadTaskCount(task_count_);
   do {
     std::tie(packed_value, nta, tc) = ReadTaskCount(packed_value);
@@ -642,7 +836,7 @@ void TaskQueue::ActivateTasks() {
   int active = active_users_.fetch_add(1, std::memory_order_relaxed);
   if (active == 0) {
     Mutex::Lock lock(picking_tasks_mutex_);
-    task_added_.notify_all();
+    task_added_.notify_one();
   }
 }
 
@@ -677,8 +871,14 @@ void TaskQueue::RunTasks(int tid) {
     }
     if (exiting_) return;
     sleeping_threads_.fetch_add(1, std::memory_order_release);
-    task_added_.wait(lock.get_raw());
-    sleeping_threads_.fetch_sub(1, std::memory_order_relaxed);
+    task_added_.wait(lock.get_raw(), [&] {
+      return exiting_ || active_users_.load(std::memory_order_relaxed) > 0;
+    });
+    auto old = sleeping_threads_.fetch_sub(1, std::memory_order_relaxed);
+    if (old > 1) {
+      // There are still other sleeping threads. Wake all of them.
+      task_added_.notify_all();
+    }
     std::tie(std::ignore, nta, tc) = ReadTaskCount(task_count_);
     if (nta == tc && exiting_) return;
   }
@@ -832,6 +1032,7 @@ inline double WDLRescale(T& v, T& d, float wdl_rescale_ratio,
 
 void Search::SendUciInfo(const classic::IterationStats& stats)
     REQUIRES(nodes_mutex_) REQUIRES(counters_mutex_) {
+  LCTRACE_FUNCTION_SCOPE;
   const auto max_pv = params_.GetMultiPv();
   const auto edges = GetBestChildrenNoTemperature(root_node_, max_pv, 0);
   const auto score_type = params_.GetScoreType();
@@ -960,6 +1161,7 @@ void Search::SendUciInfo(const classic::IterationStats& stats)
 // Decides whether anything important changed in stats and new info should be
 // shown to a user.
 void Search::MaybeOutputInfo(const classic::IterationStats& stats) {
+  LCTRACE_FUNCTION_SCOPE;
   SharedMutex::Lock lock(nodes_mutex_);
   Mutex::Lock counters_lock(counters_mutex_);
   if (!bestmove_is_sent_ && current_best_edge_ &&
@@ -1041,6 +1243,7 @@ static bool operator<(const EdgeAndNode&, const EdgeAndNode&) { return false; }
 
 std::vector<std::string> Search::GetVerboseStats(
     const Node* node, std::optional<Move> move_to_node) const {
+  LCTRACE_FUNCTION_SCOPE;
   const bool is_root = (node == root_node_);
   const bool is_odd_depth = !is_root;
   const bool is_black_to_move = (played_history_.IsBlackToMove() == is_root);
@@ -1167,6 +1370,7 @@ std::vector<std::string> Search::GetVerboseStats(
 }
 
 void Search::SendMovesStats() const REQUIRES(counters_mutex_) {
+  LCTRACE_FUNCTION_SCOPE;
   auto move_stats = GetVerboseStats(root_node_, std::nullopt);
 
   if (params_.GetVerboseStats()) {
@@ -1197,6 +1401,7 @@ void Search::SendMovesStats() const REQUIRES(counters_mutex_) {
 
 void Search::MaybeTriggerStop(const classic::IterationStats& stats,
                               classic::StoppersHints* hints) {
+  LCTRACE_FUNCTION_SCOPE;
   hints->Reset();
   if (params_.GetNpsLimit() > 0) {
     hints->UpdateEstimatedNps(params_.GetNpsLimit());
@@ -1216,7 +1421,7 @@ void Search::MaybeTriggerStop(const classic::IterationStats& stats,
                stats.time_since_movestart >
                    delay * (stats.time_since_movestart +
                             hints->GetEstimatedRemainingTimeMs())) {
-      NodeGarbageCollector::Instance().Start();
+      NGC::Instance().Start();
       gc_started_ = true;
     }
   }
@@ -1232,7 +1437,7 @@ void Search::MaybeTriggerStop(const classic::IterationStats& stats,
     stopper_->OnSearchDone(stats);
     bestmove_is_sent_ = true;
     current_best_edge_ = EdgeAndNode();
-    NodeGarbageCollector::Instance().Stop();
+    NGC::Instance().Stop();
   }
 }
 
@@ -1318,6 +1523,7 @@ void Search::EnsureBestMoveKnown() REQUIRES(nodes_mutex_)
 std::vector<EdgeAndNode> Search::GetBestChildrenNoTemperature(Node* parent,
                                                               int count,
                                                               int depth) const {
+  LCTRACE_FUNCTION_SCOPE;
   // Even if Edges is populated at this point, its a race condition to access
   // the node, so exit quickly.
   if (parent->GetN() == 0) return {};
@@ -1542,6 +1748,7 @@ bool Search::IsSearchActive() const {
 }
 
 void Search::PopulateCommonIterationStats(classic::IterationStats* stats) {
+  LCTRACE_FUNCTION_SCOPE;
   stats->time_since_movestart = GetTimeSinceStart();
 
   SharedMutex::SharedLock nodes_lock(nodes_mutex_);
@@ -1659,7 +1866,7 @@ void Search::FireStopInternal() {
 }
 
 void Search::Stop() {
-  NodeGarbageCollector::Instance().Stop();
+  NGC::Instance().Stop();
   Mutex::Lock lock(counters_mutex_);
   ok_to_respond_bestmove_ = true;
   FireStopInternal();
@@ -1667,7 +1874,7 @@ void Search::Stop() {
 }
 
 void Search::Abort() {
-  NodeGarbageCollector::Instance().Abort();
+  NGC::Instance().Abort();
   Mutex::Lock lock(counters_mutex_);
   if (!stop_.load(std::memory_order_acquire) ||
       (!bestmove_is_sent_ && !ok_to_respond_bestmove_)) {
@@ -1678,7 +1885,7 @@ void Search::Abort() {
 }
 
 void Search::Wait() {
-  NodeGarbageCollector::Instance().Wait();
+  NGC::Instance().Wait();
   bool active_threads = !threads_.empty();
   while (!threads_.empty()) {
     threads_.back().join();
@@ -1789,6 +1996,111 @@ void SearchWorker::PickTaskCancelCollisions::DoTask(int) {
   completed_.store(true, std::memory_order_release);
 }
 
+namespace {
+
+void ScheduleBackupUpdateTasks(MakeSolidList& solid_tasks,
+                               MakeSolidQueue& queue, SearchCachedState& state,
+                               size_t tid) {
+  size_t paths = 0;
+  size_t wid = tid - state.task_queue_.Size();
+  for (size_t t = 0; t < state.worker_states_.size(); t++) {
+    if (t == wid) continue;
+    auto& worker = state.worker_states_[t];
+    paths += worker.minibatch_.size();
+    assert(worker.ooobatch_.empty());
+    paths += worker.collisions_.size();
+  }
+
+  const size_t tail_share = 5;
+
+  // Use two tasks per thread where the second tasks is a smaller load balancing
+  // tasks. Faster threads can take more than one smaller task.
+  bool use_small_tail = paths >= (state.task_queue_.Size() + 1) * tail_share;
+  size_t threads = state.task_queue_.Size() + 1;
+
+  TaskArray<UpdatePathPointers> tasks(use_small_tail ? threads * 2 : threads);
+
+  // Calculate how to split paths evenly.
+  size_t batch_paths =
+      use_small_tail ? paths * (tail_share - 1) / tail_share : paths;
+  size_t paths_per_thread = batch_paths / threads;
+  size_t extra_paths = batch_paths % threads;
+  size_t t = 0;
+
+  size_t start = 0;
+
+  for (; t < extra_paths; t++) {
+    tasks.emplace_back(queue, state, wid, start, paths_per_thread + 1);
+    start += paths_per_thread + 1;
+  }
+  for (; t < threads && paths_per_thread > 0; t++) {
+    tasks.emplace_back(queue, state, wid, start, paths_per_thread);
+    start += paths_per_thread;
+  }
+  // Add smaller tasks at the end to balance executions times.
+  if (use_small_tail) {
+    size_t tail_paths = paths - batch_paths;
+    size_t paths_per_thread = tail_paths / threads;
+    size_t extra_paths = tail_paths % threads;
+    for (t = 0; t < extra_paths; t++) {
+      tasks.emplace_back(queue, state, wid, start, paths_per_thread + 1);
+      start += paths_per_thread + 1;
+    }
+    for (; t < threads && paths_per_thread > 0; t++) {
+      tasks.emplace_back(queue, state, wid, start, paths_per_thread);
+      start += paths_per_thread;
+    }
+  }
+  // Submit all tasks.
+  assert(start == paths);
+  state.task_queue_.SubmitTasks(tasks, tid);
+  // Wait for tasks.
+  for (auto& tasks : solid_tasks) {
+    tasks.Wait(tid);
+  }
+
+  for (auto& task : tasks) {
+    task.Wait(tid);
+  }
+}
+
+// Do Solidification tasks
+void SolidifyCandidates(SearchWorker& worker, SearchCachedState& state, int tid,
+                        std::vector<LowNode*>& candidates,
+                        bool do_all = false) {
+  // Remove already solid nodes.
+  candidates.erase(
+      std::remove_if(candidates.begin(), candidates.end(),
+                     [](LowNode* node) { return !node->CanMakeSolid(); }),
+      candidates.end());
+
+  // Delay tasks until there is at least one solidification task for each
+  // worker.
+  if (candidates.size() < (state.task_queue_.Size() + 1) &&
+      (!do_all || candidates.empty())) {
+    return;
+  }
+  LCTRACE_FUNCTION_SCOPE;
+  worker.NewMemoryIteration();
+  MakeSolidQueue solid_queue;
+  MakeSolidList solid_tasks;
+  // Queue solidification tasks.
+  for (auto* node : candidates) {
+    solid_tasks.emplace_front(worker, solid_queue, node);
+  }
+  // Allocate memory for queue.
+  solid_queue.Allocate();
+  // Submit solidification tasks.
+  state.task_queue_.SubmitTasks(solid_tasks, tid);
+  // Schedule pointer update tasks which read from the queue.
+  ScheduleBackupUpdateTasks(solid_tasks, solid_queue, state, tid);
+  // Clear candidate list.
+  size_t capacity = candidates.capacity();
+  candidates.clear();
+  candidates.reserve(capacity);
+}
+}  // namespace
+
 void SearchWorker::RunBlocking() {
   LOGFILE << "Started search thread.";
   // Wait here until root node has been evaluated.
@@ -1810,6 +2122,12 @@ void SearchWorker::RunBlocking() {
     do {
       ExecuteOneIteration();
     } while (search_->IsSearchActive());
+    if (!state_.solidify_candidates_.empty()) {
+      SharedMutex::Lock lock(search_->nodes_mutex_);
+      // Don't leave dangling pointers into candidates.
+      SolidifyCandidates(*this, search_->state_, tid_,
+                         state_.solidify_candidates_, true);
+    }
     search_->state_.task_queue_.DeactivateTasks();
   } catch (std::exception& e) {
     std::cerr << "Unhandled exception in worker thread: " << e.what()
@@ -1872,10 +2190,10 @@ void SearchWorker::ExecuteOneIteration() {
   FetchMinibatchResults();
 
   // 6. Propagate the new nodes' information to all their parents in the tree.
-  DoBackupUpdate();
+  bool work_done = DoBackupUpdate();
 
   // 7. Update the Search's status and progress information.
-  UpdateCounters();
+  UpdateCounters(work_done);
 
   // If required, waste time to limit nps.
   if (params_.GetNpsLimit() > 0 && iteration_stats_.time_since_first_batch) {
@@ -1897,14 +2215,10 @@ void SearchWorker::ExecuteOneIteration() {
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 void SearchWorker::InitializeIteration() {
   LCTRACE_FUNCTION_SCOPE;
-  cancel_task_.Wait(tid_);
   // Free the old computation before allocating a new one. This works better
   // when backend caches buffer allocations between computations.
   computation_.reset();
   computation_ = search_->backend_->CreateComputation();
-  state_.minibatch_.clear();
-  state_.ooobatch_.clear();
-  state_.collisions_.clear();
   eval_used_.store(0, std::memory_order_relaxed);
 }
 
@@ -1939,6 +2253,11 @@ IterationMemoryManager& SearchWorker::GetIterationMemoryManager(int tid) {
 
 size_t SearchWorker::GetIterationAge() const { return iteration_memory_age_; }
 
+void SearchWorker::NewMemoryIteration() {
+  iteration_memory_age_++;
+  IterationMemoryManager::ResetLocalManager(*this, tid_);
+}
+
 // Schedule a task to cancel collisions. Cancel task is left running at the
 // background when worker sends a batch to be evaluated.
 void SearchWorker::ScheduleCancelTask(int start, int end, bool stop) {
@@ -1947,13 +2266,19 @@ void SearchWorker::ScheduleCancelTask(int start, int end, bool stop) {
     // Do we need to stop task workers?
     if (stop) {
       search_->state_.task_queue_.DeactivateTasks();
+      state_.collisions_.clear();
     }
     return;
   }
 
   // Schedule the work to a task thread.
   cancel_task_.Reset(start, end, stop);
-  search_->state_.task_queue_.SubmitTask(cancel_task_, tid_);
+  if (!stop) {
+    search_->state_.task_queue_.SubmitTask(cancel_task_, tid_);
+  } else {
+    cancel_task_(tid_);
+    state_.collisions_.clear();
+  }
 }
 
 int SearchWorker::ExpandCollision(int index, int collisions_left) {
@@ -1980,13 +2305,14 @@ void SearchWorker::GatherMinibatch() {
   int minibatch_size = 0;
   int cur_n = 0;
 
+  // We take the nodes_mutex_ only once to avoid bouncing between this thread
+  // and a thread returning from RunNNComputation.
+  SharedMutex::Lock lock(search_->nodes_mutex_);
   // Collision use atomic operations. We can cancel them outside the lock.
   absl::Cleanup cancel_collsions = [this] {
     ScheduleCancelTask(0, state_.collisions_.size(), true);
   };
-  // We take the nodes_mutex_ only once to avoid bouncing between this thread
-  // and a thread returning from RunNNComputation.
-  SharedMutex::Lock lock(search_->nodes_mutex_);
+  SolidifyCandidates(*this, search_->state_, tid_, state_.solidify_candidates_);
   cur_n = search_->root_node_->GetN();
   // TODO: GetEstimatedRemainingPlayouts has already had smart pruning factor
   // applied, which doesn't clearly make sense to include here...
@@ -2029,8 +2355,7 @@ void SearchWorker::GatherMinibatch() {
     }
 
     // Free iteration memory allocations.
-    iteration_memory_age_++;
-    IterationMemoryManager::ResetLocalManager(*this, tid_);
+    NewMemoryIteration();
 
     int new_start = state_.minibatch_.size();
     int collisions_start = state_.collisions_.size();
@@ -2064,8 +2389,8 @@ void SearchWorker::GatherMinibatch() {
         DoBackupUpdateSingleNode(state_.ooobatch_[i], GetOutOfOrderPath(i));
         ++number_out_of_order_;
       }
-      state_.ooobatch_.clear();
       cancel_task_.Wait(tid_);
+      state_.ooobatch_.clear();
       state_.collisions_.erase(state_.collisions_.begin() + collisions_start,
                                state_.collisions_.begin() + collisions_end);
       collisions_end = collisions_start;
@@ -2871,7 +3196,7 @@ void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process,
 
 // 6. Propagate the new nodes' information to all their parents in the tree.
 // ~~~~~~~~~~~~~~
-void SearchWorker::DoBackupUpdate() {
+bool SearchWorker::DoBackupUpdate() {
   LCTRACE_FUNCTION_SCOPE;
   // Nodes mutex for doing node updates.
   SharedMutex::Lock lock(search_->nodes_mutex_);
@@ -2899,11 +3224,10 @@ void SearchWorker::DoBackupUpdate() {
   for (const NodeToProcess& node_to_process : state_.minibatch_) {
     DoBackupUpdateSingleNode(node_to_process, GetMinibatchPath(i++));
   }
-  // Start task workers early. This leaves scheduler a little extra time if it
-  // needs to wake up a new CPU core.
-  search_->state_.task_queue_.ActivateTasks();
-  if (!work_done) return;
+  state_.minibatch_.clear();
+  if (!work_done) return false;
   search_->total_batches_ += 1;
+  return true;
 }
 
 bool SearchWorker::MaybeAdjustForTerminalOrTransposition(
@@ -3035,6 +3359,18 @@ void SearchWorker::DoBackupUpdateSingleNode(
                           ? params_.GetUncertaintyWeightingCap()
                           : 1.0;
 
+  if (n->GetN() == 0 && path.size() > 1) {
+    const auto& parent = std::get<0>(path[path.size() - 2])->GetLowNode();
+    if (parent->CanMakeSolid() &&
+        (parent->GetN() > params_.GetSolidTreeThreshold() ||
+         parent->IsLastChild(n)) &&
+        std::none_of(state_.solidify_candidates_.begin(),
+                     state_.solidify_candidates_.end(),
+                     [&](const auto& node) { return node == parent.get(); })) {
+      state_.solidify_candidates_.emplace_back(parent.get());
+    }
+  }
+
   // Update the low node at the start of the backup path first, but only visit
   // it the first time that backup sees it.
   if (nl && nl->GetN() == 0) {
@@ -3044,6 +3380,8 @@ void SearchWorker::DoBackupUpdateSingleNode(
   } else if (nl) {
     avg_weight = std::min(avg_weight, nl->GetWeight());
   }
+
+  assert(nl || n->IsTerminal());
 
   if (nr >= 2) {
     // Three-fold itself has to be handled as a terminal to produce relevant
@@ -3219,12 +3557,12 @@ bool SearchWorker::MaybeSetBounds(Node* p, float m, double* weight_to_fix,
 
 // 7. Update the Search's status and progress information.
 //~~~~~~~~~~~~~~~~~~~~
-void SearchWorker::UpdateCounters() {
+void SearchWorker::UpdateCounters(bool work_done) {
   LCTRACE_FUNCTION_SCOPE;
   search_->PopulateCommonIterationStats(&iteration_stats_);
   search_->MaybeTriggerStop(iteration_stats_, &latest_time_manager_hints_);
   search_->MaybeOutputInfo(iteration_stats_);
-  if (state_.minibatch_.empty() && number_out_of_order_ == 0) {
+  if (!work_done) {
     int tc = search_->thread_count_.fetch_sub(1, std::memory_order_relaxed) - 1;
     if (tc <= 0) return;
 #ifndef NO_STD_ATOMIC_WAIT
@@ -3235,6 +3573,9 @@ void SearchWorker::UpdateCounters() {
         lock.get_raw(), [this, tc]() { return tc != search_->thread_count_; });
 #endif
   }
+  // Start task workers early. This leaves scheduler a little extra time if it
+  // needs to wake up a new CPU core.
+  search_->state_.task_queue_.ActivateTasks();
 }
 
 }  // namespace dag_classic

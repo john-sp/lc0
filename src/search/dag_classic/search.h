@@ -481,14 +481,15 @@ class SearchWorker {
   void FetchMinibatchResults();
 
   // 6. Propagate the new nodes' information to all their parents in the tree.
-  void DoBackupUpdate();
+  bool DoBackupUpdate();
 
   // 7. Update the Search's status and progress information.
-  void UpdateCounters();
+  void UpdateCounters(bool work_done);
 
   // Interface for IterationMemoryAllocator support.
   IterationMemoryManager& GetIterationMemoryManager(int tid);
   size_t GetIterationAge() const;
+  void NewMemoryIteration();
 
   // Interface for tasks.
   template <bool starting_from_root = false>
@@ -650,7 +651,9 @@ class SearchWorker {
   void FetchSingleNodeResult(NodeToProcess* node_to_process,
                              const BackupPath& path);
   // Process a queued task.
+ public:
   void ProcessTask(int tid);
+ private:
   void WaitForTasks();
 
   // Helpers to lookup picked node paths.
@@ -771,6 +774,7 @@ struct SearchWorkerCachedState {
   alignas(kCacheLineSize) AtomicVector<SearchWorker::CollisionNode> collisions_;
   std::vector<EvalResult> eval_results_;
   std::vector<BackupPath> node_paths_;
+  std::vector<LowNode*> solidify_candidates_;
 };
 
 // Cached state between subsequent searches.

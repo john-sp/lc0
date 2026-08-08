@@ -28,18 +28,18 @@
 #include "search/dag_classic/node.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstring>
-#include <iostream>
 #include <fstream>
-#include <list>
+#include <memory>
+#include <new>
 #include <sstream>
 #include <thread>
-#include <unordered_set>
 
-#include "utils/exception.h"
-#include "utils/hashcat.h"
+#include "search/dag_classic/search.h"
+#include "utils/trace.h"
 
 namespace lczero {
 namespace dag_classic {
@@ -109,11 +109,12 @@ std::string Edge::DebugString() const {
   return oss.str();
 }
 
-std::unique_ptr<Edge[]> Edge::FromMovelist(const MoveList& moves) {
-  std::unique_ptr<Edge[]> edges = std::make_unique<Edge[]>(moves.size());
-  auto* edge = edges.get();
-  for (const auto move : moves) edge++->move_ = move;
-  return edges;
+void Edge::FromMovelist(Edge* dst, const MoveList& moves) {
+  std::transform(moves.begin(), moves.end(), dst, [](Move move) {
+    Edge edge;
+    edge.move_ = move;
+    return edge;
+  });
 }
 
 /////////////////////////////////////////////////////////////////////////
@@ -142,7 +143,11 @@ void Node::Trim() {
 }
 
 LowNode::~LowNode() {
-  NGC::Instance().AddToGcQueue(child_);
+  if (solid_edges_) {
+    NGC::Instance().AddToGcQueue(child_.solid_);
+  } else {
+    NGC::Instance().AddToGcQueue(child_.first_);
+  }
 }
 
 Node::~Node() {
@@ -152,7 +157,7 @@ Node::~Node() {
 
 Node* Node::GetChild() const {
   if (!low_node_) return nullptr;
-  return low_node_->GetChild()->get();
+  return low_node_->GetChild();
 }
 
 bool Node::HasChildren() const { return low_node_ && low_node_->HasChildren(); }
@@ -175,7 +180,25 @@ float Node::GetTotalVisits() const {
   return low_node_ ? low_node_->GetN() : 0.0f;
 }
 
-const Edge& LowNode::GetEdgeAt(uint16_t index) const { return edges_[index]; }
+const Edge& LowNode::GetEdgeAt(uint16_t index) const {
+  if (solid_edges_) {
+    return child_.solid_->GetEdges(num_edges_)[index];
+  } else {
+    return child_.first_->GetEdges()[index];
+  }
+}
+
+Node* LowNode::GetChildAt(uint16_t index) const {
+  if (solid_edges_) {
+    return &child_.solid_->GetChild()[index];
+  } else {
+    Node* node = child_.first_->GetChild();
+    for (size_t i = 0; i < index && node; ++i) {
+      node = node->GetSibling()->get();
+    }
+    return node;
+  }
+}
 
 std::string Node::DebugString() const {
   std::ostringstream oss;
@@ -192,11 +215,10 @@ std::string Node::DebugString() const {
 
 std::string LowNode::DebugString() const {
   std::ostringstream oss;
-  oss << " <LowNode> This:" << this << " Edges:" << edges_.get()
-      << " NumEdges:" << static_cast<int>(num_edges_)
-      << " Child:" << child_.get() << " WL:" << wl_ << " D:" << d_
-      << " M:" << m_ << " N:" << weight_ << " NP:" << num_parents_
-      << " Term:" << static_cast<int>(terminal_type_)
+  oss << " <LowNode> This:" << this << " Edges:" << GetEdges()
+      << " NumEdges:" << static_cast<int>(num_edges_) << " Child:" << GetChild()
+      << " WL:" << wl_ << " D:" << d_ << " M:" << m_ << " N:" << weight_
+      << " NP:" << num_parents_ << " Term:" << static_cast<int>(terminal_type_)
       << " Bounds:" << static_cast<int>(lower_bound_) - 2 << ","
       << static_cast<int>(upper_bound_) - 2;
   return oss.str();
@@ -228,7 +250,7 @@ void LowNode::MakeTerminal(GameResult result, float plies_left, Terminal type) {
 }
 
 void LowNode::MakeNotTerminal(const Node* node) {
-  assert(edges_);
+  assert(child_.first_);
   if (!IsTerminal()) return;
 
   terminal_type_ = Terminal::NonTerminal;
@@ -284,8 +306,9 @@ void Node::MakeTerminal(GameResult result, float plies_left, Terminal type) {
   } else if (result == GameResult::BLACK_WON) {
     wl_ = -1.0f;
     d_ = 0.0f;
-    // Terminal losses have no uncertainty and no reason for their U value to be
-    // comparable to another non-loss choice. Force this by clearing the policy.
+    // Terminal losses have no uncertainty and no reason for their U value to
+    // be comparable to another non-loss choice. Force this by clearing the
+    // policy.
     SetP(0.0f);
   }
 
@@ -346,7 +369,7 @@ void Node::CancelScoreUpdate(uint32_t multivisit) {
 
 double LowNode::FinalizeScoreUpdate(double v, double d, float m,
                                     double multiweight) {
-  assert(edges_);
+  assert(child_.first_);
   // Increment N.
   weight_ += multiweight;
 
@@ -406,31 +429,221 @@ void Node::IncrementNInFlight(uint32_t multivisit) {
   n_in_flight_.fetch_add(multivisit, std::memory_order_acq_rel);
 }
 
+Node::Node(Node&& node)
+    : low_node_(std::move(node.low_node_)),
+      wl_(node.wl_),
+      d_(node.d_),
+      weight_(node.weight_),
+      sibling_(nullptr),
+      m_(node.m_),
+      n_in_flight_(node.n_in_flight_.load(std::memory_order_relaxed)),
+      edge_(node.edge_),
+      index_(node.index_),
+      terminal_type_(node.terminal_type_),
+      lower_bound_(node.lower_bound_),
+      upper_bound_(node.upper_bound_),
+      repetition_(node.repetition_) {
+  assert(GetN() == 0 || IsTerminal() || GetLowNode());
+}
 
-void LowNode::ReleaseChildrenExceptOne(Node* node_to_save) {
+Node& Node::operator=(Node&& node) {
+  low_node_ = std::move(node.low_node_);
+  wl_ = node.wl_;
+  d_ = node.d_;
+  weight_ = node.weight_;
+  sibling_ = nullptr;
+  m_ = node.m_;
+  n_in_flight_.store(node.n_in_flight_.load(std::memory_order_relaxed),
+                     std::memory_order_relaxed);
+  edge_ = node.edge_;
+  index_ = node.index_;
+  terminal_type_ = node.terminal_type_;
+  lower_bound_ = node.lower_bound_;
+  upper_bound_ = node.upper_bound_;
+  repetition_ = node.repetition_;
+  assert(GetN() == 0 || IsTerminal() || GetLowNode());
+  return *this;
+}
+
+std::unique_ptr<LowNode::ChildAndEdges> LowNode::ChildAndEdges::FromMovelist(
+    const MoveList& moves, uint16_t index) {
+  std::unique_ptr<ChildAndEdges> child(ChildAndEdges::Allocate(moves.size()));
+
+  Edge::FromMovelist(child->GetEdges(), moves);
+
+  std::construct_at(child->GetChild(), child->GetEdges()[index], index);
+
+  return child;
+}
+
+std::unique_ptr<LowNode::ChildAndEdges> LowNode::ChildAndEdges::FromNode(
+    Node&& node, uint8_t num_edges) {
+  std::unique_ptr<ChildAndEdges> child(ChildAndEdges::Allocate(num_edges));
+
+  std::construct_at(child->GetChild(), std::move(node));
+
+  return child;
+}
+
+LowNode::SolidChildren::~SolidChildren() {
+  Node* node = GetChild();
+  Node* next = node->GetSibling()->get();
+  for (; node; node = next, next = next ? next->GetSibling()->get() : nullptr) {
+    // Disconnect the sibling pointer which doesn't own the memory.
+    node->GetSibling()->release();
+    // Call destructor to clean nodes.
+    std::destroy_at(node);
+  }
+}
+
+LowNode::ChildAndEdges* LowNode::ChildAndEdges::Allocate(size_t count) {
+  // Allocates aligned memory for variable size class.
+  size_t size = sizeof(ChildAndEdges) + count * sizeof(Edge);
+  size = (size + Node::kAlignment - 1) & ~(Node::kAlignment - 1);
+  return reinterpret_cast<ChildAndEdges*>(
+      std::aligned_alloc(Node::kAlignment, size));
+}
+
+void LowNode::ChildAndEdges::operator delete(ChildAndEdges* ptr,
+                                             std::destroying_delete_t) {
+  // Custom delete operator to free aligned memory allocations.
+  std::destroy_at(ptr);
+  std::free(ptr);
+}
+
+LowNode::SolidChildren* LowNode::SolidChildren::Allocate(size_t count) {
+  // Allocates aligned memory for variable size class.
+  size_t size =
+      sizeof(SolidChildren) + count * sizeof(Node) + count * sizeof(Edge);
+  size = (size + Node::kAlignment - 1) & ~(Node::kAlignment - 1);
+  return reinterpret_cast<SolidChildren*>(
+      std::aligned_alloc(Node::kAlignment, size));
+}
+
+void LowNode::SolidChildren::operator delete(SolidChildren* ptr,
+                                             std::destroying_delete_t) {
+  // Custom delete operator to free aligned memory allocations.
+  std::destroy_at(ptr);
+  std::free(ptr);
+}
+
+std::unique_ptr<LowNode::SolidChildren> LowNode::SolidChildren::Make(
+    uint8_t num_edges, Node* child, Edge* edges) {
+  // Allocate and construct a SoldChildren from ChildAndEdges
+  std::unique_ptr<SolidChildren> solid(SolidChildren::Allocate(num_edges));
+  Node* dst = solid->GetChild();
+  // Copy existing children and
+  for (size_t i = 0; i < num_edges;
+       ++i, child = child ? child->GetSibling()->get() : nullptr) {
+    if (child) {
+      assert(child->GetN() == 0 || child->IsTerminal() || child->GetLowNode());
+      std::construct_at(&dst[i], std::move(*child));
+    } else {
+      std::construct_at(&dst[i], edges[i], i);
+    }
+    // Connect linked list for iteration.
+    if (i + 1 < num_edges) {
+      dst[i].GetSibling()->reset(&dst[i + 1]);
+    }
+  }
+  // Copy edges.
+  std::copy(edges, edges + num_edges, solid->GetEdges(num_edges));
+  return solid;
+}
+
+LowNode::PointerChanges* LowNode::PointerChanges::Allocate(size_t count) {
+  // Allocate variable size class to temporary iteration memory. There won't be
+  // an destructor calls. All pointers must be non-owning because all memory
+  // will be leaked.
+  using Allocator = IterationMemoryAllocator<char>;
+  size_t size = sizeof(PointerChanges) + count * sizeof(Node*) * 2;
+  auto* rv = reinterpret_cast<PointerChanges*>(Allocator().allocate(size));
+  rv->num_edges_ = 0;
+  rv->capacity_ = count;
+  return rv;
+}
+
+LowNode::PointerChanges* LowNode::MakeSolid() {
+  if (solid_edges_) {
+    return PointerChanges::Allocate(0);
+  }
+  PointerChanges* result = PointerChanges::Allocate(num_edges_);
+  // Collect old Node pointers to convert BackupPaths.
+  for (Node* node = child_.first_->GetChild(); node;
+       node = node->GetSibling()->get()) {
+    assert(node->GetN() == 0 || node->IsTerminal() || node->GetLowNode());
+    result->changes_[result->num_edges_++] = node;
+  }
+  auto solid = SolidChildren::Make(num_edges_, child_.first_->GetChild(),
+                                   child_.first_->GetEdges());
+  NGC::Instance().AddToGcQueue(child_.first_);
+  child_.solid_ = solid.release();
+  solid_edges_ = true;
+  // Collect new pointers which are used to update BackupPaths.
+  for (size_t i = 0; i < result->size(); ++i) {
+    Node* node = &child_.solid_->GetChild()[i];
+    assert(node->GetN() == 0 || node->IsTerminal() || node->GetLowNode());
+    (*result)[i].new_ = node;
+  }
+  return result;
+}
+
+Node* Node::MakeSingleChild(Move move) {
+  if (low_node_ && low_node_->GetChild()->GetMove() == move) {
+    ReleaseChildrenExceptOne(move);
+    return low_node_->GetChild();
+  } else if (low_node_) {
+    // We cannot reuse low node that might be in TT if child isn't the highest
+    // policy child. We must unlink it and create a new private low node.
+    UnsetLowNode();
+  }
+  return CreateSingleChildNode(move);
+}
+
+void LowNode::ReleaseChildrenExceptOne(Move move) {
   auto& ngc = NGC::Instance();
   // Stores node which will have to survive (or nullptr if it's not found).
-  std::unique_ptr<Node> saved_node;
+  std::unique_ptr<ChildAndEdges> saved_node;
+  // Handle first node as a special case.
+  auto* first_node = GetChild();
+  if (first_node->GetMove() == move) {
+    if (solid_edges_) {
+      saved_node = ChildAndEdges::FromNode(std::move(*first_node), num_edges_);
+      ngc.AddToGcQueue(child_.solid_);
+      child_.first_ = saved_node.release();
+      solid_edges_ = false;
+      return;
+    } else {
+      ngc.AddToGcQueue(*first_node->GetSibling());
+      return;
+    }
+  }
   // Pointer to atomic_unique_ptr, so that we could move from it.
-  for (auto node = &child_; *node; node = (*node)->GetSibling()) {
+  for (auto node = first_node->GetSibling(); *node;
+       node = (*node)->GetSibling()) {
     // If current node is the one that we have to save.
-    if (node->get() == node_to_save) {
-      // Kill all remaining siblings.
-      ngc.AddToGcQueue(*(*node)->GetSibling());
+    if ((*node)->GetMove() == move) {
       // Save the node, and take the ownership from the unique_ptr.
-      saved_node.reset(node->release());
+      if (solid_edges_) {
+        (*node)->GetSibling()->release();
+        saved_node = ChildAndEdges::FromNode(std::move(**node), num_edges_);
+        ngc.AddToGcQueue(child_.solid_);
+      } else {
+        *GetChild() = std::move(**node);
+        saved_node.reset(child_.first_);
+      }
       break;
     }
   }
-  // Make saved node the only child. (kills previous siblings).
-  ngc.AddToGcQueue(child_);
-  child_ = std::move(saved_node);
+  child_.first_ = saved_node.release();
+  solid_edges_ = false;
+  return;
 }
 
-void Node::ReleaseChildrenExceptOne(Node* node_to_save) const {
+void Node::ReleaseChildrenExceptOne(Move move) const {
   // Sometime we have no graph yet or a reverted terminal without low node.
   if (low_node_) {
-    low_node_->ReleaseChildrenExceptOne(node_to_save);
+    low_node_->ReleaseChildrenExceptOne(move);
   }
 }
 
@@ -451,25 +664,21 @@ static Node::VisitorId::storage current_visitor_id = 0;
 
 Node::VisitorId::VisitorId() {
   id_ = ++current_visitor_id;
-  if (id_ == 0)
-    id_ = ++current_visitor_id;
+  if (id_ == 0) id_ = ++current_visitor_id;
 }
 
-Node::VisitorId::~VisitorId() {
-  assert(current_visitor_id == id_);
-}
+Node::VisitorId::~VisitorId() { assert(current_visitor_id == id_); }
 
 bool LowNode::Visit(Node::VisitorId::type id) {
-  if (visitor_id_ == id)
-    return false;
+  if (visitor_id_ == id) return false;
   visitor_id_ = id;
   return true;
 }
 
-template<typename VisitorType, typename EdgeVisitorType>
+template <typename VisitorType, typename EdgeVisitorType>
 static void TreeWalk(const Node* node, bool as_opponent,
-                     Node::VisitorId::type id,
-                     VisitorType visitor, EdgeVisitorType edge) {
+                     Node::VisitorId::type id, VisitorType visitor,
+                     EdgeVisitorType edge) {
   const std::shared_ptr<LowNode>& low_node = node->GetLowNode();
   if (!low_node || !low_node->Visit(id)) {
     return;
@@ -500,9 +709,9 @@ static std::string PtrToNodeName(const void* ptr) {
   return oss.str();
 }
 
-template<typename VisitorType, typename EdgeVisitorType>
-static void TreeWalk(const Node* node, bool as_opponent,
-                     VisitorType visitor, EdgeVisitorType edge) {
+template <typename VisitorType, typename EdgeVisitorType>
+static void TreeWalk(const Node* node, bool as_opponent, VisitorType visitor,
+                     EdgeVisitorType edge) {
   Node::VisitorId id{};
   edge(node, as_opponent, nullptr);
   TreeWalk(node, !as_opponent, id, visitor, edge);
@@ -530,9 +739,9 @@ void LowNode::DotNodeString(std::ofstream& oss) const {
       << std::showpos                                    //
       << "\\nBounds=" << static_cast<int>(lower_bound_) - 2 << ","
       << static_cast<int>(upper_bound_) - 2 << std::noshowpos  //
-      << "\\n\\nThis=" << this << "\\nEdges=" << edges_.get()
+      << "\\n\\nThis=" << this << "\\nEdges=" << GetEdges()
       << "\\nNumEdges=" << static_cast<int>(num_edges_)
-      << "\\nChild=" << child_.get() << "\\n\"";
+      << "\\nChild=" << GetChild() << "\\n\"";
   oss << "];" << std::endl;
 }
 
@@ -577,31 +786,30 @@ void Node::DotGraphString(std::ofstream& oss, bool as_opponent) const {
       << "];" << std::endl;
   oss << "ranksep=" << 4.0f * std::log10(GetN()) << std::endl;
 
-  TreeWalk(this, !as_opponent,
-    [&](const LowNode* low_node, bool) {
-      low_node->DotNodeString(oss);
-    },
-    [&](const Node* node, bool as_opponent, const LowNode* parent) {
-      node->DotEdgeString(oss, as_opponent, parent);
-    });
+  TreeWalk(
+      this, !as_opponent,
+      [&](const LowNode* low_node, bool) { low_node->DotNodeString(oss); },
+      [&](const Node* node, bool as_opponent, const LowNode* parent) {
+        node->DotEdgeString(oss, as_opponent, parent);
+      });
 
   oss << "}" << std::endl;
 }
 
 bool Node::ZeroNInFlight() const {
   size_t nonzero_node_count = 0;
-  TreeWalk(this, false,
-    [](const LowNode*, bool) {},
-    [&](const Node* node, bool, const LowNode*) {
-      if (node->GetNInFlight() > 0) [[unlikely]] {
-        CERR << node->DebugString() << std::endl;
-        ++nonzero_node_count;
-      }
-    });
+  TreeWalk(
+      this, false, [](const LowNode*, bool) {},
+      [&](const Node* node, bool, const LowNode*) {
+        if (node->GetNInFlight() > 0) [[unlikely]] {
+          CERR << node->DebugString() << std::endl;
+          ++nonzero_node_count;
+        }
+      });
 
   if (nonzero_node_count > 0) {
-    CERR << "GetNInFlight() is nonzero on " << nonzero_node_count
-              << " nodes" << std::endl;
+    CERR << "GetNInFlight() is nonzero on " << nonzero_node_count << " nodes"
+         << std::endl;
     return false;
   }
 
@@ -663,21 +871,10 @@ NodeTree::~NodeTree() {
 }
 
 void NodeTree::MakeMove(Move move) {
-  Node* new_head = nullptr;
-  for (auto& n : current_head_->Edges()) {
-    if (n.GetMove() == move) {
-      new_head = n.GetOrSpawnNode(current_head_);
-      // Ensure head is not terminal, so search can extend or visit children of
-      // "terminal" positions, e.g., WDL hits, converted terminals, 3-fold draw.
-      if (new_head->IsTerminal()) new_head->MakeNotTerminal();
-      break;
-    }
-  }
-  // Release nodes from last move if any.
-  current_head_->ReleaseChildrenExceptOne(new_head);
-  new_head = current_head_->GetChild();
-  current_head_ =
-      new_head ? new_head : current_head_->CreateSingleChildNode(move);
+  current_head_ = current_head_->MakeSingleChild(move);
+  // Ensure head is not terminal, so search can extend or visit children of
+  // "terminal" positions, e.g., WDL hits, converted terminals, 3-fold draw.
+  if (current_head_->IsTerminal())  current_head_->MakeNotTerminal();
   history_.Append(move);
   moves_.push_back(move);
 }
@@ -984,6 +1181,7 @@ void ReleaseNodesWork<Types>::Submit() {
   if (released_nodes_.empty()) {
     return;
   }
+  LCTRACE_FUNCTION_SCOPE;
   auto& worker = NodeGarbageCollector<Types>::Instance();
   SpinMutex::Lock lock(worker.mutex_);
   // If this is worker, we have oldest nodes. Keep them at front of the queue.
