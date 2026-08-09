@@ -600,7 +600,7 @@ class SearchWorker {
 
     // Details that are filled in as we go.
     uint64_t hash;
-    std::shared_ptr<LowNode> tt_low_node;
+    IntrusiveSharedPtr<LowNode> tt_low_node;
 
     std::string DebugString(const BackupPath& path) const {
       auto node = std::get<0>(path.back());
@@ -637,7 +637,7 @@ class SearchWorker {
   // terminal status of node @n using information from its child low node.
   // Return true if adjustment happened.
   bool MaybeAdjustForTerminalOrTransposition(Node* n,
-                                             const std::shared_ptr<LowNode>& nl,
+                                             const IntrusiveSharedPtr<LowNode>& nl,
                                              double& v, double& d, float& m,
                                              double avg_weight,
                                              double& weight_to_fix, double& v_delta,

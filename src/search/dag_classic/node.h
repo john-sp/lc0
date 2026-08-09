@@ -245,6 +245,85 @@ class VisitedNode_Iterator;
 template <typename Types>
 class ReleaseNodesWork;
 
+// Intrusive shared pointer for LowNode. It allows reducing 16 bytes of
+// std::shared_ptr to 8 bytes. It should require minimal changes to replace
+// std::shared_ptr. The main difference is requirement that stored object must
+// implement AddRef and Release functions. Release returns true if this object
+// holds the last reference.
+template <typename T>
+class IntrusiveSharedPtr {
+ public:
+  explicit IntrusiveSharedPtr(T* ptr = nullptr) noexcept : ptr_(ptr) {
+    if (ptr_) {
+      ptr_->AddRef();
+    }
+  }
+
+  ~IntrusiveSharedPtr() { Release(); }
+
+  IntrusiveSharedPtr(const IntrusiveSharedPtr& other) noexcept
+      : ptr_(other.ptr_) {
+    AddRef();
+  }
+
+  IntrusiveSharedPtr& operator=(const IntrusiveSharedPtr& other) noexcept {
+    assert(this != &other);
+    reset(other.ptr_);
+    return *this;
+  }
+  IntrusiveSharedPtr& operator=(IntrusiveSharedPtr&& other) noexcept {
+    assert(this != &other);
+    Release();
+    ptr_ = other.ptr_;
+    other.ptr_ = nullptr;
+    return *this;
+  }
+
+  void reset(T* ptr = nullptr) noexcept {
+    Release();
+    ptr_ = ptr;
+    AddRef();
+  }
+
+  T* get() const { return ptr_; }
+  T* operator->() const { return ptr_; }
+  T& operator*() const { return *ptr_; }
+
+  explicit operator bool() const { return ptr_ != nullptr; }
+  auto operator<=>(const IntrusiveSharedPtr& other) const {
+    return ptr_ <=> other.ptr_;
+  }
+  bool operator==(const IntrusiveSharedPtr& other) const {
+    return ptr_ == other.ptr_;
+  }
+
+ private:
+  void AddRef() {
+    if (!ptr_) return;
+    ptr_->AddRef();
+  }
+  void Release() {
+    if (!ptr_) return;
+
+    if (ptr_->Release()) {
+      delete ptr_;
+    }
+    ptr_ = nullptr;
+  }
+
+  T* ptr_ = nullptr;
+};
+
+template <typename T>
+std::ostream& operator<<(std::ostream& os, const IntrusiveSharedPtr<T>& ptr) {
+  return os << ptr.get();
+}
+
+template <typename T, typename... Args>
+IntrusiveSharedPtr<T> MakeShared(Args&&... args) {
+  return IntrusiveSharedPtr<T>(new T(std::forward<Args>(args)...));
+}
+
 class LowNode;
 class Node {
  public:
@@ -282,7 +361,7 @@ class Node {
   // before that.
   Node* CreateSingleChildNode(Move move) {
     assert(!low_node_);
-    auto low_node = std::make_shared<LowNode>(MoveList({move}));
+    auto low_node = MakeShared<LowNode>(MoveList({move}));
     SetLowNode(low_node);
     return GetChild();
   }
@@ -379,9 +458,9 @@ class Node {
   float GetP() const { return edge_.GetP(); }
   void SetP(float val) { edge_.SetP(val); }
 
-  const std::shared_ptr<LowNode>& GetLowNode() const { return low_node_; }
+  const auto& GetLowNode() const { return low_node_; }
 
-  void SetLowNode(std::shared_ptr<LowNode> low_node);
+  void SetLowNode(IntrusiveSharedPtr<LowNode> low_node);
   void UnsetLowNode();
 
   // Debug information about the node.
@@ -443,7 +522,7 @@ class Node {
 
   // 16 byte fields on 64-bit platforms, 8 byte on 32-bit.
   // Shared pointer to the low node.
-  std::shared_ptr<LowNode> low_node_;
+  IntrusiveSharedPtr<LowNode> low_node_;
 
   // 8 byte fields.
   // Average value (from value head of neural network) of all visited nodes in
@@ -628,21 +707,21 @@ class LowNode {
   PointerChanges* MakeSolid(bool no_results = false);
 
   // Add new parent with @n_in_flight visits.
-  void AddParent() {
+  void AddRef() {
     num_parents_.fetch_add(1, std::memory_order_acq_rel);
 
     assert(num_parents_ > 0);
   }
   // Remove parent and its first visit.
-  void RemoveParent() {
+  bool Release() {
     assert(num_parents_ > 0);
-    num_parents_.fetch_sub(1, std::memory_order_acq_rel);
+    return num_parents_.fetch_sub(1, std::memory_order_acq_rel) == 1;
   }
   uint32_t GetNumParents() const {
     return num_parents_.load(std::memory_order_acquire);
   }
   bool IsTransposition() const {
-    return num_parents_.load(std::memory_order_acquire) > 1;
+    return num_parents_.load(std::memory_order_acquire) > 2;
   }
 
   bool WLDMInvariantsHold() const;
@@ -890,9 +969,8 @@ class LowNode {
 
   float m_ = 0.0f;
 
-  // 2 byte fields.
   // Number of parents.
-  std::atomic<uint16_t> num_parents_ = {};
+  std::atomic<uint32_t> num_parents_ = {};
 
   // 1 byte fields.
   // Number of edges in @edges_.
@@ -1200,7 +1278,7 @@ inline VisitedNode_Iterator<false> Node::VisitedNodes() {
 }
 
 // Transposition Table type for holding references to all low nodes in DAG.
-typedef HashKeyedCache<std::weak_ptr<LowNode>> TranspositionTable;
+typedef HashKeyedCache<IntrusiveSharedPtr<LowNode>> TranspositionTable;
 
 class NodeTree {
  public:

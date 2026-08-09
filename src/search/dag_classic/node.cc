@@ -723,21 +723,17 @@ void Node::ReleaseChildrenExceptOne(Move move) {
         low_node_->GetChild()->GetSibling()->get()) {
       // If low node isn't already a single child, we need to copy low_node to
       // avoid potential tt low node losing children.
-      auto low = std::make_shared<LowNode>(*low_node_, move);
-      UnsetLowNode();
-      SetLowNode(low);
+      low_node_ = MakeShared<LowNode>(*low_node_, move);
       return;
     }
   }
 }
 
-void Node::SetLowNode(std::shared_ptr<LowNode> low_node) {
+void Node::SetLowNode(IntrusiveSharedPtr<LowNode> low_node) {
   assert(!low_node_);
-  low_node->AddParent();
   low_node_ = low_node;
 }
 void Node::UnsetLowNode() {
-  if (low_node_) low_node_->RemoveParent();
   low_node_.reset();
 }
 
@@ -763,7 +759,7 @@ template <typename VisitorType, typename EdgeVisitorType>
 static void TreeWalk(const Node* node, bool as_opponent,
                      Node::VisitorId::type id, VisitorType visitor,
                      EdgeVisitorType edge) {
-  const std::shared_ptr<LowNode>& low_node = node->GetLowNode();
+  const auto& low_node = node->GetLowNode();
   if (!low_node || !low_node->Visit(id)) {
     return;
   }

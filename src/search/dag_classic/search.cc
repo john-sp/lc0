@@ -3073,13 +3073,16 @@ void SearchWorker::ExtendNode(NodeToProcess& picked_node,
   picked_node.hash = history.HashLast(params_.GetCacheHistoryLength() + 1);
   auto entry = search_->tt_->LookupAndPin(picked_node.hash);
   if (entry) {
-    picked_node.tt_low_node = entry->lock();
+    picked_node.tt_low_node = *entry;
     search_->tt_->Unpin(picked_node.hash, entry);
   }
   if (picked_node.tt_low_node) {
     picked_node.is_tt_hit = true;
   } else {
-    picked_node.tt_low_node = search_->root_node_ == node ? std::make_shared<LowNode>(legal_moves, LowNode::RootTag{}) : std::make_shared<LowNode>(legal_moves);
+    picked_node.tt_low_node =
+        search_->root_node_ == node
+            ? MakeShared<LowNode>(legal_moves, LowNode::RootTag{})
+            : MakeShared<LowNode>(legal_moves);
     picked_node.nn_queried = true;
     picked_node.eval_index =
         GetEvalIndex(eval_used_, state_.eval_results_.size());
@@ -3229,9 +3232,9 @@ bool SearchWorker::DoBackupUpdate() {
 }
 
 bool SearchWorker::MaybeAdjustForTerminalOrTransposition(
-    Node* n, const std::shared_ptr<LowNode>& nl, double& v, double& d, float& m,
-    double avg_weight, double& weight_to_fix, double& v_delta, double& d_delta,
-    float& m_delta, bool& update_parent_bounds) const {
+    Node* n, const IntrusiveSharedPtr<LowNode>& nl, double& v, double& d,
+    float& m, double avg_weight, double& weight_to_fix, double& v_delta,
+    double& d_delta, float& m_delta, bool& update_parent_bounds) const {
   if (n->IsTerminal()) {
     v = n->GetWL();
     d = n->GetD();
@@ -3241,8 +3244,7 @@ bool SearchWorker::MaybeAdjustForTerminalOrTransposition(
   }
 
   // Use information from transposition or a new terminal.
-  if (nl->IsTransposition() || nl->IsTerminal() ||
-      n->GetWeight() + avg_weight < nl->GetWeight()) {
+  if (nl->IsTerminal() || n->GetWeight() + avg_weight < nl->GetWeight()) {
     // Adapt information from low node to node by flipping Q sign, bounds,
     // result and incrementing m.
     v = -nl->GetWL();
@@ -3294,7 +3296,7 @@ void SearchWorker::DoBackupUpdateSingleNode(
     auto entry = search_->tt_->LookupAndPin(node_to_process.hash);
     if (!entry) {
       bool insert_ok = search_->tt_->Insert(
-          node_to_process.hash, std::make_unique<std::weak_ptr<LowNode>>(
+          node_to_process.hash, std::make_unique<IntrusiveSharedPtr<LowNode>>(
                                     node_to_process.tt_low_node));
       if (!insert_ok) {
         // The insert may fail if another thread added the same hash.
@@ -3306,16 +3308,8 @@ void SearchWorker::DoBackupUpdateSingleNode(
     if (is_tt_miss) {
       n->SetLowNode(node_to_process.tt_low_node);
     } else {
-      auto tt_low_node = entry->lock();
-      if (!tt_low_node) {
-        // An insert would fail, so update the (expired) entry directly.
-        *entry = node_to_process.tt_low_node;
-        search_->tt_->Unpin(node_to_process.hash, entry);
-        n->SetLowNode(node_to_process.tt_low_node);
-      } else {
-        search_->tt_->Unpin(node_to_process.hash, entry);
-        n->SetLowNode(tt_low_node);
-      }
+      n->SetLowNode(*entry);
+      search_->tt_->Unpin(node_to_process.hash, entry);
     }
   } else if (node_to_process.is_tt_hit) {
     n->SetLowNode(node_to_process.tt_low_node);
