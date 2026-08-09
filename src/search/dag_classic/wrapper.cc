@@ -51,12 +51,10 @@ const OptionId kClearTree{
      .help_text = "Clear the tree before the next search.",
      .visibility = OptionId::kProOnly}};
 
-#ifdef FIX_TT
 const OptionId kHashId{{.long_flag = "hash",
                         .uci_option = "Hash",
                         .help_text = "Size of the transposition table in MB.",
                         .visibility = OptionId::kAlwaysVisible}};
-#endif
 
 class DagClassicSearch : public SearchBase {
  public:
@@ -119,11 +117,7 @@ void DagClassicSearch::NewGame() {
   LCTRACE_FUNCTION_SCOPE;
   LOGFILE << "New game.";
   search_.reset();
-#ifndef FIX_TT
-  tt_.clear();
-#else
   tt_.Clear();
-#endif
   tree_.reset();
   time_manager_ = classic::MakeTimeManager(*options_);
 }
@@ -134,11 +128,9 @@ void DagClassicSearch::SetPosition(const GameState& pos) {
   const bool is_same_game = tree_->ResetToPosition(pos);
   LOGFILE << "Tree reset to a new position.";
   if (!is_same_game) time_manager_ = classic::MakeTimeManager(*options_);
-#ifdef FIX_TT
   // Transposition table size.
   tt_.SetCapacity(options_->Get<int>(kHashId) * 1000000 /
                   tt_.GetItemStructSize());
-#endif
 }
 
 void DagClassicSearch::StartSearch(const GoParams& params) {
@@ -161,11 +153,7 @@ void DagClassicSearch::StartSearch(const GoParams& params) {
       sizeof(float[classic::MemoryWatchingStopper::kAvgMovesPerPosition]);
   size_t total_memory =
       tree_.get()->GetCurrentHead()->GetN() * kAvgNodeSize +
-#ifdef FIX_TT
       tt_.GetCapacity() * tt_.GetItemStructSize() +
-#else
-      (sizeof(TranspositionTable::value_type) + 1) * tt_.bucket_count() +
-#endif
       cache_size * kAvgCacheItemSize;
   auto stopper = time_manager_->GetStopper(
       params, tree_.get()->HeadPosition(), total_memory, kAvgNodeSize,
@@ -178,10 +166,8 @@ void DagClassicSearch::StartSearch(const GoParams& params) {
       StringsToMovelist(params.searchmoves, tree_->HeadPosition().GetBoard()),
       *move_start_time_, std::move(stopper), params.infinite, params.ponder,
       *options_, &tt_, syzygy_tb_);
-#ifdef FIX_TT
   LOGFILE << "Transposition table load factor is "
           << tt_.GetSize() / static_cast<float>(tt_.GetCapacity());
-#endif
   LOGFILE << "Timer started at "
           << FormatTime(SteadyClockToSystemClock(*move_start_time_));
   search_->StartThreads(options_->Get<int>(kThreadsOptionId));
@@ -197,9 +183,7 @@ class DagClassicSearchFactory : public SearchFactory {
 
   void PopulateParams(OptionsParser* parser) const override {
     parser->Add<IntOption>(kThreadsOptionId, 0, 128) = 0;
-#ifdef FIX_TT
     parser->Add<IntOption>(kHashId, 0, 10000) = 50;
-#endif
     SearchParams::Populate(parser);
     classic::PopulateTimeManagementOptions(classic::RunType::kUci, parser);
 

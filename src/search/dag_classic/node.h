@@ -1200,12 +1200,7 @@ inline VisitedNode_Iterator<false> Node::VisitedNodes() {
 }
 
 // Transposition Table type for holding references to all low nodes in DAG.
-#ifndef FIX_TT
-typedef absl::flat_hash_map<uint64_t, std::weak_ptr<LowNode>>
-    TranspositionTable;
-#else
 typedef HashKeyedCache<std::weak_ptr<LowNode>> TranspositionTable;
-#endif
 
 class NodeTree {
  public:
