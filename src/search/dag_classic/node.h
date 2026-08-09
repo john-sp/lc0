@@ -352,6 +352,11 @@ class Node {
 
   ~Node();
 
+  // Returns mutex for backup propagation. It is used to synchronize access to
+  // the evaluation. Mutex must be locked in order from child to parent to avoid
+  // deadlocks. The parent LowNode must be locked before this node is released.
+  auto& GetMutex() { return backprop_mutex_; }
+
   // Trim node, resetting everything except parent, sibling, edge and index.
   void Trim();
 
@@ -549,6 +554,7 @@ class Node {
   // but not finished). This value is added to n during selection which node
   // to pick in MCTS, and also when selecting the best move.
   std::atomic<uint32_t> n_in_flight_ = 0;
+  SpinMutex backprop_mutex_;
 
   // Move and policy for this edge.
   Edge edge_;
@@ -591,6 +597,11 @@ class LowNode {
   }
   LowNode(const LowNode& low_node, Move saved_child);
   ~LowNode();
+
+  // Returns mutex for backup propagation. It is used to synchronize access to
+  // the evaluation. Mutex must be locked in order from child to parent to avoid
+  // deadlocks. The parent Node must be locked before this node is released.
+  auto& GetMutex() { return backprop_mutex_; }
 
   void SetNNEval(const EvalResult* eval) {
     assert(weight_ == 0);
@@ -964,6 +975,7 @@ class LowNode {
   // Estimated remaining plies.
 
   float m_ = 0.0f;
+  SpinMutex backprop_mutex_;
 
   // Number of parents.
   std::atomic<uint32_t> num_parents_ = {};

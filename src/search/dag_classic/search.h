@@ -662,11 +662,30 @@ class SearchWorker {
       Node* n, const IntrusiveSharedPtr<LowNode>& nl, double& v, double& d,
       float& m, double& weight_to_fix, double& v_delta, double& d_delta,
       float& m_delta, bool& update_parent_bounds) const;
-  void DoBackupUpdateSingleNode(const NodeToProcess& node_to_process,
-                                const BackupPath& path);
+
+ public:
+  struct BackupUpdateResults {
+    uint32_t total_playouts_ = 0;
+    uint32_t network_evaluations_ = 0;
+    uint32_t cum_depth_ = 0;
+    uint16_t max_depth_ = 0;
+
+    BackupUpdateResults& operator+=(const BackupUpdateResults& other) {
+      total_playouts_ += other.total_playouts_;
+      network_evaluations_ += other.network_evaluations_;
+      cum_depth_ += other.cum_depth_;
+      max_depth_ = std::max(max_depth_, other.max_depth_);
+      return *this;
+    }
+  };
+  BackupUpdateResults DoBackupUpdateSingleNode(
+      const NodeToProcess& node_to_process, const BackupPath& path);
+  bool IsMinibatch(const AtomicVector<NodeToProcess>& batch) const;
+
+ private:
   // Returns whether a node's bounds were set based on its children.
-  bool MaybeSetBounds(Node* p, float m, double* weight_to_fix, double* v_delta,
-                      double* d_delta, float* m_delta) const;
+  template <typename L>
+  bool MaybeSetBounds(Node* p, float m, L& low_lock) const;
   std::tuple<int, int> PickNodesToExtend(int collision_limit);
   void ScheduleCancelTask(int start, int end, bool stop);
   int ExpandCollision(int idenx, int collisions_left);
@@ -679,13 +698,15 @@ class SearchWorker {
   bool ShouldStopPickingHere(Node* node, bool is_root_node, int repetitions);
   void ExtendNode(NodeToProcess& picked_node, const BackupPath& path,
                   const PositionHistory& history);
+
  public:
   void FetchSingleNodeResult(const NodeToProcess* node_to_process,
                              const BackupPath& path);
+
   // Process a queued task.
   void ProcessTask(int tid);
   template <typename TaskType>
-  void SubmitTasks(const TaskType& task);
+  void SubmitTasks(const TaskType& tasks);
 
   void MaybeOutputInfo();
 
@@ -694,8 +715,10 @@ class SearchWorker {
 
  public:
   // Helpers to lookup picked node paths.
+ public:
   const BackupPath& GetMinibatchPath(int index) const;
   const BackupPath& GetOutOfOrderPath(int index) const;
+
  private:
   const BackupPath& GetCollisionPath(int index) const;
   // Helpers to assign picked node paths.
