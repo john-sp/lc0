@@ -584,10 +584,8 @@ class SearchWorker {
       auto node = std::get<0>(path.back());
       return !node->IsTerminal() && !node->GetLowNode();
     }
-    bool CanEvalOutOfOrder(const BackupPath& path) const {
-      auto node = std::get<0>(path.back());
-      return is_tt_hit || is_cache_hit || node->IsTerminal() ||
-             node->GetLowNode();
+    bool CanEvalOutOfOrder(const BackupPath&) const {
+      return is_tt_hit || is_cache_hit || is_edge_update;
     }
 
     // The node to extend.
@@ -597,10 +595,8 @@ class SearchWorker {
     bool is_cache_hit : 1  = false;
     bool is_black_to_move : 1 = false;
     bool is_delayed_cache_hit : 1 = false;
-
-    // Details that are filled in as we go.
-    uint64_t hash;
-    IntrusiveSharedPtr<LowNode> tt_low_node;
+    bool is_delayed_tt_hit : 1 = false;
+    bool is_edge_update : 1 = false;
 
     std::string DebugString(const BackupPath& path) const {
       auto node = std::get<0>(path.back());

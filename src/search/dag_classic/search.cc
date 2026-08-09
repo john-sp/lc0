@@ -2368,7 +2368,8 @@ void SearchWorker::GatherMinibatch() {
         non_collisions - std::count_if(state_.minibatch_.begin() + new_start,
                                        state_.minibatch_.begin() + new_end,
                                        [](const auto& item) {
-                                         return item.is_delayed_cache_hit;
+                                         return item.is_delayed_cache_hit ||
+                                                item.is_delayed_tt_hit;
                                        });
 
     if (!state_.ooobatch_.empty()) {
@@ -2983,6 +2984,8 @@ void SearchWorker::Visit(const BackupPath& path,
   NodeToProcess picked_node(history);
   if (picked_node.IsExtendable(path)) {
     ExtendNode(picked_node, path, history);
+  } else {
+    picked_node.is_edge_update = true;
   }
   if (params_.GetOutOfOrderEval() && picked_node.CanEvalOutOfOrder(path)) {
     int i = state_.ooobatch_.emplace_back(std::move(picked_node));
@@ -3069,19 +3072,21 @@ void SearchWorker::ExtendNode(NodeToProcess& picked_node,
 
   // Check the transposition table first and NN cache second before asking for
   // NN evaluation.
-  picked_node.hash = history.HashLast(params_.GetCacheHistoryLength() + 1);
-  auto entry = search_->tt_->LookupAndPin(picked_node.hash);
-  if (entry) {
-    picked_node.tt_low_node = *entry;
-    search_->tt_->Unpin(picked_node.hash, entry);
+  auto hash = history.HashLast(params_.GetCacheHistoryLength() + 1);
+  auto entry = search_->tt_->LookupAndPin(hash);
+  bool tt_hit = true;
+  if (!entry) {
+    auto new_node = search_->root_node_ == node
+                        ? MakeShared<LowNode>(legal_moves, LowNode::RootTag{})
+                        : MakeShared<LowNode>(legal_moves);
+    auto uniq = std::make_unique<decltype(new_node)>(new_node);
+    tt_hit = !search_->tt_->Insert(hash, std::move(uniq));
+    entry = search_->tt_->LookupAndPin(hash);
   }
-  if (picked_node.tt_low_node) {
-    picked_node.is_tt_hit = true;
-  } else {
-    picked_node.tt_low_node =
-        search_->root_node_ == node
-            ? MakeShared<LowNode>(legal_moves, LowNode::RootTag{})
-            : MakeShared<LowNode>(legal_moves);
+  assert(entry);
+  node->SetLowNode(*entry);
+  search_->tt_->Unpin(hash, entry);
+  if (!tt_hit) {
     picked_node.nn_queried = true;
     picked_node.eval_index =
         GetEvalIndex(eval_used_, state_.eval_results_.size());
@@ -3106,6 +3111,12 @@ void SearchWorker::ExtendNode(NodeToProcess& picked_node,
       case BackendComputation::FETCHED_DELAYED:
         picked_node.is_delayed_cache_hit = true;
         break;
+    }
+  } else {
+    if (node->GetLowNode()->GetN() == 0) {
+      picked_node.is_delayed_tt_hit = true;
+    } else {
+      picked_node.is_tt_hit = true;
     }
   }
 }
@@ -3181,16 +3192,18 @@ void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process,
   } else {
     eval.e = 1.0f;
   }
-  node_to_process->tt_low_node->SetNNEval(&eval);
-  node_to_process->tt_low_node->SortEdges();
-
   // Add NN results to node.
   Node* node = std::get<0>(path.back());
+  const auto& low_node = node->GetLowNode();
+  assert(low_node);
+  low_node->SetNNEval(&eval);
+  low_node->SortEdges();
+
   // Add Dirichlet noise if enabled and at root.
   if (params_.GetNoiseEpsilon() && node == search_->root_node_) {
-    ApplyDirichletNoise(node_to_process->tt_low_node.get(),
-                        params_.GetNoiseEpsilon(), params_.GetNoiseAlpha());
-    node_to_process->tt_low_node->SortEdges();
+    ApplyDirichletNoise(low_node.get(), params_.GetNoiseEpsilon(),
+                        params_.GetNoiseAlpha());
+    low_node->SortEdges();
   }
 }
 
@@ -3289,28 +3302,6 @@ void SearchWorker::DoBackupUpdateSingleNode(
     REQUIRES(search_->nodes_mutex_) {
   LCTRACE_FUNCTION_SCOPE;
   auto [n, nr, nm] = path.back();
-  if (node_to_process.nn_queried) {
-    auto entry = search_->tt_->LookupAndPin(node_to_process.hash);
-    if (!entry) {
-      bool insert_ok = search_->tt_->Insert(
-          node_to_process.hash, std::make_unique<IntrusiveSharedPtr<LowNode>>(
-                                    node_to_process.tt_low_node));
-      if (!insert_ok) {
-        // The insert may fail if another thread added the same hash.
-        // In the unlikely case it fails, the search will still work OK.
-        entry = search_->tt_->LookupAndPin(node_to_process.hash);
-      }
-    }
-    bool is_tt_miss = !entry;
-    if (is_tt_miss) {
-      n->SetLowNode(node_to_process.tt_low_node);
-    } else {
-      n->SetLowNode(*entry);
-      search_->tt_->Unpin(node_to_process.hash, entry);
-    }
-  } else if (node_to_process.is_tt_hit) {
-    n->SetLowNode(node_to_process.tt_low_node);
-  }
 
   // For the first visit to a terminal, maybe update parent bounds too.
   auto update_parent_bounds =
@@ -3331,6 +3322,17 @@ void SearchWorker::DoBackupUpdateSingleNode(
   // Update the low node at the start of the backup path first, but only visit
   // it the first time that backup sees it.
   if (nl && nl->GetN() == 0) {
+    if (node_to_process.is_delayed_tt_hit || node_to_process.is_edge_update) {
+      // If GatherMinibatch returns only delayed tt hits we try to resolve them
+      // here before NN evaluation is done. Score update can be canceled which
+      // lets node picking select them after NN evaluation is done.
+      // No need to keep locks for CancelScoreUpdate because it uses atomic
+      // operations.
+      for (auto it = path.crbegin(); it != path.crend(); ++it) {
+        std::get<0>(*it)->CancelScoreUpdate(1);
+      }
+      return;
+    }
     auto& eval = state_.eval_results_[node_to_process.eval_index];
     avg_weight = eval.e;
     nl->FinalizeScoreUpdate(nl->GetWL(), nl->GetD(), nl->GetM(), avg_weight);
