@@ -616,6 +616,7 @@ class LowNode {
     return num_edges_ == child->Index() + 1;
   }
   bool CanMakeSolid() const { return num_edges_ > 1 && !solid_edges_; }
+  bool IsSolid() const { return solid_edges_; }
   struct PointerChanges;
   // Reallocate edge evaluations to a solid array.
   // @return Changes array in iteration memory.

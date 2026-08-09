@@ -685,6 +685,7 @@ class SearchWorker {
   // List of nodes to process.
   alignas(kCacheLineSize) std::atomic<int> collisions_left_;
   alignas(kCacheLineSize) std::atomic<int> eval_used_;
+  alignas(kCacheLineSize) SpinMutex solidify_mutex_;
   std::unique_ptr<BackendComputation> computation_;
   const SearchParams& params_;
   const bool moves_left_support_;

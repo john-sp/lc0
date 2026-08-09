@@ -581,7 +581,14 @@ LowNode::PointerChanges* LowNode::PointerChanges::Allocate(size_t count) {
 
 LowNode::PointerChanges* LowNode::MakeSolid() {
   if (solid_edges_) {
-    return PointerChanges::Allocate(0);
+    return nullptr;
+  }
+  // Check that none of children are pending a NN evaluation.
+  for (Node* node = child_.first_->GetChild(); node;
+       node = node->GetSibling()->get()) {
+    if (node->GetN() == 0 && node->GetNInFlight() > 0) {
+      return nullptr;
+    }
   }
   PointerChanges* result = PointerChanges::Allocate(num_edges_);
   // Collect old Node pointers to convert BackupPaths.

@@ -376,6 +376,11 @@ class MakeSolidQueue {
   // Add range of pointer changes to the shared queue
   void Push(ChangeType* changes) {
     assert(queue_);
+    if (changes == nullptr) {
+      // Skip no changes. It can happen when a child is locked for NN eval.
+      inserted_.fetch_add(1, std::memory_order_release);
+      return;
+    }
     // Reserve range from the destination.
     std::atomic_ref<size_t> insert(queue_->num_edges_);
     size_t idx =
@@ -1972,6 +1977,9 @@ void SearchWorkerCachedState::StartANewSearch(const SearchParams& params,
   if (node_paths_.size() < node_path_size) {
     node_paths_.resize(node_path_size);
   }
+  const size_t capacity = solidify_candidates_.capacity();
+  solidify_candidates_.clear();
+  solidify_candidates_.reserve(capacity);
 }
 
 SearchWorker::SearchWorker(int tid, SearchWorkerCachedState& state,
@@ -2101,8 +2109,7 @@ void ScheduleBackupUpdateTasks(MakeSolidList& solid_tasks,
 
 // Do Solidification tasks
 void SolidifyCandidates(SearchWorker& worker, SearchCachedState& state, int tid,
-                        std::vector<LowNode*>& candidates,
-                        bool do_all = false) {
+                        std::vector<LowNode*>& candidates) {
   // Remove already solid nodes.
   candidates.erase(
       std::remove_if(candidates.begin(), candidates.end(),
@@ -2111,8 +2118,7 @@ void SolidifyCandidates(SearchWorker& worker, SearchCachedState& state, int tid,
 
   // Delay tasks until there is at least one solidification task for each
   // worker.
-  if (candidates.size() < (state.task_queue_.Size() + 1) &&
-      (!do_all || candidates.empty())) {
+  if (candidates.size() < (state.task_queue_.Size() + 1)) {
     return;
   }
   LCTRACE_FUNCTION_SCOPE;
@@ -2157,12 +2163,6 @@ void SearchWorker::RunBlocking() {
     do {
       ExecuteOneIteration();
     } while (search_->IsSearchActive());
-    if (!state_.solidify_candidates_.empty()) {
-      SharedMutex::Lock lock(search_->nodes_mutex_);
-      // Don't leave dangling pointers into candidates.
-      SolidifyCandidates(*this, search_->state_, tid_,
-                         state_.solidify_candidates_, true);
-    }
     search_->state_.task_queue_.DeactivateTasks();
   } catch (std::exception& e) {
     std::cerr << "Unhandled exception in worker thread: " << e.what()
@@ -2677,6 +2677,21 @@ SearchWorker::PickNodesToExtendTask(int collision_limit, int tid,
       for (int i = 0; i < max_needed; i++) {
         if (current_util[i] == std::numeric_limits<float>::lowest()) {
           current_util[i] = fpu + m_evaluator.GetDefaultMUtility();
+        }
+      }
+
+      if (node->GetLowNode()) {
+        const auto& low_node = node->GetLowNode();
+        if (!low_node->IsSolid() &&
+            low_node->GetN() > params_.GetSolidTreeThreshold() &&
+            low_node->CanMakeSolid()) {
+          SpinMutex::Lock lock(solidify_mutex_);
+          if (std::none_of(
+                  state_.solidify_candidates_.begin(),
+                  state_.solidify_candidates_.end(),
+                  [&](const LowNode* n) { return n == low_node.get(); })) {
+            state_.solidify_candidates_.push_back(low_node.get());
+          }
         }
       }
 
@@ -3394,18 +3409,6 @@ void SearchWorker::DoBackupUpdateSingleNode(
   double avg_weight = params_.GetUseUncertaintyWeighting()
                           ? params_.GetUncertaintyWeightingCap()
                           : 1.0;
-
-  if (n->GetN() == 0 && path.size() > 1) {
-    const auto& parent = std::get<0>(path[path.size() - 2])->GetLowNode();
-    if (parent->CanMakeSolid() &&
-        (parent->GetN() > params_.GetSolidTreeThreshold() ||
-         parent->IsLastChild(n)) &&
-        std::none_of(state_.solidify_candidates_.begin(),
-                     state_.solidify_candidates_.end(),
-                     [&](const auto& node) { return node == parent.get(); })) {
-      state_.solidify_candidates_.emplace_back(parent.get());
-    }
-  }
 
   // Update the low node at the start of the backup path first, but only visit
   // it the first time that backup sees it.
