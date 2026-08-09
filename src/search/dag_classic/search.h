@@ -77,6 +77,8 @@ class StackLikeArena {
   char* Begin() { return std::begin(buffer_); }
   char* End() { return std::end(buffer_); }
 
+  static constexpr size_t GetSize() { return bytes; }
+
  private:
   alignas(alignment) char buffer_[bytes];
 };
@@ -86,7 +88,7 @@ class StackLikeArena {
 // Deallocation will be delayed until the next iteration starts.
 class IterationMemoryManager {
  public:
-  using ArenaType = StackLikeArena<16 * 1024 - sizeof(void*) - sizeof(size_t),
+  using ArenaType = StackLikeArena<64 * 1024 - sizeof(void*) - sizeof(size_t),
                                    alignof(std::max_align_t)>;
   using ArenaTuple = std::tuple<ArenaType, size_t>;
   IterationMemoryManager();
@@ -102,6 +104,8 @@ class IterationMemoryManager {
   // Tells manager that a new iteration has started. It must be called before
   // the first call to LocalManager in the thread.
   static void ResetLocalManager(SearchWorker& worker, int tid);
+
+  static constexpr size_t GetArenaSize() { return ArenaType::GetSize(); }
 
  private:
   // Threads add randmoness to where thinks are allocated. Deallocations will be

@@ -355,6 +355,8 @@ using MakeSolidList =
 // be available.
 class MakeSolidQueue {
  public:
+  static size_t constexpr kMaxEdgesInSolidQueue =
+      (IterationMemoryManager::GetArenaSize() - 1024) / sizeof(LowNode*) / 2;
   using ChangeType = LowNode::PointerChanges;
   using Allocator = IterationMemoryAllocator<char>;
   MakeSolidQueue() {}
@@ -411,6 +413,10 @@ class MakeSolidQueue {
   void AddSource(size_t num_edges) {
     total_changes_++;
     total_edges_ += num_edges;
+  }
+
+  bool DoesNodeFit(const LowNode* node) const {
+    return node->GetNumEdges() + total_edges_ < kMaxEdgesInSolidQueue;
   }
 
  private:
@@ -2043,9 +2049,9 @@ void SearchWorker::PickTaskCancelCollisions::DoTask(int) {
 
 namespace {
 
-void ScheduleBackupUpdateTasks(MakeSolidList& solid_tasks,
-                               MakeSolidQueue& queue, SearchCachedState& state,
-                               size_t tid) {
+void SchedulePointerUpdateTasks(MakeSolidList& solid_tasks,
+                                MakeSolidQueue& queue, SearchCachedState& state,
+                                size_t tid) {
   size_t paths = 0;
   size_t wid = tid - state.task_queue_.Size();
   for (size_t t = 0; t < state.worker_states_.size(); t++) {
@@ -2129,6 +2135,7 @@ void SolidifyCandidates(SearchWorker& worker, SearchCachedState& state, int tid,
   MakeSolidList solid_tasks;
   // Queue solidification tasks.
   for (auto* node : candidates) {
+    if (!solid_queue.DoesNodeFit(node)) break;
     solid_tasks.emplace_front(worker, solid_queue, node);
   }
   // Allocate memory for queue.
@@ -2136,7 +2143,7 @@ void SolidifyCandidates(SearchWorker& worker, SearchCachedState& state, int tid,
   // Submit solidification tasks.
   state.task_queue_.SubmitTasks(solid_tasks, tid);
   // Schedule pointer update tasks which read from the queue.
-  ScheduleBackupUpdateTasks(solid_tasks, solid_queue, state, tid);
+  SchedulePointerUpdateTasks(solid_tasks, solid_queue, state, tid);
   // Clear candidate list.
   size_t capacity = candidates.capacity();
   candidates.clear();
