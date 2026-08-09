@@ -842,6 +842,7 @@ void TaskQueue::SubmitTask(const TaskType& task, int tid) {
 void TaskQueue::ActivateTasks() {
   if (task_threads_.empty()) return;
   int active = active_users_.fetch_add(1, std::memory_order_relaxed);
+  assert(active >= 0);
   if (active == 0) {
     auto old = state_.load(std::memory_order_relaxed);
     do {
@@ -855,6 +856,7 @@ void TaskQueue::ActivateTasks() {
 void TaskQueue::DeactivateTasks() {
   if (task_threads_.empty()) return;
   auto old = active_users_.fetch_sub(1, std::memory_order_relaxed);
+  assert(old > 0);
   if (old == 1) {
     State s = state_.load(std::memory_order_relaxed);
     if (s == kExiting) return;
@@ -2155,15 +2157,15 @@ void SearchWorker::RunBlocking() {
 #endif
   }
   try {
-    // Start task workers early. This leaves scheduler a little extra time if
-    // it needs to wake up a new CPU core.
-    search_->state_.task_queue_.ActivateTasks();
+    bool tasks_active = false;
     // A very early stop may arrive before this point, so the test is at the
     // end to ensure at least one iteration runs before exiting.
     do {
-      ExecuteOneIteration();
+      tasks_active = ExecuteOneIteration();
     } while (search_->IsSearchActive());
-    search_->state_.task_queue_.DeactivateTasks();
+    if (tasks_active) {
+      search_->state_.task_queue_.DeactivateTasks();
+    }
   } catch (std::exception& e) {
     std::cerr << "Unhandled exception in worker thread: " << e.what()
               << std::endl;
@@ -2171,7 +2173,10 @@ void SearchWorker::RunBlocking() {
   }
 }
 
-void SearchWorker::ExecuteOneIteration() {
+bool SearchWorker::ExecuteOneIteration() {
+  // Start task workers early. This leaves scheduler a little extra time if it
+  // needs to wake up a new CPU core.
+  search_->state_.task_queue_.ActivateTasks();
   // 1. Initialize internal structures.
   InitializeIteration();
 
@@ -2192,7 +2197,7 @@ void SearchWorker::ExecuteOneIteration() {
       // done at least one iteration.
       if (search_->stop_.load(std::memory_order_acquire) &&
           search_->GetTotalPlayouts() + search_->initial_visits_ > 0) {
-        return;
+        return true;
       }
 
       int available =
@@ -2244,6 +2249,7 @@ void SearchWorker::ExecuteOneIteration() {
       }
     }
   }
+  return false;
 }
 
 // 1. Initialize internal structures.
@@ -3611,9 +3617,6 @@ void SearchWorker::UpdateCounters(bool work_done) {
         lock.get_raw(), [this, tc]() { return tc != search_->thread_count_; });
 #endif
   }
-  // Start task workers early. This leaves scheduler a little extra time if it
-  // needs to wake up a new CPU core.
-  search_->state_.task_queue_.ActivateTasks();
 }
 
 }  // namespace dag_classic

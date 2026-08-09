@@ -470,7 +470,7 @@ class SearchWorker {
   // 5. Retrieve NN computations (and terminal values) into nodes.
   // 6. Propagate the new nodes' information to all their parents in the tree.
   // 7. Update the Search's status and progress information.
-  void ExecuteOneIteration();
+  bool ExecuteOneIteration();
 
   // The same operations one by one:
   // 1. Initialize internal structures.
