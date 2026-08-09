@@ -365,7 +365,7 @@ class Node {
   // Deletes all children except one.
   // The node provided may be moved, so should not be relied upon to exist
   // afterwards.
-  void ReleaseChildrenExceptOne(Move move) const;
+  void ReleaseChildrenExceptOne(Move move);
 
   Edge& GetEdge() { return edge_; }
   // Returns move from the point of view of the player making it (if as_opponent
@@ -515,6 +515,7 @@ class LowNode {
         upper_bound_(GameResult::WHITE_WON) {
     child_.first_ = ChildAndEdges::FromMovelist(moves, index).release();
   }
+  LowNode(const LowNode& low_node, Move saved_child);
   ~LowNode();
 
   void SetNNEval(const EvalResult* eval) {
@@ -632,6 +633,9 @@ class LowNode {
   void RemoveParent() {
     assert(num_parents_ > 0);
     num_parents_.fetch_sub(1, std::memory_order_acq_rel);
+  }
+  uint32_t GetNumParents() const {
+    return num_parents_.load(std::memory_order_acquire);
   }
   bool IsTransposition() const {
     return num_parents_.load(std::memory_order_acquire) > 1;

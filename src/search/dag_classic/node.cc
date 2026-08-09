@@ -485,6 +485,40 @@ std::unique_ptr<LowNode::ChildAndEdges> LowNode::ChildAndEdges::FromNode(
   return child;
 }
 
+LowNode::LowNode(const LowNode& node, Move saved_child)
+    : wl_(node.wl_),
+      d_(node.d_),
+      weight_(node.weight_),
+      child_(ChildAndEdges::Allocate(node.num_edges_)),
+      m_(node.m_),
+      num_edges_(node.num_edges_),
+      terminal_type_(node.terminal_type_),
+      lower_bound_(node.lower_bound_),
+      upper_bound_(node.upper_bound_),
+      solid_edges_(false) {
+  std::copy(node.GetEdges(), node.GetEdges() + node.num_edges_,
+            child_.first_->GetEdges());
+  Node* src = node.child_.first_->GetChild();
+  for (; src; src = src->GetSibling()->get()) {
+    if (src->GetMove() == saved_child) {
+      break;
+    }
+  }
+  if (src) {
+    std::construct_at(child_.first_->GetChild(), std::move(*src));
+  } else {
+    auto edge = std::find_if(node.child_.first_->GetEdges(),
+                             node.child_.first_->GetEdges() + node.num_edges_,
+                             [saved_child](const Edge& edge) {
+                               return edge.GetMove() == saved_child;
+                             });
+    assert(edge != node.child_.first_->GetEdges() + node.num_edges_);
+    // If the saved child is not found, construct a default Node.
+    std::construct_at(child_.first_->GetChild(), *edge,
+                      edge - node.child_.first_->GetEdges());
+  }
+}
+
 LowNode::SolidChildren::~SolidChildren() {
   Node* node = GetChild();
   Node* next = node->GetSibling()->get();
@@ -501,7 +535,8 @@ LowNode::ChildAndEdges* LowNode::ChildAndEdges::Allocate(size_t count) {
   size_t size = sizeof(ChildAndEdges) + count * sizeof(Edge);
   size = (size + Node::kAlignment - 1) & ~(Node::kAlignment - 1);
 #if defined(_MSC_VER)
-  return reinterpret_cast<ChildAndEdges*>(_aligned_malloc(size, Node::kAlignment));
+  return reinterpret_cast<ChildAndEdges*>(
+      _aligned_malloc(size, Node::kAlignment));
 #else
   return reinterpret_cast<ChildAndEdges*>(
       std::aligned_alloc(Node::kAlignment, size));
@@ -525,7 +560,8 @@ LowNode::SolidChildren* LowNode::SolidChildren::Allocate(size_t count) {
       sizeof(SolidChildren) + count * sizeof(Node) + count * sizeof(Edge);
   size = (size + Node::kAlignment - 1) & ~(Node::kAlignment - 1);
 #if defined(_MSC_VER)
-  return reinterpret_cast<SolidChildren*>(_aligned_malloc(size, Node::kAlignment));
+  return reinterpret_cast<SolidChildren*>(
+      _aligned_malloc(size, Node::kAlignment));
 #else
   return reinterpret_cast<SolidChildren*>(
       std::aligned_alloc(Node::kAlignment, size));
@@ -612,13 +648,9 @@ LowNode::PointerChanges* LowNode::MakeSolid() {
 }
 
 Node* Node::MakeSingleChild(Move move) {
-  if (low_node_ && low_node_->GetChild()->GetMove() == move) {
+  if (low_node_) {
     ReleaseChildrenExceptOne(move);
     return low_node_->GetChild();
-  } else if (low_node_) {
-    // We cannot reuse low node that might be in TT if child isn't the highest
-    // policy child. We must unlink it and create a new private low node.
-    UnsetLowNode();
   }
   return CreateSingleChildNode(move);
 }
@@ -663,10 +695,18 @@ void LowNode::ReleaseChildrenExceptOne(Move move) {
   return;
 }
 
-void Node::ReleaseChildrenExceptOne(Move move) const {
+void Node::ReleaseChildrenExceptOne(Move move) {
   // Sometime we have no graph yet or a reverted terminal without low node.
   if (low_node_) {
-    low_node_->ReleaseChildrenExceptOne(move);
+    if (low_node_->GetChild()->GetMove() != move ||
+        low_node_->GetChild()->GetSibling()->get()) {
+      // If low node isn't already a single child, we need to copy low_node to
+      // avoid potential tt low node losing children.
+      auto low = std::make_shared<LowNode>(*low_node_, move);
+      UnsetLowNode();
+      SetLowNode(low);
+      return;
+    }
   }
 }
 
@@ -897,7 +937,7 @@ void NodeTree::MakeMove(Move move) {
   current_head_ = current_head_->MakeSingleChild(move);
   // Ensure head is not terminal, so search can extend or visit children of
   // "terminal" positions, e.g., WDL hits, converted terminals, 3-fold draw.
-  if (current_head_->IsTerminal())  current_head_->MakeNotTerminal();
+  if (current_head_->IsTerminal()) current_head_->MakeNotTerminal();
   history_.Append(move);
   moves_.push_back(move);
 }
