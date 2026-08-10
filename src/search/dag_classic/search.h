@@ -220,10 +220,11 @@ class TaskQueue {
 
  private:
   enum State : int {
-    kRunning = 0,
-    kWakeAll = 2,
-    kSleeping = 3,
-    kExiting = 4,
+    kRunning,
+    kWakeAll,
+    kWakeOne,
+    kSleeping,
+    kExiting,
   };
 
   bool ProcessTaskWorker(int tid);
@@ -543,6 +544,25 @@ class SearchWorker {
     void DoTask(int) override;
   };
 
+  // Tasks to output uci info when it is least likely to cause task worker slow
+  // down.
+  class MaybeOutputInfoTask final : public TaskQueue::PickTask {
+   public:
+    explicit MaybeOutputInfoTask(SearchWorker& worker) : worker_(worker) {}
+
+    void Wait(int tid) const override;
+    void Reset(int tid, int task_workers);
+
+   private:
+    void DoTask(int) override;
+
+   private:
+    SearchWorker& worker_;
+    int worker_id_ = -1;
+    int task_workers_ = 0;
+    std::atomic<int> done_{0};
+  };
+
  private:
   // TODO: Is there false sharing issues when inserting to AtomicVector?
   struct CollisionNode {
@@ -658,6 +678,9 @@ class SearchWorker {
   // Process a queued task.
  public:
   void ProcessTask(int tid);
+
+  void MaybeOutputInfo();
+
  private:
   void WaitForTasks();
 
@@ -692,6 +715,7 @@ class SearchWorker {
 
   alignas(kCacheLineSize) std::atomic<int> outstanding_tasks_ = 0;
   PickTaskCancelCollisions cancel_task_;
+  MaybeOutputInfoTask output_task_;
   friend struct SearchWorkerCachedState;
 };
 

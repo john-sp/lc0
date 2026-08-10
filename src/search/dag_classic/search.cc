@@ -843,6 +843,13 @@ void TaskQueue::SubmitTask(const TaskType& task, int tid) {
   } while (!bucket.compare_exchange_strong(expected,
                                            static_cast<const PickTask*>(&task),
                                            std::memory_order_release));
+  if (state_.load(std::memory_order_relaxed) == kSleeping) {
+    State old = kSleeping;
+    if (state_.compare_exchange_strong(old, kWakeOne,
+                                       std::memory_order_relaxed)) {
+      state_.notify_one();
+    }
+  }
 }
 
 void TaskQueue::ActivateTasks() {
@@ -878,6 +885,7 @@ static constexpr auto kSpinStartLimit = std::chrono::microseconds(100);
 bool TaskQueue::ShouldRun(State s) const {
   if (s == kExiting) return false;
   if (s == kSleeping) return false;
+  if (s == kWakeOne) return false;
   return true;
 }
 
@@ -889,8 +897,7 @@ void TaskQueue::RunTasks(int tid) {
     auto spin_start = std::chrono::high_resolution_clock::now();
     int spins = 0;
     bool work_done = false;
-    State s;
-    while (ShouldRun(s = state_.load(std::memory_order_relaxed))) {
+    do {
       work_done |= ProcessTaskWorker(tid);
       spins++;
       if (spins >= kSpinsToCheckClock) {
@@ -911,7 +918,7 @@ void TaskQueue::RunTasks(int tid) {
       } else {
         SpinloopPause();
       }
-    }
+    } while (ShouldRun(state_.load(std::memory_order_relaxed)));
     spins = 0;
     // Looks like sleep time.
     // Refresh them now we have the lock.
@@ -919,14 +926,23 @@ void TaskQueue::RunTasks(int tid) {
     if (nta != tc) {
       continue;
     }
-    s = state_.load(std::memory_order_relaxed);
+    State s = state_.load(std::memory_order_relaxed);
     if (s == kExiting) return;
+    if (s == kWakeOne) {
+      if (state_.compare_exchange_strong(s, kSleeping,
+                                         std::memory_order_relaxed)) {
+        continue;
+      }
+    }
     if (ShouldRun(s)) continue;
     state_.wait(s, std::memory_order_relaxed);
     s = state_.load(std::memory_order_relaxed);
     if (s == kWakeAll) {
       state_.compare_exchange_strong(s, kRunning, std::memory_order_relaxed);
       state_.notify_all();
+    }
+    if (s == kWakeOne) {
+      state_.compare_exchange_strong(s, kSleeping, std::memory_order_relaxed);
     }
   }
 }
@@ -1193,6 +1209,30 @@ void Search::SendUciInfo(const classic::IterationStats& stats)
   }
 
   uci_responder_->OutputThinkingInfo(&uci_infos);
+}
+
+void SearchWorker::MaybeOutputInfoTask::Wait(int tid) const {
+  while (!done_.load(std::memory_order_acquire)) {
+    worker_.ProcessTask(tid);
+  }
+}
+
+void SearchWorker::MaybeOutputInfoTask::Reset(int tid, int task_workers) {
+  worker_id_ = tid;
+  task_workers_ = task_workers;
+  done_.store(0, std::memory_order_release);
+}
+
+void SearchWorker::MaybeOutputInfoTask::DoTask(int tid) {
+  if (tid == worker_id_ || tid < task_workers_) {
+    // Output is only allowed from task workers or from the scheduling thread.
+    worker_.MaybeOutputInfo();
+  }
+  done_.store(1, std::memory_order_release);
+}
+
+void SearchWorker::MaybeOutputInfo() {
+  search_->MaybeOutputInfo(iteration_stats_);
 }
 
 // Decides whether anything important changed in stats and new info should be
@@ -1859,7 +1899,6 @@ void Search::WatchdogThread() {
   while (true) {
     PopulateCommonIterationStats(&stats);
     MaybeTriggerStop(stats, &hints);
-    MaybeOutputInfo(stats);
 
     constexpr auto kMaxWaitTimeMs = 100;
     constexpr auto kMinWaitTimeMs = 1;
@@ -1992,7 +2031,8 @@ SearchWorker::SearchWorker(int tid, SearchWorkerCachedState& state,
                                        target_minibatch_size_))),
       params_(params),
       moves_left_support_(search_->backend_attributes_.has_mlh),
-      cancel_task_(*this) {
+      cancel_task_(*this),
+      output_task_{*this} {
   int total_workers =
       search_->state_.task_queue_.Size() + search_->total_workers_;
   iteration_memory_managers_.resize(total_workers);
@@ -2261,7 +2301,6 @@ void SearchWorker::ScheduleCancelTask(int start, int end, bool stop) {
   if (end == start) {
     // Do we need to stop task workers?
     if (stop) {
-      search_->state_.task_queue_.DeactivateTasks();
       state_.collisions_.clear();
     }
     return;
@@ -2301,11 +2340,17 @@ void SearchWorker::GatherMinibatch() {
   int minibatch_size = 0;
   int cur_n = 0;
 
+  absl::Cleanup schedule_output = [this] {
+    output_task_.Reset(tid_, search_->state_.task_queue_.Size());
+    search_->state_.task_queue_.SubmitTask(output_task_, tid_);
+    search_->state_.task_queue_.DeactivateTasks();
+  };
   // We take the nodes_mutex_ only once to avoid bouncing between this thread
   // and a thread returning from RunNNComputation.
   SharedMutex::Lock lock(search_->nodes_mutex_);
   // Collision use atomic operations. We can cancel them outside the lock.
-  absl::Cleanup cancel_collsions = [this] {
+  absl::Cleanup cancel_collsions = [this, &minibatch_size] {
+    if (minibatch_size) search_->RecordNPSStartTime();
     ScheduleCancelTask(0, state_.collisions_.size(), true);
   };
   SolidifyCandidates(*this, search_->state_, tid_, state_.solidify_candidates_);
@@ -2319,10 +2364,6 @@ void SearchWorker::GatherMinibatch() {
   collisions_left_.store(collisions_left, std::memory_order_relaxed);
   // Number of nodes processed out of order.
   number_out_of_order_ = 0;
-
-  absl::Cleanup record_batch_start_time = [&] {
-    if (minibatch_size) search_->RecordNPSStartTime();
-  };
 
   // Gather nodes to process in the current batch.
   // If we had too many nodes out of order, also interrupt the iteration so
@@ -2408,9 +2449,6 @@ int SearchWorker::AddCollisions(int collisions) {
 
 void SearchWorker::CancelCollisionsTask(int start, int end, bool stop) {
   LCTRACE_FUNCTION_SCOPE;
-  if (stop) {
-    search_->state_.task_queue_.DeactivateTasks();
-  }
   int total = 0;
   for (int i = start; i < end; i++) {
     const auto& entry = state_.collisions_[i];
@@ -3143,6 +3181,9 @@ void SearchWorker::RunNNComputation() {
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 void SearchWorker::FetchMinibatchResults() {
   LCTRACE_FUNCTION_SCOPE;
+  // Wait for output tasks to complete before entering mutex to avoid deadlock
+  // if output task wants to execute in this thread.
+  output_task_.Wait(tid_);
   // Populate NN/cached results, or terminal results, into nodes.
   int i = 0;
   for (auto& node_to_process : state_.minibatch_) {
