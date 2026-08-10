@@ -1931,14 +1931,7 @@ void Search::FireStopInternal() {
 
   // Make sure there is no threads waiting on the atomic if we abort early.
   thread_count_.store(0, std::memory_order_relaxed);
-#ifndef NO_STD_ATOMIC_WAIT
   thread_count_.notify_all();
-#else
-  {
-    Mutex::Lock lock(fallback_threads_mutex_);
-    fallback_threads_cond_.notify_all();
-  }
-#endif
 }
 
 void Search::Stop() {
@@ -2184,13 +2177,7 @@ void SearchWorker::RunBlocking() {
   LOGFILE << "Started search thread.";
   // Wait here until root node has been evaluated.
   if (tid_ > (int)search_->state_.task_queue_.Size()) {
-#ifndef NO_STD_ATOMIC_WAIT
     search_->thread_count_.wait(1, std::memory_order_relaxed);
-#else
-    Mutex::Lock lock(search_->fallback_threads_mutex_);
-    search_->fallback_threads_cond_.wait(
-        lock.get_raw(), [this]() { return 1 != search_->thread_count_; });
-#endif
   }
   try {
     bool tasks_active = false;
@@ -3353,12 +3340,7 @@ bool SearchWorker::DoBackupUpdate() {
     if (total != count && count != 0) {
       while (count > 0 && !tc.compare_exchange_weak(count, total,
                                                     std::memory_order_relaxed));
-#ifndef NO_STD_ATOMIC_WAIT
       search_->thread_count_.notify_all();
-#else
-      Mutex::Lock lock(search_->fallback_threads_mutex_);
-      search_->fallback_threads_cond_.notify_all();
-#endif
     }
   }
 
@@ -3656,15 +3638,14 @@ void SearchWorker::UpdateCounters(bool work_done) {
   search_->PopulateCommonIterationStats(&iteration_stats_);
   search_->MaybeTriggerStop(iteration_stats_, &latest_time_manager_hints_);
   if (!work_done) {
+    // We are going to sleep because node picking found only collisions. Stop
+    // task workers while we sleep.
+    search_->state_.task_queue_.DeactivateTasks();
     int tc = search_->thread_count_.fetch_sub(1, std::memory_order_relaxed) - 1;
-    if (tc <= 0) return;
-#ifndef NO_STD_ATOMIC_WAIT
-    search_->thread_count_.wait(tc, std::memory_order_relaxed);
-#else
-    Mutex::Lock lock(search_->fallback_threads_mutex_);
-    search_->fallback_threads_cond_.wait(
-        lock.get_raw(), [this, tc]() { return tc != search_->thread_count_; });
-#endif
+    if (tc > 0) {
+      search_->thread_count_.wait(tc, std::memory_order_relaxed);
+    }
+    search_->state_.task_queue_.ActivateTasks();
   }
 }
 
