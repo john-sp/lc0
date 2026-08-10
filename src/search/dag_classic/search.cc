@@ -860,9 +860,9 @@ void TaskQueue::ActivateTasks() {
     auto old = state_.load(std::memory_order_relaxed);
     do {
       if (old == kExiting) return;
-    } while (!state_.compare_exchange_weak(old, kWakeAll,
+    } while (!state_.compare_exchange_weak(old, kRunning,
                                            std::memory_order_relaxed));
-    state_.notify_one();
+    state_.notify_all();
   }
 }
 
@@ -935,6 +935,7 @@ void TaskQueue::RunTasks(int tid) {
       }
     }
     if (ShouldRun(s)) continue;
+    s = kSleeping;
     state_.wait(s, std::memory_order_relaxed);
     s = state_.load(std::memory_order_relaxed);
     if (s == kWakeAll) {
@@ -2193,6 +2194,9 @@ void SearchWorker::RunBlocking() {
   }
   try {
     bool tasks_active = false;
+    // Start task workers early. This leaves scheduler a little extra time if it
+    // needs to wake up a new CPU core.
+    search_->state_.task_queue_.ActivateTasks();
     // A very early stop may arrive before this point, so the test is at the
     // end to ensure at least one iteration runs before exiting.
     do {
@@ -2209,9 +2213,6 @@ void SearchWorker::RunBlocking() {
 }
 
 bool SearchWorker::ExecuteOneIteration() {
-  // Start task workers early. This leaves scheduler a little extra time if it
-  // needs to wake up a new CPU core.
-  search_->state_.task_queue_.ActivateTasks();
   // 1. Initialize internal structures.
   InitializeIteration();
 
@@ -2223,6 +2224,8 @@ bool SearchWorker::ExecuteOneIteration() {
 
   // 5. Retrieve NN computations (and terminal values) into nodes.
   FetchMinibatchResults();
+
+  search_->state_.task_queue_.DeactivateTasks();
 
   // 6. Propagate the new nodes' information to all their parents in the tree.
   bool work_done = DoBackupUpdate();
@@ -2244,7 +2247,7 @@ bool SearchWorker::ExecuteOneIteration() {
       }
     }
   }
-  return false;
+  return true;
 }
 
 // 1. Initialize internal structures.
@@ -2281,6 +2284,76 @@ int CalculateCollisionsLeft(int64_t nodes, const SearchParams& params) {
                            params.GetMaxCollisionVisitsScalingStart()),
                       params.GetMaxCollisionVisitsScalingPower()));
 }
+
+// Schedule fetch results tasks. It could make backup propagation to scale
+// better to more thread if this was merged together. Tasks would need carefully
+// scheduling to allow many transpositions to allow any transposition to read
+// results while only reading them once.
+class FetchResultsTask final : public TaskQueue::PickTask {
+ public:
+  FetchResultsTask(SearchWorker& worker,
+                   const AtomicVector<SearchWorker::NodeToProcess>& batch,
+                   size_t start, size_t size)
+      : worker_(worker), batch_(batch), start_(start), size_(size) {}
+
+ private:
+  void DoTask(int tid) override {
+    DoFetchResultsRange(tid);
+    worker_.CompleteTask();
+  }
+
+  void DoFetchResultsRange(int) {
+    LCTRACE_FUNCTION_SCOPE;
+    for (size_t i = 0; i < size_; ++i) {
+      const auto& node_to_process = batch_[i + start_];
+      const auto& path = worker_.GetMinibatchPath(i + start_);
+      worker_.FetchSingleNodeResult(&node_to_process, path);
+    }
+  }
+
+ private:
+  SearchWorker& worker_;
+  const AtomicVector<SearchWorker::NodeToProcess>& batch_;
+  unsigned start_;
+  unsigned size_;
+};
+
+void ScheduleFetchResultsTasks(
+    SearchWorker& worker, size_t workers,
+    const AtomicVector<SearchWorker::NodeToProcess>& batch) {
+  if (batch.empty()) return;
+
+  const size_t tail_share = 8;
+  size_t positions = batch.size();
+  bool use_small_tail = positions >= tail_share * workers;
+  TaskArray<FetchResultsTask> tasks(workers * (use_small_tail ? 2 : 1));
+  size_t first_positions =
+      use_small_tail ? positions * (tail_share - 1) / tail_share : positions;
+  size_t positions_per_task = first_positions / workers;
+  size_t extra_positions = first_positions % workers;
+  size_t start = 0;
+  for (size_t i = 0; i < workers; ++i) {
+    size_t size = positions_per_task + (i < extra_positions ? 1 : 0);
+    if (size == 0) break;
+    tasks.emplace_back(worker, batch, start, size);
+    start += size;
+  }
+  if (use_small_tail) {
+    size_t tail_positions = positions - first_positions;
+    size_t tail_per_task = tail_positions / workers;
+    size_t tail_extra = tail_positions % workers;
+    for (size_t i = 0; i < workers; ++i) {
+      size_t size = tail_per_task + (i < tail_extra ? 1 : 0);
+      if (size == 0) break;
+      tasks.emplace_back(worker, batch, start, size);
+      start += size;
+    }
+  }
+  assert(start == positions);
+  worker.StartTasks(tasks.size());
+  worker.SubmitTasks(tasks);
+}
+
 }  // namespace
 
 IterationMemoryManager& SearchWorker::GetIterationMemoryManager(int tid) {
@@ -2481,6 +2554,10 @@ void SearchWorker::CompleteTask() {
 void SearchWorker::ProcessTask(int tid) {
   search_->state_.task_queue_.ProcessTask(tid);
 }
+template <typename TaskType>
+void SearchWorker::SubmitTasks(const TaskType& tasks) {
+  search_->state_.task_queue_.SubmitTasks(tasks, tid_);
+}
 
 // Check for any outstanding gather tasks. Task objects aren't tracked so we
 // need a shared counter to know when all of them are done.
@@ -2607,8 +2684,14 @@ SearchWorker::PickNodesToExtendTask(int collision_limit, int tid,
     // a collision of appropriate size and pop current_path.
     if (current_path.back().stop_picking_) {
       if (current_path.back().visit_child_) {
-        Visit(full_path, history);
-        cur_limit -= 1;
+        // Don't try to visit a node if low node is pending NN evaluation and
+        // visit attempt has already failed.
+        if (!node->GetLowNode() || node->GetLowNode()->GetWeight() != 0) {
+          Visit(full_path, history);
+          cur_limit -= 1;
+        } else {
+          node->CancelScoreUpdate(1);
+        }
       }
       // Visits are created elsewhere, just need the collisions here.
       if (cur_limit > 0) {
@@ -3128,6 +3211,7 @@ void SearchWorker::ExtendNode(NodeToProcess& picked_node,
     picked_node.eval_index =
         GetEvalIndex(eval_used_, state_.eval_results_.size());
     assert(picked_node.eval_index < (int)state_.eval_results_.size());
+    assert(picked_node.eval_index >= 0);
     auto& eval = state_.eval_results_[picked_node.eval_index];
     if (eval.p.capacity() == 0) {
       eval.p.reserve(60);
@@ -3173,7 +3257,13 @@ void SearchWorker::RunNNComputation() {
       assert(old > 0);
       std::ignore = old;
       std::ignore = event;
+      // Start task workers early. This leaves scheduler a little extra time if it
+      // needs to wake up a new CPU core.
+      search_->state_.task_queue_.ActivateTasks();
     });
+  } else {
+    // No NN computation was needed, so we can start task workers early.
+    search_->state_.task_queue_.ActivateTasks();
   }
 }
 
@@ -3184,14 +3274,14 @@ void SearchWorker::FetchMinibatchResults() {
   // Wait for output tasks to complete before entering mutex to avoid deadlock
   // if output task wants to execute in this thread.
   output_task_.Wait(tid_);
-  // Populate NN/cached results, or terminal results, into nodes.
-  int i = 0;
-  for (auto& node_to_process : state_.minibatch_) {
-    FetchSingleNodeResult(&node_to_process, GetMinibatchPath(i++));
-  }
+  SharedMutex::Lock lock(search_->nodes_mutex_);
+  NewMemoryIteration();
+  ScheduleFetchResultsTasks(*this, search_->state_.task_queue_.Size() + 1,
+                            state_.minibatch_);
+  WaitForTasks();
 }
 
-void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process,
+void SearchWorker::FetchSingleNodeResult(const NodeToProcess* node_to_process,
                                          const BackupPath& path) {
   if (!node_to_process->nn_queried) return;
 
@@ -3274,7 +3364,16 @@ bool SearchWorker::DoBackupUpdate() {
 
   bool work_done = number_out_of_order_ > 0 || !state_.minibatch_.empty();
   int i = 0;
+  const size_t kWakeupLatency = 50;
+  if (state_.minibatch_.size() < kWakeupLatency) {
+    search_->state_.task_queue_.ActivateTasks();
+  }
   for (const NodeToProcess& node_to_process : state_.minibatch_) {
+    if (state_.minibatch_.size() - i == kWakeupLatency) {
+      // We need about 50 backup updates to let tasks workers to wakeup for
+      // GatherMinibatch.
+      search_->state_.task_queue_.ActivateTasks();
+    }
     DoBackupUpdateSingleNode(node_to_process, GetMinibatchPath(i++));
   }
   state_.minibatch_.clear();
@@ -3361,8 +3460,8 @@ void SearchWorker::DoBackupUpdateSingleNode(
 
   // Update the low node at the start of the backup path first, but only visit
   // it the first time that backup sees it.
-  if (nl && nl->GetN() == 0) {
-    if (node_to_process.is_delayed_tt_hit || node_to_process.is_edge_update) {
+  if (nl) {
+    if (nl->GetWeight() == 0) {
       // If GatherMinibatch returns only delayed tt hits we try to resolve them
       // here before NN evaluation is done. Score update can be canceled which
       // lets node picking select them after NN evaluation is done.
@@ -3373,10 +3472,6 @@ void SearchWorker::DoBackupUpdateSingleNode(
       }
       return;
     }
-    auto& eval = state_.eval_results_[node_to_process.eval_index];
-    avg_weight = eval.e;
-    nl->FinalizeScoreUpdate(nl->GetWL(), nl->GetD(), nl->GetM(), avg_weight);
-  } else if (nl) {
     avg_weight = std::min(avg_weight, nl->GetWeight());
   }
 
