@@ -392,7 +392,6 @@ class Search {
   // GatherMinibatch. It is guarded by nodes mutex until set once.
   std::optional<std::chrono::steady_clock::time_point> nps_start_time_;
 
-  std::atomic<int> pending_searchers_{0};
   std::atomic<int> backend_waiting_counter_{0};
   std::atomic<int> thread_count_{0};
 #if NO_STD_ATOMIC_WAIT

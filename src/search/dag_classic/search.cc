@@ -976,10 +976,6 @@ Search::Search(SearchCachedState& state, const NodeTree& tree, Backend* backend,
   LOGFILE << "Transposition table garbage collection done.";
 #endif
 
-  if (params_.GetMaxConcurrentSearchers() != 0) {
-    pending_searchers_.store(params_.GetMaxConcurrentSearchers(),
-                             std::memory_order_release);
-  }
   contempt_mode_ = params_.GetContemptMode();
   // Make sure the contempt mode is never "play" beyond this point.
   if (contempt_mode_ == ContemptMode::PLAY) {
@@ -2190,48 +2186,8 @@ bool SearchWorker::ExecuteOneIteration() {
   // 1. Initialize internal structures.
   InitializeIteration();
 
-  if (params_.GetMaxConcurrentSearchers() != 0) {
-    std::unique_ptr<SpinHelper> spin_helper;
-    if (params_.GetSearchSpinBackoff()) {
-      spin_helper = std::make_unique<ExponentialBackoffSpinHelper>();
-    } else {
-      // This is a hard spin lock to reduce latency but at the expense of busy
-      // wait cpu usage. If search worker count is large, this is probably a
-      // bad idea.
-      spin_helper = std::make_unique<SpinHelper>();
-    }
-
-    while (true) {
-      // If search is stopped, we've not gathered or done anything and we
-      // don't want to, so we can safely skip all below. But make sure we have
-      // done at least one iteration.
-      if (search_->stop_.load(std::memory_order_acquire) &&
-          search_->GetTotalPlayouts() + search_->initial_visits_ > 0) {
-        return true;
-      }
-
-      int available =
-          search_->pending_searchers_.load(std::memory_order_acquire);
-      if (available == 0) {
-        spin_helper->Wait();
-        continue;
-      }
-
-      if (search_->pending_searchers_.compare_exchange_weak(
-              available, available - 1, std::memory_order_acq_rel)) {
-        break;
-      } else {
-        spin_helper->Backoff();
-      }
-    }
-  }
-
   // 2. Gather minibatch.
   GatherMinibatch();
-
-  if (params_.GetMaxConcurrentSearchers() != 0) {
-    search_->pending_searchers_.fetch_add(1, std::memory_order_acq_rel);
-  }
 
   // 4. Run NN computation.
   RunNNComputation();
