@@ -1370,7 +1370,6 @@ std::vector<std::string> Search::GetVerboseStats(
       }
     }
     if (v) {
-      print(oss, "(E: ", e, ") ", 7, 4);
       print(oss, "(V: ", sign * *v, ") ", 7, 4);
       print(oss, "(E: ", e, ") ", 7, 4);
     } else {
