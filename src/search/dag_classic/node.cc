@@ -1185,10 +1185,6 @@ void NodeGarbageCollector<Types>::GCThread() {
       }
     }
 
-    if (!empty) {
-      LOGFILE << "Garbage collection starting.";
-    }
-
     // Free nodes one by one. LowNode destructor calls AddToGcQueue which
     // allows recursive destruction terminate before freeing a whole branch.
     while (!nodes.empty()) {
@@ -1196,10 +1192,6 @@ void NodeGarbageCollector<Types>::GCThread() {
         break;
       }
       nodes.pop_back();
-    }
-
-    if (!empty) {
-      LOGFILE << "Garbage collection ending.";
     }
 
     // Go to sleep if empty or search stopped.
