@@ -2622,7 +2622,7 @@ bool SearchWorker::ShouldStopPickingHere(Node* node, bool is_root_node,
   if (is_root_node) return false;
 
   // Stop at draws by repetition.
-  if (repetitions >= 2) return true;
+  if (repetitions >= 1) return true;
 
   // Check if Node and LowNode differ significantly.
   auto low_node = node->GetLowNode().get();
@@ -3487,25 +3487,40 @@ void SearchWorker::DoBackupUpdateSingleNode(
       }
       return;
     }
-    avg_weight = std::min(avg_weight, nl->GetWeight());
+    if (nr > 0) {
+      v = 0.0;
+      d = 1.0;
+      m = nr >= 2 ? 0.0f : nm;
+      if (node_to_process.nn_queried) {
+        // Adjust NN evaluation to match the repetition evaluation.
+        avg_weight = std::min(avg_weight, nl->GetWeight());
+        v_delta = v - nl->GetWL();
+        d_delta = d - nl->GetD();
+        m_delta = m - nl->GetM();
+        nl->AdjustForTerminal(v_delta, d_delta, m_delta, 1.0 / avg_weight,
+                              avg_weight);
+      } else {
+        // Update low node evaluation for the repetition.
+        nl->FinalizeScoreUpdate(v, d, m, avg_weight);
+      }
+    } else {
+      avg_weight = std::min(avg_weight, nl->GetWeight());
+    }
   }
 
   assert(nl || n->IsTerminal());
 
-  if (nr >= 2) {
-    // Three-fold itself has to be handled as a terminal to produce relevant
-    // results. Unlike two-folds that can keep updating their "real" values.
-    n->SetRepetition();
-    v = 0.0f;
-    d = 1.0f;
-    m = 1;
-  } else if (!MaybeAdjustForTerminalOrTransposition(
-                 n, nl, v, d, m, weight_to_fix, v_delta, d_delta, m_delta,
-                 update_parent_bounds)) {
-    // If there is nothing better, use original NN values adjusted for node.
-    v = -nl->GetWL();
-    d = nl->GetD();
-    m = nl->GetM() + 1;
+  if (!MaybeAdjustForTerminalOrTransposition(n, nl, v, d, m, weight_to_fix,
+                                             v_delta, d_delta, m_delta,
+                                             update_parent_bounds)) {
+    if (nr > 0) {
+      m = m + 1;
+    } else {
+      // If there is nothing better, use original NN values adjusted for node.
+      v = -nl->GetWL();
+      d = nl->GetD();
+      m = nl->GetM() + 1;
+    }
   }
 
   // Backup V value up to a root. After 1 visit, V = Q.
@@ -3514,19 +3529,6 @@ void SearchWorker::DoBackupUpdateSingleNode(
     auto divisor = n->FinalizeScoreUpdate(v, d, m, avg_weight);
     if (weight_to_fix > 0 && !n->IsTerminal()) {
       n->AdjustForTerminal(v_delta, d_delta, m_delta, divisor, weight_to_fix);
-    }
-
-    // Stop delta update on repetition "terminal" and propagate a draw above
-    // repetitions valid on the current path.
-    // Only do this after edge update to have good values if play goes here.
-    if (nr == 1 && !n->IsTerminal()) {
-      n->SetRepetition();
-      v = 0.0f;
-      d = 1.0f;
-      m = nm + 1;
-    }
-    if (n->IsRepetition()) {
-      weight_to_fix = 0.0f;
     }
 
     // Nothing left to do without ancestors to update.

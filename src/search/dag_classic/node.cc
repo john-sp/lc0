@@ -139,7 +139,6 @@ void Node::Trim() {
   terminal_type_ = Terminal::NonTerminal;
   lower_bound_ = GameResult::BLACK_WON;
   upper_bound_ = GameResult::WHITE_WON;
-  repetition_ = false;
 }
 
 LowNode::~LowNode() {
@@ -323,7 +322,6 @@ void Node::MakeNotTerminal(bool also_low_node) {
     return;
 
   terminal_type_ = Terminal::NonTerminal;
-  repetition_ = false;
   if (low_node_) {  // Two-fold or derived terminal.
     // Revert low node first.
     if (also_low_node && low_node_) low_node_->MakeNotTerminal(this);
@@ -443,8 +441,7 @@ Node::Node(Node&& node)
       index_(node.index_),
       terminal_type_(node.terminal_type_),
       lower_bound_(node.lower_bound_),
-      upper_bound_(node.upper_bound_),
-      repetition_(node.repetition_) {
+      upper_bound_(node.upper_bound_) {
   assert(GetN() == 0 || IsTerminal() || GetLowNode());
 }
 
@@ -462,7 +459,6 @@ Node& Node::operator=(Node&& node) {
   terminal_type_ = node.terminal_type_;
   lower_bound_ = node.lower_bound_;
   upper_bound_ = node.upper_bound_;
-  repetition_ = node.repetition_;
   assert(GetN() == 0 || IsTerminal() || GetLowNode());
   return *this;
 }

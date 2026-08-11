@@ -338,16 +338,14 @@ class Node {
       : index_(index),
         terminal_type_(Terminal::NonTerminal),
         lower_bound_(GameResult::BLACK_WON),
-        upper_bound_(GameResult::WHITE_WON),
-        repetition_(false) {}
+        upper_bound_(GameResult::WHITE_WON) {}
   // Takes own @edge and @index in the parent.
   Node(const Edge& edge, uint16_t index)
       : edge_(edge),
         index_(index),
         terminal_type_(Terminal::NonTerminal),
         lower_bound_(GameResult::BLACK_WON),
-        upper_bound_(GameResult::WHITE_WON),
-        repetition_(false) {}
+        upper_bound_(GameResult::WHITE_WON) {}
 
   Node(Node&& other);
   Node& operator=(Node&& other);
@@ -485,9 +483,6 @@ class Node {
   uint16_t Index() const { return index_; }
   void SetIndex(uint16_t index) { index_ = index; }
 
-  void SetRepetition() { repetition_ = true; }
-  bool IsRepetition() const { return repetition_; }
-
   bool WLDMInvariantsHold() const;
 
 #ifndef NDEBUG
@@ -570,8 +565,6 @@ class Node {
   // Best and worst result for this node.
   GameResult lower_bound_ : 2;
   GameResult upper_bound_ : 2;
-  // Edge was handled as a repetition at some point.
-  bool repetition_ : 1;
 };
 
 // Check that Node still fits into an expected cache line size.
