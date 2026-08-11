@@ -579,6 +579,20 @@ void LowNode::SolidChildren::operator delete(SolidChildren* ptr,
 #endif
 }
 
+std::unique_ptr<LowNode::SolidChildren> LowNode::SolidChildren::FromMovelist(
+    const MoveList& moves) {
+  std::unique_ptr<SolidChildren> child(SolidChildren::Allocate(moves.size()));
+
+  Edge::FromMovelist(child->GetEdges(moves.size()), moves);
+
+  for (size_t index = 0; index < moves.size(); ++index) {
+    std::construct_at(child->GetChild() + index,
+                      child->GetEdges(moves.size())[index], index);
+  }
+
+  return child;
+}
+
 std::unique_ptr<LowNode::SolidChildren> LowNode::SolidChildren::Make(
     uint8_t num_edges, Node* child, Edge* edges) {
   // Allocate and construct a SoldChildren from ChildAndEdges
@@ -615,7 +629,7 @@ LowNode::PointerChanges* LowNode::PointerChanges::Allocate(size_t count) {
   return rv;
 }
 
-LowNode::PointerChanges* LowNode::MakeSolid() {
+LowNode::PointerChanges* LowNode::MakeSolid(bool no_results) {
   if (solid_edges_) {
     return nullptr;
   }
@@ -626,18 +640,24 @@ LowNode::PointerChanges* LowNode::MakeSolid() {
       return nullptr;
     }
   }
-  PointerChanges* result = PointerChanges::Allocate(num_edges_);
+  PointerChanges* result =
+      no_results ? nullptr : PointerChanges::Allocate(num_edges_);
   // Collect old Node pointers to convert BackupPaths.
   for (Node* node = child_.first_->GetChild(); node;
        node = node->GetSibling()->get()) {
     assert(node->GetN() == 0 || node->IsTerminal() || node->GetLowNode());
-    result->changes_[result->num_edges_++] = node;
+    if (result) {
+      result->changes_[result->num_edges_++] = node;
+    }
   }
   auto solid = SolidChildren::Make(num_edges_, child_.first_->GetChild(),
                                    child_.first_->GetEdges());
   NGC::Instance().AddToGcQueue(child_.first_);
   child_.solid_ = solid.release();
   solid_edges_ = true;
+  if (!result) {
+    return nullptr;
+  }
   // Collect new pointers which are used to update BackupPaths.
   for (size_t i = 0; i < result->size(); ++i) {
     Node* node = &child_.solid_->GetChild()[i];

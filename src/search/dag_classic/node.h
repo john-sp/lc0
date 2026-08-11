@@ -282,7 +282,7 @@ class Node {
   // before that.
   Node* CreateSingleChildNode(Move move) {
     assert(!low_node_);
-    auto low_node = std::make_shared<LowNode>(MoveList({move}), 0);
+    auto low_node = std::make_shared<LowNode>(MoveList({move}));
     SetLowNode(low_node);
     return GetChild();
   }
@@ -506,24 +506,23 @@ class LowNode {
         upper_bound_(GameResult::WHITE_WON) {
     child_.first_ = ChildAndEdges::FromMovelist(moves).release();
   }
-  // Init @edges_ with moves from @moves and 0 policy.
-  // Also create the first child at @index.
-  LowNode(const MoveList& moves, uint16_t index)
+  struct RootTag {};
+  LowNode(const MoveList& moves, RootTag)
       : num_edges_(moves.size()),
         terminal_type_(Terminal::NonTerminal),
         lower_bound_(GameResult::BLACK_WON),
-        upper_bound_(GameResult::WHITE_WON) {
-    child_.first_ = ChildAndEdges::FromMovelist(moves, index).release();
+        upper_bound_(GameResult::WHITE_WON),
+        solid_edges_(true) {
+    child_.solid_ = SolidChildren::FromMovelist(moves).release();
   }
   LowNode(const LowNode& low_node, Move saved_child);
   ~LowNode();
 
   void SetNNEval(const EvalResult* eval) {
     assert(weight_ == 0);
-    assert(!solid_edges_);
     assert(GetChild()->GetNStarted() == 0);
 
-    Edge* edges = child_.first_->GetEdges();
+    Edge* edges = GetEdges();
 
     assert(edges);
 
@@ -605,12 +604,17 @@ class LowNode {
   void DotNodeString(std::ofstream& file) const;
 
   void SortEdges() {
-    assert(!solid_edges_);
     assert(child_.first_);
     assert(GetChild()->GetNStarted() == 0);
-    Edge::SortEdges(child_.first_->GetEdges(), num_edges_);
+    Edge::SortEdges(GetEdges(), num_edges_);
     // Copy the best edge to the preallocated first child.
-    child_.first_->GetChild()->GetEdge() = *child_.first_->GetEdges();
+    if (solid_edges_) {
+      for (size_t i = 0; i < num_edges_; ++i) {
+        GetChildAt(i)->GetEdge() = GetEdges()[i];
+      }
+    } else {
+      GetChild()->GetEdge() = *GetEdges();
+    }
   }
 
   bool IsLastChild(Node* child) const {
@@ -621,7 +625,7 @@ class LowNode {
   struct PointerChanges;
   // Reallocate edge evaluations to a solid array.
   // @return Changes array in iteration memory.
-  PointerChanges* MakeSolid();
+  PointerChanges* MakeSolid(bool no_results = false);
 
   // Add new parent with @n_in_flight visits.
   void AddParent() {
@@ -842,6 +846,7 @@ class LowNode {
     ~SolidChildren();
     static std::unique_ptr<SolidChildren> Make(uint8_t num_edges, Node* child,
                                                Edge* edges);
+    static std::unique_ptr<SolidChildren> FromMovelist(const MoveList& moves);
     static SolidChildren* Allocate(size_t num_edges);
     static void operator delete(SolidChildren* ptr, std::destroying_delete_t);
     Node* GetChild() const { return const_cast<Node*>(&child_); }

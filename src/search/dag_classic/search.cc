@@ -1002,6 +1002,10 @@ Search::Search(SearchCachedState& state, const NodeTree& tree, Backend* backend,
                            : ContemptMode::WHITE;
     }
   }
+  // Root must be solid to keep edge iterators stable.
+  if (root_node_->GetLowNode()) {
+    root_node_->GetLowNode()->MakeSolid(true);
+  }
 }
 
 namespace {
@@ -3145,7 +3149,7 @@ void SearchWorker::ExtendNode(NodeToProcess& picked_node,
 #endif
     picked_node.is_tt_hit = true;
   } else {
-    picked_node.tt_low_node = std::make_shared<LowNode>(legal_moves);
+    picked_node.tt_low_node = search_->root_node_ == node ? std::make_shared<LowNode>(legal_moves, LowNode::RootTag{}) : std::make_shared<LowNode>(legal_moves);
     picked_node.nn_queried = true;
     picked_node.eval_index =
         GetEvalIndex(eval_used_, state_.eval_results_.size());
