@@ -220,7 +220,8 @@ std::string LowNode::DebugString() const {
       << " WL:" << wl_ << " D:" << d_ << " M:" << m_ << " N:" << weight_
       << " NP:" << num_parents_ << " Term:" << static_cast<int>(terminal_type_)
       << " Bounds:" << static_cast<int>(lower_bound_) - 2 << ","
-      << static_cast<int>(upper_bound_) - 2;
+      << static_cast<int>(upper_bound_) - 2
+      << " Solid: " << solid_edges_;
   return oss.str();
 }
 
