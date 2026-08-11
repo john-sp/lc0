@@ -377,7 +377,7 @@ double LowNode::FinalizeScoreUpdate(double v, double d, float m,
   double divisor = 1.0 / GetWeight();
   wl_ += multiweight * (v - wl_) * divisor;
   d_ += multiweight * (d - d_) * divisor;
-  m_ += multiweight * (m - m_) * static_cast<float>(divisor);
+  m_ += static_cast<float>(multiweight) * (m - m_) * static_cast<float>(divisor);
 
   assert(WLDMInvariantsHold());
   return divisor;
@@ -390,7 +390,7 @@ void LowNode::AdjustForTerminal(double v, double d, float m, double divisor,
   // Recompute Q.
   wl_ += multiweight * v * divisor;
   d_ += multiweight * d * divisor;
-  m_ += multiweight * m * static_cast<float>(divisor);
+  m_ += static_cast<float>(multiweight) * m * static_cast<float>(divisor);
 
   assert(WLDMInvariantsHold());
 }
@@ -404,7 +404,7 @@ double Node::FinalizeScoreUpdate(double v, double d, float m,
   double divisor = 1.0 / weight_;
   wl_ += multiweight * (v - wl_) * divisor;
   d_ += multiweight * (d - d_) * divisor;
-  m_ += multiweight * (m - m_) * static_cast<float>(divisor);
+  m_ += static_cast<float>(multiweight) * (m - m_) * static_cast<float>(divisor);
 
   assert(WLDMInvariantsHold());
   // Decrement virtual loss.
@@ -421,7 +421,7 @@ void Node::AdjustForTerminal(double v, double d, float m, double divisor,
   // Recompute Q.
   wl_ += multiweight * v * divisor;
   d_ += multiweight * d * divisor;
-  m_ += multiweight * m * static_cast<float>(divisor);
+  m_ += static_cast<float>(multiweight) * m * static_cast<float>(divisor);
 
   assert(WLDMInvariantsHold());
 }
