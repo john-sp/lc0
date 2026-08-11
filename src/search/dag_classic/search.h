@@ -409,21 +409,27 @@ using TaskVector = std::vector<TaskType, IterationMemoryAllocator<TaskType>>;
 // variable. Packed value stores required visit infromation which can be
 // pushed into the current_path stack.
 struct CurrentPath {
-    uint32_t visits_ : 20;       // <= collision limit
-    uint32_t large_branch_ : 1;  // bool
-    uint32_t last_child_ : 1;    // bool
-    uint32_t visit_child_ : 1;   // bool
-    uint32_t stop_picking_ : 1;  // bool
-    uint32_t index_ : 8;         // < 218
+  uint32_t visits_ : 20;       // <= collision limit
+  uint32_t large_branch_ : 1;  // bool
+  uint32_t last_child_ : 1;    // bool
+  uint32_t visit_child_ : 1;   // bool
+  uint32_t stop_picking_ : 1;  // bool
+  uint32_t index_ : 8;         // < 218
   CurrentPath(unsigned visits, bool last, bool visit, bool stop, unsigned index)
       : visits_(visits),
-          large_branch_(0),
-          last_child_(last),
-          visit_child_(visit),
-          stop_picking_(stop),
-          index_(index) {}
+        large_branch_(0),
+        last_child_(last),
+        visit_child_(visit),
+        stop_picking_(stop),
+        index_(index) {}
   // Implicit conversion from int to allow comparing to a visit integer.
-  CurrentPath(int visits) : visits_(visits), large_branch_(0), last_child_(0), visit_child_(0), stop_picking_(0), index_(0) {}
+  CurrentPath(int visits)
+      : visits_(visits),
+        large_branch_(0),
+        last_child_(0),
+        visit_child_(0),
+        stop_picking_(0),
+        index_(0) {}
   CurrentPath() {}
 
   auto operator<=>(CurrentPath b) const {
@@ -607,7 +613,7 @@ class SearchWorker {
     int eval_index = -1;
     bool nn_queried : 1 = false;
     bool is_tt_hit : 1 = false;
-    bool is_cache_hit : 1  = false;
+    bool is_cache_hit : 1 = false;
     bool is_black_to_move : 1 = false;
     bool is_delayed_cache_hit : 1 = false;
     bool is_delayed_tt_hit : 1 = false;
@@ -780,9 +786,7 @@ struct TaskWorkspace {
     return absl::Cleanup{[&] { Pop(); }};
   }
 
-  void StartANewSearch() {
-    go_count_++;
-  }
+  void StartANewSearch() { go_count_++; }
 
  private:
   void Pop() {
