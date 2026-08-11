@@ -253,6 +253,8 @@ class ReleaseNodesWork;
 template <typename T>
 class IntrusiveSharedPtr {
  public:
+  using element_type = T;
+
   explicit IntrusiveSharedPtr(T* ptr = nullptr) noexcept : ptr_(ptr) {
     if (ptr_) {
       ptr_->AddRef();

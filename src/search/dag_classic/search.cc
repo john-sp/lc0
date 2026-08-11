@@ -3079,12 +3079,11 @@ void SearchWorker::ExtendNode(NodeToProcess& picked_node,
     auto new_node = search_->root_node_ == node
                         ? MakeShared<LowNode>(legal_moves, LowNode::RootTag{})
                         : MakeShared<LowNode>(legal_moves);
-    auto uniq = std::make_unique<decltype(new_node)>(new_node);
-    tt_hit = !search_->tt_->Insert(hash, std::move(uniq));
+    tt_hit = !search_->tt_->Insert(hash, std::move(new_node));
     entry = search_->tt_->LookupAndPin(hash);
   }
   assert(entry);
-  node->SetLowNode(*entry);
+  node->SetLowNode(IntrusiveSharedPtr<LowNode>(entry));
   search_->tt_->Unpin(hash, entry);
   if (!tt_hit) {
     picked_node.nn_queried = true;
