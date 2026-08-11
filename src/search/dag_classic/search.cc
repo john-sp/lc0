@@ -2329,7 +2329,6 @@ void SearchWorker::GatherMinibatch() {
   // that search can exit.
   while (minibatch_size < target_minibatch_size_ &&
          number_out_of_order_ < max_out_of_order_ && collisions_left > 0) {
-
     // If there is backend work to be done, and the backend is idle - exit
     // immediately.
     // Only do this fancy work if there are multiple threads as otherwise we
@@ -3233,8 +3232,8 @@ bool SearchWorker::DoBackupUpdate() {
 
 bool SearchWorker::MaybeAdjustForTerminalOrTransposition(
     Node* n, const IntrusiveSharedPtr<LowNode>& nl, double& v, double& d,
-    float& m, double avg_weight, double& weight_to_fix, double& v_delta,
-    double& d_delta, float& m_delta, bool& update_parent_bounds) const {
+    float& m, double& weight_to_fix, double& v_delta, double& d_delta,
+    float& m_delta, bool& update_parent_bounds) const {
   if (n->IsTerminal()) {
     v = n->GetWL();
     d = n->GetD();
@@ -3243,44 +3242,42 @@ bool SearchWorker::MaybeAdjustForTerminalOrTransposition(
     return true;
   }
 
+  assert(nl);
+
   // Use information from transposition or a new terminal.
-  if (nl->IsTerminal() || n->GetWeight() + avg_weight < nl->GetWeight()) {
-    // Adapt information from low node to node by flipping Q sign, bounds,
-    // result and incrementing m.
-    v = -nl->GetWL();
-    d = nl->GetD();
-    m = nl->GetM() + 1;
-    // When starting at or going through a transposition/terminal, make sure
-    // to use the information it has already acquired.
-    weight_to_fix = n->GetWeight();
-    v_delta = v - n->GetWL();
-    d_delta = d - n->GetD();
-    m_delta = m - n->GetM();
-    // Update bounds.
-    if (params_.GetStickyEndgames()) {
-      auto tt = nl->GetTerminalType();
-      if (tt != Terminal::NonTerminal) {
-        GameResult r;
-        if (v == 1.0f) {
-          r = GameResult::WHITE_WON;
-        } else if (v == -1.0f) {
-          r = GameResult::BLACK_WON;
-        } else {
-          r = GameResult::DRAW;
-        }
-
-        n->MakeTerminal(r, m, tt);
-        update_parent_bounds = true;
+  // Adapt information from low node to node by flipping Q sign, bounds,
+  // result and incrementing m.
+  v = -nl->GetWL();
+  d = nl->GetD();
+  m = nl->GetM() + 1;
+  // When starting at or going through a transposition/terminal, make sure
+  // to use the information it has already acquired.
+  weight_to_fix = n->GetWeight();
+  v_delta = v - n->GetWL();
+  d_delta = d - n->GetD();
+  m_delta = m - n->GetM();
+  // Update bounds.
+  if (params_.GetStickyEndgames()) {
+    auto tt = nl->GetTerminalType();
+    if (tt != Terminal::NonTerminal) {
+      GameResult r;
+      if (v == 1.0f) {
+        r = GameResult::WHITE_WON;
+      } else if (v == -1.0f) {
+        r = GameResult::BLACK_WON;
       } else {
-        auto [lower, upper] = nl->GetBounds();
-        n->SetBounds(-upper, -lower);
+        r = GameResult::DRAW;
       }
-    }
 
-    return true;
+      n->MakeTerminal(r, m, tt);
+      update_parent_bounds = true;
+    } else {
+      auto [lower, upper] = nl->GetBounds();
+      n->SetBounds(-upper, -lower);
+    }
   }
 
-  return false;
+  return true;
 }
 
 // Use information from terminal status or low node to update node and node's
@@ -3351,8 +3348,8 @@ void SearchWorker::DoBackupUpdateSingleNode(
     d = 1.0f;
     m = 1;
   } else if (!MaybeAdjustForTerminalOrTransposition(
-                 n, nl, v, d, m, avg_weight, weight_to_fix, v_delta, d_delta,
-                 m_delta, update_parent_bounds)) {
+                 n, nl, v, d, m, weight_to_fix, v_delta, d_delta, m_delta,
+                 update_parent_bounds)) {
     // If there is nothing better, use original NN values adjusted for node.
     v = -nl->GetWL();
     d = nl->GetD();
@@ -3412,9 +3409,9 @@ void SearchWorker::DoBackupUpdateSingleNode(
     v_delta = -v_delta;
     m++;
 
-    MaybeAdjustForTerminalOrTransposition(p, pl, v, d, m, avg_weight,
-                                          weight_to_fix, v_delta, d_delta,
-                                          m_delta, update_parent_bounds);
+    MaybeAdjustForTerminalOrTransposition(p, pl, v, d, m, weight_to_fix,
+                                          v_delta, d_delta, m_delta,
+                                          update_parent_bounds);
 
     // Update the stats.
     // Best move.

@@ -636,13 +636,10 @@ class SearchWorker {
   // terminal or its child low node is a transposition. Also update bounds and
   // terminal status of node @n using information from its child low node.
   // Return true if adjustment happened.
-  bool MaybeAdjustForTerminalOrTransposition(Node* n,
-                                             const IntrusiveSharedPtr<LowNode>& nl,
-                                             double& v, double& d, float& m,
-                                             double avg_weight,
-                                             double& weight_to_fix, double& v_delta,
-                                             double& d_delta, float& m_delta,
-                                             bool& update_parent_bounds) const;
+  bool MaybeAdjustForTerminalOrTransposition(
+      Node* n, const IntrusiveSharedPtr<LowNode>& nl, double& v, double& d,
+      float& m, double& weight_to_fix, double& v_delta, double& d_delta,
+      float& m_delta, bool& update_parent_bounds) const;
   void DoBackupUpdateSingleNode(const NodeToProcess& node_to_process,
                                 const BackupPath& path);
   // Returns whether a node's bounds were set based on its children.
