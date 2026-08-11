@@ -408,6 +408,7 @@ double Node::FinalizeScoreUpdate(double v, double d, float m,
 
   assert(WLDMInvariantsHold());
   // Decrement virtual loss.
+  [[maybe_unused]]
   auto old = n_in_flight_.fetch_sub(1, std::memory_order_acq_rel);
   assert(old > 0);
   return divisor;
