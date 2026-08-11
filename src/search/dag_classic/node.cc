@@ -734,9 +734,7 @@ void Node::SetLowNode(IntrusiveSharedPtr<LowNode> low_node) {
   assert(!low_node_);
   low_node_ = low_node;
 }
-void Node::UnsetLowNode() {
-  low_node_.reset();
-}
+void Node::UnsetLowNode() { low_node_.reset(); }
 
 #ifndef NDEBUG
 namespace {
