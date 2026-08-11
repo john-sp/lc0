@@ -2,7 +2,7 @@ ifndef EXE
 	EXE = $(CURDIR)/lc0
 endif
 
-BUILD_FLAGS = -Ddebug=true
+BUILD_FLAGS =
 ifdef EVALFILE
 	BUILD_FLAGS += -Dembed=true
 endif
