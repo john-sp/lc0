@@ -624,7 +624,11 @@ class SearchWorker {
       std::ostringstream oss;
       oss << "<NodeToProcess> This:" << this << " Depth:" << path.size()
           << " Node:" << node << " NNQueried:" << nn_queried
-          << " TTHit:" << is_tt_hit << " CacheHit:" << is_cache_hit << " Path:";
+          << " Eval Index:" << eval_index << " TTHit:" << is_tt_hit
+          << " CacheHit:" << is_cache_hit
+          << " DelayedCacheHit:" << is_delayed_cache_hit
+          << " DelayedTTHit:" << is_delayed_tt_hit
+          << " EdgeUpdate:" << is_edge_update << " Path:";
       for (auto it = path.cbegin(); it != path.cend(); ++it) {
         if (it != path.cbegin()) oss << "->";
         auto n = std::get<0>(*it);
