@@ -2340,9 +2340,6 @@ void SearchWorker::GatherMinibatch() {
   // that search can exit.
   while (minibatch_size < target_minibatch_size_ &&
          number_out_of_order_ < max_out_of_order_ && collisions_left > 0) {
-    // If there's something to process without touching slow neural net, do
-    // it.
-    if (minibatch_size > 0 && computation_->UsedBatchSize() == 0) return;
 
     // If there is backend work to be done, and the backend is idle - exit
     // immediately.
