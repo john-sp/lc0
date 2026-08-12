@@ -497,7 +497,7 @@ class DemuxingComputation final : public BackendComputation {
     const size_t idx = entries_.emplace_back(NetworkComputationRequest{
         .input = EncodePositionForNN(backend_->input_format_, pos.pos, 8,
                                      backend_->fill_empty_history_, &transform),
-        .legal_moves = MoveList(pos.legal_moves.begin(), pos.legal_moves.end()),
+        .nn_indices = NetworkComputationRequest::ToNNIndices(pos.legal_moves, transform),
         .result = result,
         .transform = 0});
     entries_[idx].transform = transform;

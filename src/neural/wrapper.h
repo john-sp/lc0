@@ -41,9 +41,12 @@ FillEmptyHistory EncodeHistoryFill(std::string history_fill);
 class NetworkComputationRequest {
  public:
   InputPlanes input;
-  MoveList legal_moves;
+  std::unique_ptr<uint16_t[]> nn_indices;
   EvalResultPtr result;
   int transform;
+
+  static std::unique_ptr<uint16_t[]> ToNNIndices(
+      const std::span<const Move>& moves, const int transform);
 
   void ProcessResult(const NetworkComputation& computation, int sample,
                      const float temperature);

@@ -46,15 +46,15 @@ FillEmptyHistory EncodeHistoryFill(std::string history_fill) {
 }
 
 namespace {
-void SoftmaxPolicy(std::span<float> dst, const NetworkComputation& computation, int sample,
-                   const std::vector<Move>& moves, const int transform,
+void SoftmaxPolicy(std::span<float> dst, const NetworkComputation& computation,
+                   int sample, const std::span<uint16_t>& indices,
                    const float temperature) {
   // Copy the values to the destination array and compute the maximum.
   const float max_p = std::accumulate(
-      moves.begin(), moves.end(), std::numeric_limits<float>::lowest(),
-      [&, counter = 0](float max_p, const Move& move) mutable {
-        return std::max(max_p, dst[counter++] = computation.GetPVal(
-                                   sample, MoveToNNIndex(move, transform)));
+      indices.begin(), indices.end(), std::numeric_limits<float>::lowest(),
+      [&, counter = 0](float max_p, const uint16_t idx) mutable {
+        return std::max(max_p,
+                        dst[counter++] = computation.GetPVal(sample, idx));
       });
   // Compute the softmax and compute the total.
   float total = std::accumulate(
@@ -67,14 +67,25 @@ void SoftmaxPolicy(std::span<float> dst, const NetworkComputation& computation, 
 }
 }  // namespace
 
-void NetworkComputationRequest::ProcessResult(const NetworkComputation& computation,
-                                       int sample, const float temperature) {
+std::unique_ptr<uint16_t[]> NetworkComputationRequest::ToNNIndices(
+    const std::span<const Move>& moves, const int transform) {
+  auto indices = std::make_unique<uint16_t[]>(moves.size());
+  for (size_t i = 0; i < moves.size(); ++i) {
+    indices[i] = MoveToNNIndex(moves[i], transform);
+  }
+  return indices;
+}
+
+void NetworkComputationRequest::ProcessResult(
+    const NetworkComputation& computation, int sample,
+    const float temperature) {
   if (result.q) *result.q = computation.GetQVal(sample);
   if (result.d) *result.d = computation.GetDVal(sample);
   if (result.e) *result.e = computation.GetEVal(sample);
   if (result.m) *result.m = computation.GetMVal(sample);
   if (!result.p.empty()) {
-    SoftmaxPolicy(result.p, computation, sample, legal_moves, transform,
+    SoftmaxPolicy(result.p, computation, sample,
+                  std::span<uint16_t>(nn_indices.get(), result.p.size()),
                   temperature);
   }
 }
@@ -142,7 +153,7 @@ class NetworkAsBackendComputation : public BackendComputation {
     const size_t idx = entries_.emplace_back(NetworkComputationRequest{
         .input = EncodePositionForNN(backend_->input_format_, pos.pos, 8,
                                      backend_->fill_empty_history_, &transform),
-        .legal_moves = MoveList(pos.legal_moves.begin(), pos.legal_moves.end()),
+        .nn_indices = NetworkComputationRequest::ToNNIndices(pos.legal_moves, transform),
         .result = result,
         .transform = 0});
     entries_[idx].transform = transform;
