@@ -26,6 +26,7 @@
 */
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <filesystem>
@@ -134,6 +135,7 @@ class OnnxComputation final : public NetworkComputation {
   OnnxComputation(OnnxNetwork* network);
   ~OnnxComputation();
   void AddInput(InputPlanes&& input) override;
+  uint32_t AddInputConcurrent(InputPlanes&& input) override;
   int GetBatchSize() const override;
   void ComputeBlocking() override;
   void ComputeBlockingImpl();
@@ -148,7 +150,7 @@ class OnnxComputation final : public NetworkComputation {
   Ort::IoBinding PrepareInputs(int start, int batch_size, int step);
 
   OnnxNetwork* network_;
-  size_t input_size_ = 0;
+  std::atomic<size_t> input_size_ = 0;
   std::vector<InputPlanes> raw_input_;
   std::unique_ptr<InputsOutputs> inputs_outputs_;
 };
@@ -186,6 +188,11 @@ class OnnxNetwork final : public Network {
   int GetPreferredBatchStep() const override {
     return batch_size_ == -1 ? min_batch_size_ : batch_size_;
   }
+#ifdef USE_ONNX_CUDART
+  bool IsConcurrentAddInputSupported() const override {
+    return provider_ == OnnxProvider::TRT || provider_ == OnnxProvider::CUDA;
+  }
+#endif
   bool IsCpu() const override { return provider_ == OnnxProvider::CPU; }
 
   Ort::SessionOptions GetOptions(int threads, int batch_size, uint64_t hash, int optimize);
@@ -388,7 +395,12 @@ void AsDataType(float x, Ort::BFloat16_t* y) {
 
 template <typename DataType>
 void OnnxComputation<DataType>::AddInput(InputPlanes&& input) {
-  if (input_size_ >= network_->max_batch_size_) {
+  AddInputConcurrent(std::move(input));
+}
+template <typename DataType>
+uint32_t OnnxComputation<DataType>::AddInputConcurrent(InputPlanes&& input) {
+  auto input_size = input_size_.fetch_add(1, std::memory_order_relaxed);
+  if (input_size >= network_->max_batch_size_) {
     throw Exception("NN input exceeds max batch size of " +
                     std::to_string(network_->max_batch_size_) + ".");
   }
@@ -396,34 +408,31 @@ void OnnxComputation<DataType>::AddInput(InputPlanes&& input) {
   if (network_->provider_ == OnnxProvider::CUDA ||
       network_->provider_ == OnnxProvider::TRT) {
     assert(input.size() == kInputPlanes);
+    assert(network_->IsConcurrentAddInputSupported());
     uint64_t* masks =
         static_cast<uint64_t*>(inputs_outputs_->input_tensor_data_) +
-        input_size_ * kInputPlanes;
+        input_size * kInputPlanes;
     uint64_t* mask_end =
         static_cast<uint64_t*>(inputs_outputs_->input_tensor_data_) +
         network_->max_batch_size_ * kInputPlanes;
     DataType* values =
-        reinterpret_cast<DataType*>(mask_end) + input_size_ * kInputPlanes;
+        reinterpret_cast<DataType*>(mask_end) + input_size * kInputPlanes;
     for (size_t i = 0; i < kInputPlanes; i++) {
       masks[i] = input[i].mask;
       DataType value;
       AsDataType(input[i].value, &value);
       values[i] = value;
     }
-    input_size_++;
-    if (input_size_ > network_->max_batch_size_) {
-      throw Exception("NN input exceeds max batch size of " +
-                      std::to_string(network_->max_batch_size_) + ".");
-    }
-    return;
+    return input_size;
   }
 #endif
+  assert(!network_->IsConcurrentAddInputSupported());
   raw_input_.emplace_back(std::move(input));
-  input_size_++;
+  return input_size;
 }
 template <typename DataType>
 int OnnxComputation<DataType>::GetBatchSize() const {
-  return input_size_;
+  return input_size_.load(std::memory_order_relaxed);
 }
 
 float AsFloat(float x) { return x; }
@@ -493,7 +502,7 @@ Ort::IoBinding OnnxComputation<DataType>::PrepareInputs(int start,
     iter += start * kInputPlanes * 8 * 8;
     std::memset(static_cast<void*>(iter), 0,
                 batch_size * kInputPlanes * 8 * 8 * sizeof(DataType));
-    int end = std::min(start + batch_size, static_cast<int>(input_size_));
+    int end = std::min(start + batch_size, static_cast<int>(GetBatchSize()));
     for (int i = start; i < end; i++) {
       for (const auto& plane : raw_input_[i]) {
         DataType value;
@@ -556,7 +565,8 @@ void OnnxComputation<DataType>::CaptureCudaGraph(std::unique_lock<std::mutex>&& 
 template <typename DataType>
 void OnnxComputation<DataType>::ComputeBlocking() {
   LCTRACE_FUNCTION_SCOPE;
-  if (GetBatchSize() == 0) return;
+  size_t batch_size = GetBatchSize();
+  if (batch_size == 0) return;
 #ifdef USE_ONNX_CUDART
   if ((network_->provider_ == OnnxProvider::TRT ||
        network_->provider_ == OnnxProvider::CUDA) &&
@@ -566,7 +576,7 @@ void OnnxComputation<DataType>::ComputeBlocking() {
     {
       std::unique_lock lock(network_->lock_);
       cudaGraphExec_t& graph =
-          inputs_outputs_->cuda_graphs_[GetBatchSize() - 1];
+          inputs_outputs_->cuda_graphs_[batch_size - 1];
       if (!graph) {
         ComputeBlockingImpl();
         ReportCUDAErrors(cudaEventRecord(
@@ -608,7 +618,7 @@ void OnnxComputation<DataType>::ComputeBlocking() {
   if (network_->wdl_head_ != -1) {
     const DataType* data = static_cast<DataType*>(
         inputs_outputs_->output_tensors_data_[network_->wdl_head_]);
-    for (size_t i = 0; i < input_size_; i++) {
+    for (size_t i = 0; i < input_size_.load(std::memory_order_relaxed); i++) {
       float w = AsFloat(data[i * 3 + 0]);
       float d = AsFloat(data[i * 3 + 1]);
       float l = AsFloat(data[i * 3 + 2]);
@@ -635,8 +645,9 @@ void OnnxComputation<DataType>::ComputeBlockingImpl() {
   int batch_size = network_->batch_size_;
   if (batch_size < 0) {
     batch_size =
-        std::max(static_cast<int>(input_size_), network_->min_batch_size_);
+        std::max(GetBatchSize(), network_->min_batch_size_);
   }
+  size_t input_size = input_size_.load(std::memory_order_relaxed);
 #ifdef USE_ONNX_CUDART
   cudaStreamCaptureStatus capture_status;
   if (network_->provider_ == OnnxProvider::TRT ||
@@ -645,12 +656,12 @@ void OnnxComputation<DataType>::ComputeBlockingImpl() {
         cudaStreamIsCapturing(network_->upload_stream_, &capture_status));
   }
 #endif
-  for (size_t i = 0; i < (size_t)input_size_;) {
-    int step = (input_size_ - i + batch_size - 1) / batch_size;
+  for (size_t i = 0; i < input_size;) {
+    int step = (input_size - i + batch_size - 1) / batch_size;
     if (step > network_->steps_) step = network_->steps_;
     int batch = batch_size * step;
     if (network_->provider_ == OnnxProvider::TRT && network_->batch_size_ > 0) {
-      batch = std::min((int)input_size_ - (int)i, batch);
+      batch = std::min((int)input_size - (int)i, batch);
     }
 
     auto binding = PrepareInputs(i, batch, step);

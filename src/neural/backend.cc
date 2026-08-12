@@ -39,6 +39,7 @@ BackendAttributes::BackendAttributes(const Network& network) {
   has_mlh = caps.has_mlh();
   has_wdl = caps.has_wdl();
   runs_on_cpu = network.IsCpu();
+  concurrent_add_input = network.IsConcurrentAddInputSupported();
   suggested_num_search_threads = network.GetThreads();
   recommended_batch_size = network.GetMiniBatchSize();
   maximum_batch_size = 1024;
@@ -50,6 +51,7 @@ BackendAttributes& BackendAttributes::operator+=(
   has_mlh = has_mlh && other.has_mlh;
   has_wdl = has_wdl && other.has_wdl;
   runs_on_cpu = runs_on_cpu && other.runs_on_cpu;
+  concurrent_add_input = concurrent_add_input && other.concurrent_add_input;
   suggested_num_search_threads = std::max(suggested_num_search_threads,
                                           other.suggested_num_search_threads);
   recommended_batch_size += other.recommended_batch_size;

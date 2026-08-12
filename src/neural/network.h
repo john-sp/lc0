@@ -57,6 +57,9 @@ class NetworkComputation {
  public:
   // Adds a sample to the batch.
   virtual void AddInput(InputPlanes&& input) = 0;
+  virtual uint32_t AddInputConcurrent(InputPlanes&&) {
+    throw Exception("Concurrent AddInput not supported");
+  }
   // Do the computation.
   virtual void ComputeBlocking() = 0;
   // Returns how many times AddInput() was called.
@@ -121,6 +124,7 @@ class Network {
   virtual int GetThreads() const { return 1; }
   virtual void InitThread(int /*id*/) {}
   virtual bool IsCpu() const { return false; }
+  virtual bool IsConcurrentAddInputSupported() const { return false; }
   virtual int GetMiniBatchSize() const { return 256; }
   virtual int GetPreferredBatchStep() const { return 1; }
   virtual ~Network() = default;

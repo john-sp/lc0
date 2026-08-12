@@ -90,6 +90,21 @@ class AtomicVector {
   size_t size() const { return size_.load(std::memory_order_relaxed); }
   size_t capacity() const { return capacity_; }
 
+  // Request size to be at least the new capacity. Caller must ensure that all
+  // smaller indices are going to be constructed.
+  void ResizeAtLeast(size_t size) {
+#if __cpp_lib_atomic_min_max >=	202403L
+    size_.fetch_max(size, std::memory_order_relaxed);
+#else
+    size_t old_size = size_.load(std::memory_order_relaxed);
+    while (old_size < size &&
+           !size_.compare_exchange_weak(old_size, size,
+                                        std::memory_order_relaxed)) {
+      // Loop until we successfully update the size.
+    }
+#endif
+  }
+
   // Not thread safe.
   void clear() {
     for (size_t i = size_.load(std::memory_order_relaxed); i-- > 0;) {

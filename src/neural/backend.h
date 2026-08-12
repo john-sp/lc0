@@ -44,6 +44,7 @@ struct BackendAttributes {
   bool has_mlh;
   bool has_wdl;
   bool runs_on_cpu;
+  bool concurrent_add_input;
   int suggested_num_search_threads;
   int recommended_batch_size;
   int maximum_batch_size;

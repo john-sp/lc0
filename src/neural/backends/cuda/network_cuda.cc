@@ -25,6 +25,7 @@
   Program grant you additional permission to convey the resulting work.
 */
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <list>
 #include <memory>
@@ -133,11 +134,12 @@ class CudaNetworkComputation : public NetworkComputation {
                          bool moves_left);
   ~CudaNetworkComputation();
 
-  void AddInput(InputPlanes&& input) override {
+  uint32_t AddInputConcurrent(InputPlanes&& input) override {
+    auto batch_size = batch_size_.fetch_add(1, std::memory_order_relaxed);
     const auto iter_mask =
-        &inputs_outputs_->input_masks_mem_[batch_size_ * kInputPlanes];
+        &inputs_outputs_->input_masks_mem_[batch_size * kInputPlanes];
     const auto iter_val =
-        &inputs_outputs_->input_val_mem_[batch_size_ * kInputPlanes];
+        &inputs_outputs_->input_val_mem_[batch_size * kInputPlanes];
 
     assert(input.size() == kInputPlanes);
     for (int i = 0; i < kInputPlanes; i++) {
@@ -145,15 +147,20 @@ class CudaNetworkComputation : public NetworkComputation {
       iter_mask[i] = plane.mask;
       ToType(iter_val[i], plane.value);
     }
+    return batch_size;
+  }
 
-    batch_size_++;
+  void AddInput(InputPlanes&& input) override {
+    AddInputConcurrent(std::move(input));
   }
 
   void ComputeBlocking() override;
 
   void CaptureGraph(std::unique_lock<std::mutex>&& lock = {});
 
-  int GetBatchSize() const override { return batch_size_; }
+  int GetBatchSize() const override {
+    return batch_size_.load(std::memory_order_relaxed);
+  }
 
   float GetQVal(int sample) const override {
     if (wdl_) {
@@ -199,7 +206,7 @@ class CudaNetworkComputation : public NetworkComputation {
  private:
   // Memory holding inputs, outputs.
   std::unique_ptr<InputsOutputs<DataType>> inputs_outputs_;
-  int batch_size_;
+  std::atomic<int> batch_size_;
   bool wdl_;
   bool wdl_err_;
   bool moves_left_;
@@ -1098,6 +1105,8 @@ class CudaNetwork : public Network {
 
   int GetThreads() const override { return 1 + multi_stream_; }
 
+  bool IsConcurrentAddInputSupported() const override { return true; }
+
   std::unique_ptr<NetworkComputation> NewComputation() override {
     // Set correct gpu id for this computation (as it might have been called
     // from a different thread).
@@ -1264,13 +1273,17 @@ class CudaNetwork : public Network {
 template <typename DataType>
 CudaNetworkComputation<DataType>::CudaNetworkComputation(
     CudaNetwork<DataType>* network, bool wdl, bool wdl_err, bool moves_left)
-    : wdl_(wdl), wdl_err_(wdl_err), moves_left_(moves_left), network_(network) {
-  batch_size_ = 0;
+    : batch_size_(0),
+      wdl_(wdl),
+      wdl_err_(wdl_err),
+      moves_left_(moves_left),
+      network_(network) {
   inputs_outputs_ = network_->GetInputsOutputs();
 }
 
 template <typename DataType>
 CudaNetworkComputation<DataType>::~CudaNetworkComputation() {
+  LCTRACE_FUNCTION_SCOPE;
   network_->ReleaseInputsOutputs(std::move(inputs_outputs_));
 }
 
@@ -1285,29 +1298,31 @@ void CudaNetworkComputation<DataType>::CaptureGraph(
     });
     return;
   }
+  int batch_size = GetBatchSize();
   auto capture = network_->BeginCapture(*inputs_outputs_);
-  network_->forwardEval(inputs_outputs_.get(), GetBatchSize(), true);
+  network_->forwardEval(inputs_outputs_.get(), batch_size, true);
   capture.EndCapture();
   if (lock.owns_lock()) lock.unlock();
-  inputs_outputs_->cuda_graphs_[GetBatchSize() - 1] = capture;
+  inputs_outputs_->cuda_graphs_[batch_size - 1] = capture;
 }
 
 template <typename DataType>
 void CudaNetworkComputation<DataType>::ComputeBlocking() {
   LCTRACE_FUNCTION_SCOPE;
-  if (GetBatchSize() == 0) return;
-  if (inputs_outputs_->cuda_graphs_[GetBatchSize() - 1]) {
+  int batch_size = GetBatchSize();
+  if (batch_size == 0) return;
+  if (inputs_outputs_->cuda_graphs_[batch_size - 1]) {
     std::unique_lock<std::mutex> lock = network_->LockEval();
-    network_->GraphLaunch(inputs_outputs_.get(), GetBatchSize());
+    network_->GraphLaunch(inputs_outputs_.get(), batch_size);
   } else {
     std::unique_lock<std::mutex> lock = network_->LockEval();
 #if !CUDA_GRAPH_SUPPORTS_EXTERNAL_EVENTS
-    network_->UploadInputs(inputs_outputs_.get(), GetBatchSize());
+    network_->UploadInputs(inputs_outputs_.get(), batch_size);
 #endif
-    network_->forwardEval(inputs_outputs_.get(), GetBatchSize());
+    network_->forwardEval(inputs_outputs_.get(), batch_size);
     CaptureGraph(std::move(lock));
   }
-  network_->finishEval(inputs_outputs_.get(), GetBatchSize());
+  network_->finishEval(inputs_outputs_.get(), batch_size);
 }
 
 template <typename DataType>

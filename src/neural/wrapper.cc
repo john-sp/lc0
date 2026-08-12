@@ -143,35 +143,58 @@ class NetworkAsBackendComputation : public BackendComputation {
   NetworkAsBackendComputation(NetworkAsBackend* backend)
       : backend_(backend),
         computation_(backend_->network_->NewComputation()),
-        entries_(backend_->attrs_.maximum_batch_size) {}
+        entries_(backend_->attrs_.maximum_batch_size) {
+  }
 
   size_t UsedBatchSize() const override { return entries_.size(); }
 
   AddInputResult AddInput(const EvalPosition& pos,
                           EvalResultPtr result) override {
     int transform;
-    const size_t idx = entries_.emplace_back(NetworkComputationRequest{
-        .input = EncodePositionForNN(backend_->input_format_, pos.pos, 8,
-                                     backend_->fill_empty_history_, &transform),
-        .nn_indices = NetworkComputationRequest::ToNNIndices(pos.legal_moves, transform),
+    auto input = EncodePositionForNN(backend_->input_format_, pos.pos, 8,
+                                     backend_->fill_empty_history_, &transform);
+    size_t idx = 0;
+    NetworkComputationRequest request{
+        .input = backend_->attrs_.concurrent_add_input ? InputPlanes{} : std::move(input),
+        .nn_indices =
+            NetworkComputationRequest::ToNNIndices(pos.legal_moves, transform),
         .result = result,
-        .transform = 0});
-    entries_[idx].transform = transform;
+        .transform = transform};
+    if (backend_->attrs_.concurrent_add_input) {
+      idx = computation_->AddInputConcurrent(std::move(input));
+      entries_.ResizeAtLeast(idx + 1);
+      std::construct_at(&entries_[idx], std::move(request));
+    } else {
+      entries_.emplace_back(std::move(request));
+    }
     return ENQUEUED_FOR_EVAL;
   }
 
   void ComputeBlocking(ComputationCallback callback) override {
-    for (auto& entry : entries_) computation_->AddInput(std::move(entry.input));
+    ForwardInputs();
     computation_->ComputeBlocking();
     callback(ComputationEvent::FIRST_BACKEND_IDLE);
+    ConvertNetworkOutputToBackend();
+  }
+
+  void ConvertNetworkOutputToBackend() {
     LCTRACE_FUNCTION_SCOPE;
     for (size_t i = 0; i < entries_.size(); ++i) {
       entries_[i].ProcessResult(*computation_, i,
-                               backend_->softmax_policy_temperature_);
+                                backend_->softmax_policy_temperature_);
     }
   }
 
  private:
+  void ForwardInputs() {
+    if (backend_->attrs_.concurrent_add_input) return;
+    LCTRACE_FUNCTION_SCOPE;
+    for (auto& entry : entries_) {
+      computation_->AddInput(std::move(entry.input));
+      entry.input = {};
+    }
+  }
+
   NetworkAsBackend* backend_;
   std::unique_ptr<NetworkComputation> computation_;
   AtomicVector<NetworkComputationRequest> entries_;
