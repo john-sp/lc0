@@ -519,6 +519,7 @@ if get_option('build_backends')
     foreach x : get_option('cudnn_include')
       nvcc_arguments += ['-I', x]
     endforeach
+    nvcc_arguments += ['-I', meson.current_build_dir()]
     if host_machine.system() == 'windows'
       outputname = '@BASENAME@.obj'
     else
