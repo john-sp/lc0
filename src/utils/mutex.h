@@ -38,6 +38,15 @@
 
 #include "utils/cppattributes.h"
 
+#ifndef __has_feature
+#define __has_feature(x) 0
+#endif
+
+#if __has_feature(thread_sanitizer) || defined(__SANITIZE_THREAD__)
+#define TSAN_BUILD 1
+#include <sanitizer/tsan_interface.h>
+#endif
+
 namespace lczero {
 
 // Implementation of reader-preferenced shared mutex. Based on fair shared
@@ -156,11 +165,24 @@ class CAPABILITY("mutex") SpinMutex {
     std::unique_lock<SpinMutex> lock_;
   };
 
+#if TSAN_BUILD
+  SpinMutex() { __tsan_mutex_create(&mutex_, 0); }
+#endif
+#if TSAN_BUILD
+  ~SpinMutex() { __tsan_mutex_destroy(&mutex_, 0); }
+#endif
+
   void lock() ACQUIRE() {
     int spins = 0;
+#if TSAN_BUILD
+    __tsan_mutex_pre_lock(&mutex_, 0);
+#endif
     while (true) {
       int val = 0;
       if (mutex_.compare_exchange_weak(val, 1, std::memory_order_acq_rel)) {
+#if TSAN_BUILD
+        __tsan_mutex_post_lock(&mutex_, 0, 0);
+#endif
         break;
       }
       ++spins;
@@ -173,7 +195,15 @@ class CAPABILITY("mutex") SpinMutex {
       }
     }
   }
-  void unlock() RELEASE() { mutex_.store(0, std::memory_order_release); }
+  void unlock() RELEASE() {
+#if TSAN_BUILD
+    __tsan_mutex_pre_unlock(&mutex_, 0);
+#endif
+    mutex_.store(0, std::memory_order_release);
+#if TSAN_BUILD
+    __tsan_mutex_post_unlock(&mutex_, 0);
+#endif
+  }
 
  private:
   std::atomic<int> mutex_{0};
