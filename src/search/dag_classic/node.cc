@@ -276,9 +276,11 @@ void LowNode::MakeNotTerminal(const Node* node) {
     }
 
     // Recompute with current eval (instead of network's) and children's eval.
-    wl_ /= weight_;
-    d_ /= weight_;
-    m_ /= weight_;
+    if (weight_ > 0) {
+      wl_ /= weight_;
+      d_ /= weight_;
+      m_ /= weight_;
+    }
   }
 
   assert(WLDMInvariantsHold());
