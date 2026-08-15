@@ -170,9 +170,9 @@ std::pair<int, int> GetRepetitions(int depth, const Position& position,
 
   if (repetitions == 0) return {0, 0};
 
-  if (repetitions >= 2) return {repetitions, 0};
-
   const auto plies = position.GetPliesSincePrevRepetition();
+  if (repetitions >= 2) return {repetitions, plies};
+
   if (params.GetTwoFoldDraws() && /*repetitions == 1 &&*/ depth >= 4 &&
       depth >= plies) {
     return {1, plies};
@@ -3608,9 +3608,13 @@ SearchWorker::BackupUpdateResults SearchWorker::DoBackupUpdateSingleNode(
         m_delta = m - nl->GetM();
         nl->AdjustForTerminal(v_delta, d_delta, m_delta, 1.0 / avg_weight,
                               avg_weight);
-      } else {
+      } else if (!nl->IsTerminal()) {
         // Update low node evaluation for the repetition.
         nl->FinalizeScoreUpdate(v, d, m, avg_weight);
+      }
+      if (nr > 1 && nm >= static_cast<int>(path.size()) && !nl->IsTerminal()) {
+        // Draw by repetition cannot be avoided anymore.
+        nl->MakeTerminal(GameResult::DRAW, m);
       }
     } else {
       avg_weight = std::min(avg_weight, nl->GetWeight());
