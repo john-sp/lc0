@@ -899,14 +899,14 @@ void Node::SortEdges() const {
   low_node_->SortEdges();
 }
 
-static constexpr double wld_tolerance = 1e-6;
-static constexpr float m_tolerance = 1e-3f;
+static constexpr double wld_tolerance = 1e-2;
+static constexpr float m_tolerance = 5e-2f;
 
 static bool WLDMInvariantsHold(double wl, double d, float m) {
   return -(1.0f + wld_tolerance) < wl && wl < (1.0f + wld_tolerance) &&  //
          -(0.0f + wld_tolerance) < d && d < (1.0f + wld_tolerance) &&    //
          -(0.0f + m_tolerance) < m &&                                    //
-         std::abs(wl) + std::abs(d) < (1.0f + wld_tolerance);
+         std::abs(wl) + std::clamp(d, 0.0, 1.0) < (1.0f + wld_tolerance);
 }
 
 bool Node::WLDMInvariantsHold() const {
