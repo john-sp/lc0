@@ -3657,24 +3657,11 @@ SearchWorker::BackupUpdateResults SearchWorker::DoBackupUpdateSingleNode(
     auto [p, pr, pm] = *it;
     const auto& pl = p->GetLowNode();
 
-    // Try setting parent bounds except the root or those already terminal.
-    if (update_parent_bounds && p != search_->root_node_) {
-      // We unlock child early to avoid lock ordering issues. The stack state
-      // will stay consistent because terminal cannot change its evaluation
-      // anymore.
-      node_lock.unlock();
-      update_parent_bounds = MaybeSetBounds(p, m, low_lock);
-    } else {
-      update_parent_bounds = false;
-      low_lock = std::unique_lock<MutexType>(pl->GetMutex());
-    }
-
+    low_lock = std::unique_lock<MutexType>(pl->GetMutex());
     // Node must be unlocked after LowNode has been locked to avoid another
     // thread overtaking this thread using the same path which would make stack
     // variable state invalid.
-    if (node_lock.owns_lock()) {
-      node_lock.unlock();
-    }
+    node_lock.unlock();
 
     // If parent low node is already a (new) terminal, then change propagated
     // values and stop terminal adjustment.
@@ -3688,6 +3675,10 @@ SearchWorker::BackupUpdateResults SearchWorker::DoBackupUpdateSingleNode(
     if (weight_to_fix > 0) {
       pl->AdjustForTerminal(v_delta, d_delta, m_delta, divisor, weight_to_fix);
     }
+
+    // Try setting parent bounds except the root or those already terminal.
+    update_parent_bounds = update_parent_bounds && p != search_->root_node_ &&
+                           !pl->IsTerminal() && MaybeSetBounds(p, m, low_lock);
 
     node_lock = std::unique_lock<MutexType>(p->GetMutex());
 
@@ -3739,17 +3730,12 @@ bool SearchWorker::MaybeSetBounds(Node* p, float m, L& low_lock) const {
   auto lower = GameResult::BLACK_WON;
   auto upper = GameResult::BLACK_WON;
   const auto& pl = p->GetLowNode();
-  Node::Iterator range;
-  {
-    // Getting edge iterator requires lock. But we must stop using the lock
-    // before locking children.
-    std::unique_lock<MutexType> temp_low_lock(pl->GetMutex());
-    if (pl->IsTerminal()) {
-      low_lock = std::move(temp_low_lock);
-      return false;
-    }
-    range = p->Edges();
-  }
+  Node::Iterator range = p->Edges();
+  // We unlock temporary to avoid lock ordering issues.
+  // MaybeAdjustForTerminalOrTransposition will read new stack values which
+  // makes thread local state to be consistent even if another thread
+  // overtakes this thread using the same path.
+  low_lock.unlock();
 
   for (const auto& edge : range) {
     std::unique_lock<MutexType> edge_lock;
@@ -3781,7 +3767,7 @@ bool SearchWorker::MaybeSetBounds(Node* p, float m, L& low_lock) const {
   // Can't Lose ( 0, 1) -> (-1, 0) Can't Win
   //        Win ( 1, 1) -> (-1,-1) Loss
 
-  low_lock = std::unique_lock<MutexType>(pl->GetMutex());
+  low_lock.lock();
 
   // Nothing left to do for ancestors if the parent would be a regular node.
   if (lower == GameResult::BLACK_WON && upper == GameResult::WHITE_WON) {
