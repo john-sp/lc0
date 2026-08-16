@@ -3537,6 +3537,10 @@ bool SearchWorker::MaybeAdjustForTerminalOrTransposition(
       update_parent_bounds = true;
     } else {
       auto [lower, upper] = nl->GetBounds();
+      auto [cur_lower, cur_upper] = n->GetBounds();
+      if (-lower != cur_lower || -upper != cur_upper) {
+        update_parent_bounds = true;
+      }
       n->SetBounds(-upper, -lower);
     }
   }
