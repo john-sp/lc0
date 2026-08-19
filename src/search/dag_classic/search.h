@@ -207,9 +207,9 @@ class TaskQueue {
   void ProcessTask(int tid);
   // Submit list of tasks to the queue.
   template <typename TaskVector>
-  void SubmitTasks(const TaskVector& tasks, int tid);
+  void SubmitTasks(TaskVector& tasks, int tid);
   template <typename TaskType>
-  void SubmitTask(const TaskType& task, int tid);
+  void SubmitTask(TaskType& task, int tid);
   // Activate worker threads when we are about to submit tasks.
   void ActivateTasks();
   // Deactivate worker threads.
@@ -706,7 +706,7 @@ class SearchWorker {
   // Process a queued task.
   void ProcessTask(int tid);
   template <typename TaskType>
-  void SubmitTasks(const TaskType& tasks);
+  void SubmitTasks(TaskType& tasks);
 
   void MaybeOutputInfo();
 

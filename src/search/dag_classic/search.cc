@@ -775,8 +775,16 @@ bool TaskQueue::ProcessTaskWorker(int tid) {
 
 // Queue a list of task to workers.
 template <typename TaskVector>
-void TaskQueue::SubmitTasks(const TaskVector& tasks, int tid) {
+void TaskQueue::SubmitTasks(TaskVector& tasks, int tid) {
   if (tasks.empty()) return;
+
+  // Execute tasks immediately if there are no task workers.
+  if (Size() == 0) {
+    for (auto& task : tasks) {
+      task(tid);
+    }
+    return;
+  }
 
   const size_t capacity = picking_tasks_.size();
   const size_t size = std::distance(tasks.begin(), tasks.end());
@@ -816,7 +824,12 @@ void TaskQueue::SubmitTasks(const TaskVector& tasks, int tid) {
 
 // Submit a task to the queue.
 template <typename TaskType>
-void TaskQueue::SubmitTask(const TaskType& task, int tid) {
+void TaskQueue::SubmitTask(TaskType& task, int tid) {
+  // Execute tasks immediately if there are no task workers.
+  if (Size() == 0) {
+    task(tid);
+    return;
+  }
   const size_t size = picking_tasks_.size();
   unsigned nta, tc;
   int packed_value, new_value;
@@ -2088,7 +2101,8 @@ void SchedulePointerUpdateTasks(MakeSolidList& solid_tasks,
 
   // Use two tasks per thread where the second tasks is a smaller load
   // balancing tasks. Faster threads can take more than one smaller task.
-  bool use_small_tail = paths >= (state.task_queue_.Size() + 1) * tail_share;
+  bool use_small_tail = paths >= (state.task_queue_.Size() + 1) * tail_share &&
+                        state.task_queue_.Size() > 0;
   size_t threads = state.task_queue_.Size() + 1;
 
   TaskArray<UpdatePathPointers> tasks(use_small_tail ? threads * 2 : threads);
@@ -2361,7 +2375,7 @@ TaskArray<BackupTask> ScheduleBackupUpdateTasks(
 
   const size_t tail_share = 4;
   size_t positions = batch.size();
-  bool use_small_tail = positions >= tail_share * workers;
+  bool use_small_tail = positions >= tail_share * workers && workers > 1;
   TaskArray<BackupTask> tasks(workers * (use_small_tail ? 2 : 1));
   size_t first_positions =
       use_small_tail ? positions * (tail_share - 1) / tail_share : positions;
@@ -2430,7 +2444,7 @@ void ScheduleFetchResultsTasks(
 
   const size_t tail_share = 8;
   size_t positions = batch.size();
-  bool use_small_tail = positions >= tail_share * workers;
+  bool use_small_tail = positions >= tail_share * workers && workers > 1;
   TaskArray<FetchResultsTask> tasks(workers * (use_small_tail ? 2 : 1));
   size_t first_positions =
       use_small_tail ? positions * (tail_share - 1) / tail_share : positions;
@@ -2666,7 +2680,7 @@ void SearchWorker::ProcessTask(int tid) {
   search_->state_.task_queue_.ProcessTask(tid);
 }
 template <typename TaskType>
-void SearchWorker::SubmitTasks(const TaskType& tasks) {
+void SearchWorker::SubmitTasks(TaskType& tasks) {
   search_->state_.task_queue_.SubmitTasks(tasks, tid_);
 }
 
@@ -3368,8 +3382,8 @@ void SearchWorker::RunNNComputation() {
       assert(old > 0);
       std::ignore = old;
       std::ignore = event;
-      // Start task workers early. This leaves scheduler a little extra time if it
-      // needs to wake up a new CPU core.
+      // Start task workers early. This leaves scheduler a little extra time if
+      // it needs to wake up a new CPU core.
       search_->state_.task_queue_.ActivateTasks();
     });
   } else {
