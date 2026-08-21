@@ -125,10 +125,10 @@ using FfnGemm =
     FfnGemmConfig<Activation, cutlass::gemm::GemmShape<64, 64, 32>>;
 
 // Keep the 432-block, four-wave grid used by the baseline A100 t3-distill2
-// FFN expansion, but use eight warps per threadblock instead of four.
+// FFN expansion, but use eight 32x64x32 warps per threadblock instead of four.
 template <template <typename> class Activation>
 using FfnGemmA100T3 =
-    FfnGemmConfig<Activation, cutlass::gemm::GemmShape<64, 32, 32>>;
+    FfnGemmConfig<Activation, cutlass::gemm::GemmShape<32, 64, 32>>;
 
 template <typename Gemm>
 bool runFfnGemmImpl(half* output, const half* input, const half* weights,
