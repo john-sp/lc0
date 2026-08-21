@@ -109,34 +109,22 @@ using FfnEpilogue = cutlass::epilogue::thread::LinearCombinationGeneric<
     cutlass::epilogue::thread::ScaleType::NoBetaScaling,
     cutlass::FloatRoundStyle::round_to_nearest, true>;
 
-template <template <typename> class Activation, typename ThreadblockShape,
-          typename WarpShape, int Stages>
-using FfnGemmConfig = cutlass::gemm::device::Gemm<
+template <template <typename> class Activation>
+using FfnGemm = cutlass::gemm::device::Gemm<
     cutlass::half_t, cutlass::layout::RowMajor, cutlass::half_t,
     cutlass::layout::ColumnMajor, cutlass::half_t,
     cutlass::layout::RowMajor, cutlass::half_t,
     cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
-    ThreadblockShape, WarpShape,
+    cutlass::gemm::GemmShape<128, 128, 32>,
+    cutlass::gemm::GemmShape<64, 64, 32>,
     cutlass::gemm::GemmShape<16, 8, 16>, FfnEpilogue<Activation>,
-    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, Stages>;
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, 3>;
 
 template <template <typename> class Activation>
-using FfnGemm = FfnGemmConfig<Activation,
-                              cutlass::gemm::GemmShape<128, 128, 32>,
-                              cutlass::gemm::GemmShape<64, 64, 32>, 3>;
-
-// The t3-distill2 FFN expansion at batch 108 has 6912 rows and 1024 output
-// columns. A 256-column tile gives exactly two waves across the 108 SMs of
-// A100 and increases reuse of each input tile within the threadblock.
-template <template <typename> class Activation>
-using FfnGemmA100T3 = FfnGemmConfig<
-    Activation, cutlass::gemm::GemmShape<128, 256, 32>,
-    cutlass::gemm::GemmShape<64, 64, 32>, 4>;
-
-template <typename Gemm>
-bool runFfnGemmImpl(half* output, const half* input, const half* weights,
-                    const half* bias, int rows, int outputs, int inputs,
-                    cudaStream_t stream) {
+bool runFfnGemm(half* output, const half* input, const half* weights,
+                const half* bias, int rows, int outputs, int inputs,
+                cudaStream_t stream) {
+  using Gemm = FfnGemm<Activation>;
   typename Gemm::Arguments arguments{
       {rows, outputs, inputs},
       {reinterpret_cast<const cutlass::half_t*>(input), inputs},
@@ -151,18 +139,6 @@ bool runFfnGemmImpl(half* output, const half* input, const half* weights,
   }
   Gemm gemm;
   return gemm(arguments, nullptr, stream) == cutlass::Status::kSuccess;
-}
-
-template <template <typename> class Activation>
-bool runFfnGemm(half* output, const half* input, const half* weights,
-                const half* bias, int rows, int outputs, int inputs,
-                bool use_a100_t3_tile, cudaStream_t stream) {
-  if (use_a100_t3_tile) {
-    return runFfnGemmImpl<FfnGemmA100T3<Activation>>(
-        output, input, weights, bias, rows, outputs, inputs, stream);
-  }
-  return runFfnGemmImpl<FfnGemm<Activation>>(
-      output, input, weights, bias, rows, outputs, inputs, stream);
 }
 
 bool isAligned16(const void* pointer) {
@@ -182,26 +158,20 @@ bool fusedFfnDense1(half* output, const half* input, const half* weights,
 
   int device = 0;
   int major = 0;
-  int minor = 0;
   if (cudaGetDevice(&device) != cudaSuccess ||
       cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
-                             device) != cudaSuccess ||
-      cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor,
                              device) != cudaSuccess ||
       major < 8) {
     return false;
   }
-  const bool use_a100_t3_tile =
-      major == 8 && minor == 0 && rows == 108 * 64 && outputs == 1024 &&
-      inputs == 512;
 
   switch (activation) {
     case ACTIVATION_MISH:
       return runFfnGemm<Lc0Mish>(output, input, weights, bias, rows, outputs,
-                                 inputs, use_a100_t3_tile, stream);
+                                 inputs, stream);
     case ACTIVATION_RELU_2:
       return runFfnGemm<Lc0Relu2>(output, input, weights, bias, rows, outputs,
-                                  inputs, use_a100_t3_tile, stream);
+                                  inputs, stream);
     default:
       return false;
   }
