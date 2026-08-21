@@ -109,7 +109,7 @@ using FfnEpilogue = cutlass::epilogue::thread::LinearCombinationGeneric<
     cutlass::epilogue::thread::ScaleType::NoBetaScaling,
     cutlass::FloatRoundStyle::round_to_nearest, true>;
 
-template <template <typename> class Activation, typename WarpShape>
+template <template <typename> class Activation, typename WarpShape, int Stages>
 using FfnGemmConfig = cutlass::gemm::device::Gemm<
     cutlass::half_t, cutlass::layout::RowMajor, cutlass::half_t,
     cutlass::layout::ColumnMajor, cutlass::half_t,
@@ -118,17 +118,17 @@ using FfnGemmConfig = cutlass::gemm::device::Gemm<
     cutlass::gemm::GemmShape<128, 128, 32>,
     WarpShape,
     cutlass::gemm::GemmShape<16, 8, 16>, FfnEpilogue<Activation>,
-    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, 3>;
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, Stages>;
 
 template <template <typename> class Activation>
 using FfnGemm =
-    FfnGemmConfig<Activation, cutlass::gemm::GemmShape<64, 64, 32>>;
+    FfnGemmConfig<Activation, cutlass::gemm::GemmShape<64, 64, 32>, 3>;
 
 // Keep the 432-block, four-wave grid used by the baseline A100 t3-distill2
-// FFN expansion, but use eight 32x64x32 warps per threadblock instead of four.
+// FFN expansion, but use eight 32x64x32 warps and two pipeline stages.
 template <template <typename> class Activation>
 using FfnGemmA100T3 =
-    FfnGemmConfig<Activation, cutlass::gemm::GemmShape<32, 64, 32>>;
+    FfnGemmConfig<Activation, cutlass::gemm::GemmShape<32, 64, 32>, 2>;
 
 template <typename Gemm>
 bool runFfnGemmImpl(half* output, const half* input, const half* weights,
