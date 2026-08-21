@@ -177,7 +177,7 @@ bool fusedFfnDense1(half* output, const half* input, const half* weights,
   }
 }
 
-template <bool bias>
+template <bool bias, int kQueriesPerBlock>
 void fusedMHACutlass(void* output, void* q, void* k, void* v, void* skip,
                      int batch_size, int num_heads, int depth,
                      cudaStream_t stream) {
@@ -185,7 +185,6 @@ void fusedMHACutlass(void* output, void* q, void* k, void* v, void* skip,
   cutlass::half_t* mha_k = (cutlass::half_t*)k;
   cutlass::half_t* mha_v = (cutlass::half_t*)v;
 
-  constexpr int kQueriesPerBlock = 64;
   constexpr int kKeysPerBlock = 64;
   constexpr bool kSingleValueIteration = true;
 
@@ -254,12 +253,36 @@ void fusedMHACutlass(void* output, void* q, void* k, void* v, void* skip,
 
 void fusedMHA(void* output, void* mha_q, void* mha_k, void* mha_v, void* skip,
               int batch_size, int num_heads, int depth, cudaStream_t stream) {
+  int device = 0;
+  int major = 0;
+  int minor = 0;
+  // Split the fixed 64-query board into two blocks only for the steady
+  // t3-distill2 workload on A100. Keep the established tile as the fallback.
+  const bool use_a100_t3_tile =
+      batch_size == 108 && num_heads == 16 && depth == 32 &&
+      cudaGetDevice(&device) == cudaSuccess &&
+      cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
+                             device) == cudaSuccess &&
+      cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor,
+                             device) == cudaSuccess &&
+      major == 8 && minor == 0;
+
   if (skip == nullptr) {
-    fusedMHACutlass<false>(output, mha_q, mha_k, mha_v, skip, batch_size,
-                           num_heads, depth, stream);
+    if (use_a100_t3_tile) {
+      fusedMHACutlass<false, 32>(output, mha_q, mha_k, mha_v, skip, batch_size,
+                                num_heads, depth, stream);
+    } else {
+      fusedMHACutlass<false, 64>(output, mha_q, mha_k, mha_v, skip, batch_size,
+                                num_heads, depth, stream);
+    }
   } else {
-    fusedMHACutlass<true>(output, mha_q, mha_k, mha_v, skip, batch_size,
-                          num_heads, depth, stream);
+    if (use_a100_t3_tile) {
+      fusedMHACutlass<true, 32>(output, mha_q, mha_k, mha_v, skip, batch_size,
+                               num_heads, depth, stream);
+    } else {
+      fusedMHACutlass<true, 64>(output, mha_q, mha_k, mha_v, skip, batch_size,
+                               num_heads, depth, stream);
+    }
   }
 }
 
