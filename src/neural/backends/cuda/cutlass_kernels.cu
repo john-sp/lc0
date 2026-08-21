@@ -126,11 +126,11 @@ using FfnGemm = FfnGemmConfig<Activation,
                               cutlass::gemm::GemmShape<64, 64, 32>, 3>;
 
 // The t3-distill2 FFN expansion at batch 108 has 6912 rows and 1024 output
-// columns. A 256-row tile gives exactly two waves across the 108 SMs of A100,
-// while retaining enough columns for weight reuse within each threadblock.
+// columns. A 256-column tile gives exactly two waves across the 108 SMs of
+// A100 and increases reuse of each input tile within the threadblock.
 template <template <typename> class Activation>
 using FfnGemmA100T3 = FfnGemmConfig<
-    Activation, cutlass::gemm::GemmShape<256, 128, 32>,
+    Activation, cutlass::gemm::GemmShape<128, 256, 32>,
     cutlass::gemm::GemmShape<64, 64, 32>, 3>;
 
 template <typename Gemm>
