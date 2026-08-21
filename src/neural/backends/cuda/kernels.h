@@ -150,7 +150,8 @@ void Softmax(int N, int C, T* output, const T* input, const T* input2,
 template <typename T>
 void LayerNorm(int N, int C, T* output, const T* input, const T* bias,
                const T* skip, const T* gammas, const T* betas, float ep,
-               float alpha, ActivationFunction act, cudaStream_t stream);
+               float alpha, ActivationFunction act, cudaStream_t stream,
+               bool use_256_threads = false);
 
 // Layer normalization followed by per-square input gating, fused into the
 // normalization kernel's output stage. Rows are contiguous NHWC and gates use
