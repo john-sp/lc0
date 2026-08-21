@@ -377,6 +377,27 @@ class CudaNetwork : public Network {
                            pblczero::NetworkFormat::ACTIVATION_RELU_2);
     }
 
+    const bool smolgen_overlap_option_present =
+        options.Exists<bool>("smolgen_overlap");
+    const bool smolgen_overlap_requested =
+        options.GetOrDefault<bool>("smolgen_overlap", true);
+    const bool smolgen_overlap_all_batches =
+        smolgen_overlap_option_present && smolgen_overlap_requested;
+    const bool target_t3_encoder_shape =
+        weights.has_smolgen && weights.encoder.size() == 15 &&
+        weights.ip_emb_b.size() == 512 && weights.encoder_head_count == 16 &&
+        std::all_of(weights.encoder.begin(), weights.encoder.end(),
+                    [](const auto& encoder) {
+                      return encoder.mha.has_smolgen &&
+                             encoder.mha.q_b.size() == 512 &&
+                             encoder.ffn.dense1_b.size() == 1024;
+                    });
+    const bool smolgen_overlap =
+        smolgen_overlap_requested && !multi_stream_ && fp16 && use_fused_mha &&
+        deviceProp.major == 8 &&
+        (deviceProp.minor == 0 || smolgen_overlap_all_batches) &&
+        target_t3_encoder_shape;
+
     const bool use_gemm_ex = deviceProp.major >= 5;
 
     // 0. Check for SE.
@@ -525,8 +546,15 @@ class CudaNetwork : public Network {
           static_cast<InputEmbedding>(
               file.format().network_format().input_embedding()) ==
               InputEmbedding::INPUT_EMBEDDING_PE_DENSE,
-          use_gemm_ex, use_fused_mha);
+          use_gemm_ex, use_fused_mha, smolgen_overlap,
+          smolgen_overlap_all_batches);
       network_.emplace_back(std::move(attention_body));
+
+      if (smolgen_overlap) {
+        CERR << "Enabled SM80 t3 smolgen/QKV overlap"
+             << (smolgen_overlap_all_batches ? " for all batch sizes"
+                                             : " for batch 108");
+      }
 
       encoder_last_ = getLastLayer();
     }
