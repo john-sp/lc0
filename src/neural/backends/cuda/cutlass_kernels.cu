@@ -131,7 +131,7 @@ using FfnGemm = FfnGemmConfig<Activation,
 template <template <typename> class Activation>
 using FfnGemmA100T3 = FfnGemmConfig<
     Activation, cutlass::gemm::GemmShape<128, 256, 32>,
-    cutlass::gemm::GemmShape<64, 64, 32>, 3>;
+    cutlass::gemm::GemmShape<64, 64, 32>, 4>;
 
 template <typename Gemm>
 bool runFfnGemmImpl(half* output, const half* input, const half* weights,
