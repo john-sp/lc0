@@ -110,6 +110,8 @@ struct InputsOutputs {
     ReportCUDAErrors(
         cudaEventCreateWithFlags(&upload_done_event_, cudaEventDisableTiming));
     ReportCUDAErrors(
+        cudaEventCreateWithFlags(&heads_ready_event_, cudaEventDisableTiming));
+    ReportCUDAErrors(
         cudaEventCreateWithFlags(&policy_done_event_, cudaEventDisableTiming));
     ReportCUDAErrors(
         cudaEventCreateWithFlags(&value_done_event_, cudaEventDisableTiming));
@@ -179,6 +181,7 @@ struct InputsOutputs {
     ReportCUDAErrors(cudaFreeHost(op_value_mem_));
     ReportCUDAErrors(cudaFree(op_value_mem_gpu_));
     ReportCUDAErrors(cudaEventDestroy(upload_done_event_));
+    ReportCUDAErrors(cudaEventDestroy(heads_ready_event_));
     ReportCUDAErrors(cudaEventDestroy(policy_done_event_));
     ReportCUDAErrors(cudaEventDestroy(value_done_event_));
     ReportCUDAErrors(cudaEventDestroy(wdl_download_done_event_));
@@ -243,6 +246,7 @@ struct InputsOutputs {
 
   // cuda events to synchronize between streams
   cudaEvent_t upload_done_event_ = nullptr;
+  cudaEvent_t heads_ready_event_ = nullptr;
   cudaEvent_t policy_done_event_ = nullptr;
   cudaEvent_t value_done_event_ = nullptr;
   cudaEvent_t value_err_done_event_ = nullptr;

@@ -270,6 +270,17 @@ class CudaNetwork : public Network {
 
     multi_stream_ = options.GetOrDefault<bool>("multi_stream", false);
 
+    // The four t3-distill2 output heads are independent after the shared
+    // transformer body.  Keep the optimization narrowly scoped by default:
+    // exact target network, SM80, fp16, single-eval-stream mode, and batch 108.
+    // An explicit head_overlap=true keeps the shape/device checks but allows
+    // all batch sizes, which is useful for correctness testing.
+    const bool head_overlap_option_present = options.Exists<bool>("head_overlap");
+    const bool head_overlap_requested =
+        options.GetOrDefault<bool>("head_overlap", true);
+    head_overlap_all_batches_ =
+        head_overlap_option_present && head_overlap_requested;
+
     // layout used by cuda backend is nchw.
     has_tensor_cores_ = false;
     constexpr bool fp16 = std::is_same<half, DataType>::value;
@@ -634,6 +645,27 @@ class CudaNetwork : public Network {
       network_.emplace_back(std::move(FCMov2));
     }
 
+    const auto& selected_policy = weights.policy_heads.at(policy_head);
+    const bool target_encoder_shape =
+        weights.encoder.size() == 15 && weights.ip_emb_b.size() == 512 &&
+        weights.encoder_head_count == 16 &&
+        std::all_of(weights.encoder.begin(), weights.encoder.end(),
+                    [](const auto& encoder) {
+                      return encoder.mha.q_b.size() == 512 &&
+                             encoder.ffn.dense1_b.size() == 1024;
+                    });
+    const bool target_head_shape =
+        policy_head == "vanilla" && value_head == "winner" &&
+        selected_policy.ip_pol_b.size() == 512 &&
+        selected_policy.ip2_pol_b.size() == 512;
+    const bool supported_device =
+        deviceProp.major == 8 &&
+        (deviceProp.minor == 0 || head_overlap_all_batches_);
+    head_overlap_ = head_overlap_requested && !multi_stream_ && fp16 &&
+                    supported_device && attn_body_ && attn_policy_ && wdl_ &&
+                    wdl_err_ && moves_left_ && target_encoder_shape &&
+                    target_head_shape;
+
     // 3. Allocate GPU memory for running the network:
     //    - three buffers of max size are enough (one to hold input, second to
     //      hold output and third to hold skip connection's input).
@@ -656,6 +688,35 @@ class CudaNetwork : public Network {
         ReportCUDAErrors(cudaMalloc(&mem, maxSize));
         ReportCUDAErrors(cudaMemset(mem, 0, maxSize));
       }
+    }
+
+    if (head_overlap_) {
+      auto create_head_stream = [&](cudaStream_t* stream,
+                                    cublasHandle_t* handle) {
+        ReportCUDAErrors(
+            cudaStreamCreateWithFlags(stream, cudaStreamNonBlocking));
+        ReportCUBLASErrors(cublasCreate(handle));
+        ReportCUBLASErrors(cublasSetStream(*handle, *stream));
+        ReportCUBLASErrors(
+            cublasSetMathMode(*handle, CUBLAS_TENSOR_OP_MATH));
+      };
+      create_head_stream(&value_stream_, &value_cublas_);
+      create_head_stream(&value_err_stream_, &value_err_cublas_);
+      create_head_stream(&moves_stream_, &moves_cublas_);
+
+      auto allocate_head_buffer = [&](auto** mem) {
+        ReportCUDAErrors(cudaMalloc(reinterpret_cast<void**>(mem), maxSize));
+      };
+      allocate_head_buffer(&value_tensor_);
+      allocate_head_buffer(&value_scratch_);
+      allocate_head_buffer(&value_err_tensor_);
+      allocate_head_buffer(&value_err_scratch_);
+      allocate_head_buffer(&moves_tensor1_);
+      allocate_head_buffer(&moves_tensor2_);
+      allocate_head_buffer(&moves_scratch_);
+      CERR << "Enabled SM80 t3-distill2 output-head overlap"
+           << (head_overlap_all_batches_ ? " for all batch sizes"
+                                         : " for batch 108");
     }
 
     tensor_mem_size_ = multi_stream_ ? maxSize : 0;
@@ -901,6 +962,19 @@ class CudaNetwork : public Network {
     }
 #endif
 
+    const bool overlap_heads =
+        head_overlap_ && (head_overlap_all_batches_ || batchSize == 108);
+    if (overlap_heads) {
+      ReportCUDAErrors(
+          cudaEventRecord(io->heads_ready_event_, compute_stream));
+      ReportCUDAErrors(
+          cudaStreamWaitEvent(value_stream_, io->heads_ready_event_, 0));
+      ReportCUDAErrors(
+          cudaStreamWaitEvent(value_err_stream_, io->heads_ready_event_, 0));
+      ReportCUDAErrors(
+          cudaStreamWaitEvent(moves_stream_, io->heads_ready_event_, 0));
+    }
+
     // Policy head.
     if (attn_policy_) {
       network_[l++]->Eval(
@@ -945,18 +1019,28 @@ class CudaNetwork : public Network {
         sizeof(io->op_policy_mem_[0]) * kNumOutputPolicy * batchSize,
         cudaMemcpyDeviceToHost, download_stream));
 
+    // The exact overlap target always has a two-layer attention policy head,
+    // one main-value layer, one value-error layer, and three moves-left layers.
+    // Preserve the serial layer-index walk for every fallback configuration.
+    const int value_layer = l++;
+    const auto value_eval_stream = overlap_heads ? value_stream_ : compute_stream;
+    const auto value_eval_cublas = overlap_heads ? value_cublas_ : cublas;
+    auto* value_buffer = overlap_heads ? value_tensor_ : spare2;
+    void* value_scratch = overlap_heads ? value_scratch_ : scratch_mem;
+
     // value head
-    network_[l++]->Eval(batchSize, (DataType*)opVal, flow, spare2, scratch_mem,
-                        scratch_size_, nullptr, cublas,
-                        compute_stream);  // value head
-    if (!(moves_left_ || wdl_err_) && !multi_stream_) {
+    network_[value_layer]->Eval(batchSize, (DataType*)opVal, flow, value_buffer,
+                                value_scratch, scratch_size_, nullptr,
+                                value_eval_cublas, value_eval_stream);
+    if (!(moves_left_ || wdl_err_) && !multi_stream_ && !overlap_heads) {
 #if CUDA_GRAPH_SUPPORTS_EXTERNAL_EVENTS
       ReportCUDAErrors(
           cudaEventRecordWithFlags(compute_ordering_event_, compute_stream,
                                    capture ? cudaEventRecordExternal : 0));
 #endif
     }
-    ReportCUDAErrors(cudaEventRecord(io->value_done_event_, compute_stream));
+    ReportCUDAErrors(
+        cudaEventRecord(io->value_done_event_, value_eval_stream));
     ReportCUDAErrors(
         cudaStreamWaitEvent(download_stream, io->value_done_event_, 0));
     ReportCUDAErrors(cudaMemcpyAsync(
@@ -974,11 +1058,20 @@ class CudaNetwork : public Network {
 
     if (wdl_err_) {
       // value error head
-      network_[l++]->Eval(batchSize, (DataType*)opValErr, flow, spare2,
-                          scratch_mem, scratch_size_, nullptr, cublas,
-                          compute_stream);  // value error head
+      const int value_err_layer = l++;
+      const auto value_err_eval_stream =
+          overlap_heads ? value_err_stream_ : compute_stream;
+      const auto value_err_eval_cublas =
+          overlap_heads ? value_err_cublas_ : cublas;
+      auto* value_err_buffer = overlap_heads ? value_err_tensor_ : spare2;
+      void* value_err_scratch =
+          overlap_heads ? value_err_scratch_ : scratch_mem;
+      network_[value_err_layer]->Eval(
+          batchSize, (DataType*)opValErr, flow, value_err_buffer,
+          value_err_scratch, scratch_size_, nullptr, value_err_eval_cublas,
+          value_err_eval_stream);  // value error head
 
-      if (!moves_left_ && !multi_stream_) {
+      if (!moves_left_ && !multi_stream_ && !overlap_heads) {
 #if CUDA_GRAPH_SUPPORTS_EXTERNAL_EVENTS
         ReportCUDAErrors(
             cudaEventRecordWithFlags(compute_ordering_event_, compute_stream,
@@ -986,7 +1079,7 @@ class CudaNetwork : public Network {
 #endif
       }
       ReportCUDAErrors(
-          cudaEventRecord(io->value_err_done_event_, compute_stream));
+          cudaEventRecord(io->value_err_done_event_, value_err_eval_stream));
       ReportCUDAErrors(
           cudaStreamWaitEvent(download_stream, io->value_err_done_event_, 0));
       ReportCUDAErrors(
@@ -997,19 +1090,25 @@ class CudaNetwork : public Network {
 
     if (moves_left_) {
       // Moves left head
-      network_[l++]->Eval(batchSize, spare1, flow, nullptr, scratch_mem,
-                          scratch_size_, nullptr, cublas,
-                          compute_stream);  // moves conv or embedding
+      const auto moves_eval_stream =
+          overlap_heads ? moves_stream_ : compute_stream;
+      const auto moves_eval_cublas = overlap_heads ? moves_cublas_ : cublas;
+      auto* moves_buffer1 = overlap_heads ? moves_tensor1_ : spare1;
+      auto* moves_buffer2 = overlap_heads ? moves_tensor2_ : spare2;
+      void* moves_scratch = overlap_heads ? moves_scratch_ : scratch_mem;
+      network_[l++]->Eval(batchSize, moves_buffer1, flow, nullptr, moves_scratch,
+                          scratch_size_, nullptr, moves_eval_cublas,
+                          moves_eval_stream);  // moves conv or embedding
 
-      network_[l++]->Eval(batchSize, spare2, spare1, nullptr, scratch_mem,
-                          scratch_size_, nullptr, cublas,
-                          compute_stream);  // moves FC1
+      network_[l++]->Eval(batchSize, moves_buffer2, moves_buffer1, nullptr,
+                          moves_scratch, scratch_size_, nullptr,
+                          moves_eval_cublas, moves_eval_stream);  // moves FC1
 
       // Moves left FC2
-      network_[l++]->Eval(batchSize, (DataType*)opMov, spare2, nullptr,
-                          scratch_mem, scratch_size_, nullptr, cublas,
-                          compute_stream);
-      if (!multi_stream_) {
+      network_[l++]->Eval(batchSize, (DataType*)opMov, moves_buffer2, nullptr,
+                          moves_scratch, scratch_size_, nullptr,
+                          moves_eval_cublas, moves_eval_stream);
+      if (!multi_stream_ && !overlap_heads) {
 #if CUDA_GRAPH_SUPPORTS_EXTERNAL_EVENTS
         ReportCUDAErrors(
             cudaEventRecordWithFlags(compute_ordering_event_, compute_stream,
@@ -1017,13 +1116,24 @@ class CudaNetwork : public Network {
 #endif
       }
       ReportCUDAErrors(
-          cudaEventRecord(io->moves_left_done_event_, compute_stream));
+          cudaEventRecord(io->moves_left_done_event_, moves_eval_stream));
       ReportCUDAErrors(
           cudaStreamWaitEvent(download_stream, io->moves_left_done_event_, 0));
       ReportCUDAErrors(
           cudaMemcpyAsync(io->op_moves_left_mem_, io->op_moves_left_mem_gpu_,
                           sizeof(io->op_moves_left_mem_[0]) * batchSize,
                           cudaMemcpyDeviceToHost, download_stream));
+    }
+    if (overlap_heads) {
+      // All head branches join the download stream through their completion
+      // events above. Record the inter-eval ordering event there as well. This
+      // serializes the network-owned head arenas and gives graph capture one
+      // simple body/heads -> download -> origin join path.
+#if CUDA_GRAPH_SUPPORTS_EXTERNAL_EVENTS
+      ReportCUDAErrors(
+          cudaEventRecordWithFlags(compute_ordering_event_, download_stream,
+                                   capture ? cudaEventRecordExternal : 0));
+#endif
     }
 #if CUDA_GRAPH_SUPPORTS_EXTERNAL_EVENTS
     ReportCUDAErrors(
@@ -1084,6 +1194,21 @@ class CudaNetwork : public Network {
       ReportCUDAErrors(cudaStreamDestroy(upload_stream_));
       ReportCUDAErrors(cudaStreamDestroy(download_stream_));
       ReportCUDAErrors(cudaEventDestroy(compute_ordering_event_));
+      if (head_overlap_) {
+        ReportCUDAErrors(cudaFree(value_tensor_));
+        ReportCUDAErrors(cudaFree(value_scratch_));
+        ReportCUDAErrors(cudaFree(value_err_tensor_));
+        ReportCUDAErrors(cudaFree(value_err_scratch_));
+        ReportCUDAErrors(cudaFree(moves_tensor1_));
+        ReportCUDAErrors(cudaFree(moves_tensor2_));
+        ReportCUDAErrors(cudaFree(moves_scratch_));
+        ReportCUBLASErrors(cublasDestroy(value_cublas_));
+        ReportCUBLASErrors(cublasDestroy(value_err_cublas_));
+        ReportCUBLASErrors(cublasDestroy(moves_cublas_));
+        ReportCUDAErrors(cudaStreamDestroy(value_stream_));
+        ReportCUDAErrors(cudaStreamDestroy(value_err_stream_));
+        ReportCUDAErrors(cudaStreamDestroy(moves_stream_));
+      }
     }
   }
 
@@ -1162,6 +1287,8 @@ class CudaNetwork : public Network {
                                           // tower
   bool multi_stream_;                     // run multiple parallel network evals
   bool allow_cache_opt_;  // try to fit residual block activations in L2 cache
+  bool head_overlap_ = false;
+  bool head_overlap_all_batches_ = false;
 
   // Currently only one NN Eval can happen a time (we can fix this if needed
   // by allocating more memory).
@@ -1198,6 +1325,22 @@ class CudaNetwork : public Network {
   cudaEvent_t compute_ordering_event_ = nullptr;
   cublasHandle_t cublas_;
   DataType* tensor_mem_[3];
+
+  // Network-owned because the overlap path is restricted to !multi_stream_.
+  // Each independent head gets its own cuBLAS handle and intermediate arena.
+  cudaStream_t value_stream_ = nullptr;
+  cudaStream_t value_err_stream_ = nullptr;
+  cudaStream_t moves_stream_ = nullptr;
+  cublasHandle_t value_cublas_ = nullptr;
+  cublasHandle_t value_err_cublas_ = nullptr;
+  cublasHandle_t moves_cublas_ = nullptr;
+  DataType* value_tensor_ = nullptr;
+  void* value_scratch_ = nullptr;
+  DataType* value_err_tensor_ = nullptr;
+  void* value_err_scratch_ = nullptr;
+  DataType* moves_tensor1_ = nullptr;
+  DataType* moves_tensor2_ = nullptr;
+  void* moves_scratch_ = nullptr;
 
   mutable std::mutex inputs_outputs_lock_;
   std::list<std::unique_ptr<InputsOutputs<DataType>>> free_inputs_outputs_;
