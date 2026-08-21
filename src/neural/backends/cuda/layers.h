@@ -347,8 +347,7 @@ class EncoderBlock {
 
   void Eval(int N, DataType* inpop, DataType* scratch0, DataType* scratch1,
             DataType* scratch2, cublasHandle_t cublas, cudaStream_t stream,
-            DataType*** offset_pointers,
-            bool layernorm_256_threads = false) const;
+            DataType*** offset_pointers) const;
 
   // all GPU side pointers
   DataType *mha_q_w, *mha_q_b;
@@ -484,8 +483,7 @@ class AttentionBody : public BaseLayer<DataType> {
   AttentionBody(const MultiHeadWeights& weights, void* scratch,
                 Activations activations, int num_res_blocks, int input_c,
                 int max_batch_size, bool is_pe_dense_embedding,
-                bool use_gemm_ex, bool fused_mha,
-                bool layernorm_256_threads);
+                bool use_gemm_ex, bool fused_mha);
   ~AttentionBody();
   void Eval(int N, DataType* output, const DataType* input,
             const DataType* input2, void* scratch, size_t scratch_size,
@@ -517,7 +515,6 @@ class AttentionBody : public BaseLayer<DataType> {
   const bool has_smolgen_;
   bool is_pe_dense_embedding_;  // flag for dense position encoding
   const bool use_fused_mha_;
-  const bool layernorm_256_threads_;
 };
 
 // The value head implementation

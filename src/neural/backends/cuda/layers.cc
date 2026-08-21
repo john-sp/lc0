@@ -1790,8 +1790,7 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
                                   DataType* scratch, DataType* buffer1,
                                   DataType* buffer2, cublasHandle_t cublas,
                                   cudaStream_t stream,
-                                  DataType*** offset_pointers,
-                                  bool layernorm_256_threads) const {
+                                  DataType*** offset_pointers) const {
   const int d_model = mha_q_size_;
   const int depth = d_model / encoder_heads_;
 
@@ -2008,8 +2007,7 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
   // buffer1/in_out_tensor -> scratch
   LayerNorm<DataType>(N * 64, embedding_op_size_, scratch, buffer1, mha_dense_b,
                       in_out_tensor, ln1_gammas, ln1_betas, default_eps_,
-                      alpha_, ACTIVATION_NONE, stream,
-                      layernorm_256_threads);
+                      alpha_, ACTIVATION_NONE, stream);
 
   // #FFN dense 1, scratch -> in_out_tensor
   {
@@ -2047,8 +2045,7 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
   // buffer1/scratch -> in_out_tensor
   LayerNorm<DataType>(N * 64, embedding_op_size_, in_out_tensor, buffer1,
                       ffn_dense2_b, scratch, ln2_gammas, ln2_betas,
-                      default_eps_, alpha_, ACTIVATION_NONE, stream,
-                      layernorm_256_threads);
+                      default_eps_, alpha_, ACTIVATION_NONE, stream);
 }
 
 template <typename DataType>
@@ -2231,8 +2228,7 @@ AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,
                                        int num_res_blocks, int input_c,
                                        int max_batch_size,
                                        bool is_pe_dense_embedding,
-                                       bool use_gemm_ex, bool fused_mha,
-                                       bool layernorm_256_threads)
+                                       bool use_gemm_ex, bool fused_mha)
     : BaseLayer<DataType>(weights.ip_emb_b.size(), 8, 8, nullptr, false,
                           use_gemm_ex),
       embedding_op_size_(weights.ip_emb_b.size()),
@@ -2244,8 +2240,7 @@ AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,
                   weights.ip_add_gate.size() > 0),
       has_smolgen_(weights.has_smolgen),
       is_pe_dense_embedding_(is_pe_dense_embedding),
-      use_fused_mha_(fused_mha),
-      layernorm_256_threads_(layernorm_256_threads) {
+      use_fused_mha_(fused_mha) {
   allocAndUpload<DataType>(&ip_emb_w_, weights.ip_emb_w, scratch);
   allocAndUpload<DataType>(&ip_emb_b_, weights.ip_emb_b, scratch);
 
@@ -2439,8 +2434,7 @@ void AttentionBody<DataType>::Eval(int N, DataType* output,
         LayerNorm<DataType>(N * 64, embedding_op_size_, temp, embedding,
                             ip_emb_b_, (DataType*)nullptr, ip_emb_ln_g_,
                             ip_emb_ln_b_, 1e-3, 1.0,
-                            activations_.default_activation, stream,
-                            layernorm_256_threads_);
+                            activations_.default_activation, stream);
       }
 
       if (has_gating_ && !fuse_input_gating) {
@@ -2485,7 +2479,7 @@ void AttentionBody<DataType>::Eval(int N, DataType* output,
       LayerNorm<DataType>(N * 64, embedding_ffn_size_, embedding, buffer2,
                           ip_emb_ffn_d2_b_, temp, ip_emb_ffn_ln_g_,
                           ip_emb_ffn_ln_b_, 1e-3, alpha, ACTIVATION_NONE,
-                          stream, layernorm_256_threads_);
+                          stream);
     }
 
   } else {
@@ -2522,7 +2516,7 @@ void AttentionBody<DataType>::Eval(int N, DataType* output,
   // 2. Encoder blocks
   for (const auto pEnc : encoder_weights_) {
     pEnc->Eval(N, output_tensor, (DataType*)scratch, buffer1, buffer2, cublas,
-               stream, offset_pointers, layernorm_256_threads_);
+               stream, offset_pointers);
   }  // End of encoder blocks
 }
 

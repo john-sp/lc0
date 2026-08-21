@@ -1240,7 +1240,7 @@ void launchLayerNorm(int N, int C, T* output, const T* input, const T* bias,
                      const T* skip, const T* gammas, const T* betas,
                      const T* gate_mult, const T* gate_add, int gate_hw,
                      float ep, float alpha, ActivationFunction act,
-                     cudaStream_t stream, bool use_256_threads) {
+                     cudaStream_t stream) {
   // process 4 elements per thread to achieve close to peak memory bandwidth
   if (C % 16 != 0) throw Exception("unsupported filter size");
   if (C > 16384) throw Exception("unsupported filter size");
@@ -1250,10 +1250,6 @@ void launchLayerNorm(int N, int C, T* output, const T* input, const T* bias,
   blockDim.y = DivUp(C / 16, 32);
   blockDim.z =
       std::min(std::max(512 / (blockDim.x * blockDim.y), 1u), (unsigned int)N);
-  if constexpr (std::is_same<T, half>::value && !kInputGating) {
-    // The A100 t3 batch-108 body shape benefits from more, smaller CTAs.
-    if (use_256_threads && N == 6912 && C == 512) blockDim.z = 8;
-  }
   gridDim.x = DivUp(N, blockDim.z);
   gridDim.y = 1;
   gridDim.z = 1;
@@ -1318,11 +1314,9 @@ void launchLayerNorm(int N, int C, T* output, const T* input, const T* bias,
 template <typename T>
 void LayerNorm(int N, int C, T* output, const T* input, const T* bias,
                const T* skip, const T* gammas, const T* betas, float ep,
-               float alpha, ActivationFunction act, cudaStream_t stream,
-               bool use_256_threads) {
+               float alpha, ActivationFunction act, cudaStream_t stream) {
   launchLayerNorm<T, false>(N, C, output, input, bias, skip, gammas, betas,
-                            nullptr, nullptr, 0, ep, alpha, act, stream,
-                            use_256_threads);
+                            nullptr, nullptr, 0, ep, alpha, act, stream);
 }
 
 template <typename T>
@@ -1332,7 +1326,7 @@ void LayerNormInputGating(
     float ep, float alpha, ActivationFunction act, cudaStream_t stream) {
   if (HW <= 0) throw Exception("unsupported input gating shape");
   launchLayerNorm<T, true>(N, C, output, input, bias, skip, gammas, betas, mult,
-                           add, HW, ep, alpha, act, stream, false);
+                           add, HW, ep, alpha, act, stream);
 }
 
 // Compute promotion logits in a single kernel
@@ -1869,12 +1863,12 @@ template void LayerNorm<half>(int N, int C, half* output, const half* input,
                               const half* bias, const half* skip,
                               const half* gammas, const half* betas, float ep,
                               float alpha, ActivationFunction act,
-                              cudaStream_t stream, bool use_256_threads);
+                              cudaStream_t stream);
 template void LayerNorm<float>(int N, int C, float* output, const float* input,
                                const float* bias, const float* skip,
                                const float* gammas, const float* betas,
                                float ep, float alpha, ActivationFunction act,
-                               cudaStream_t stream, bool use_256_threads);
+                               cudaStream_t stream);
 
 template void LayerNormInputGating<half>(
     int N, int C, half* output, const half* input, const half* bias,

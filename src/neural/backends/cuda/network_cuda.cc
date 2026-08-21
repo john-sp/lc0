@@ -378,9 +378,6 @@ class CudaNetwork : public Network {
     }
 
     const bool use_gemm_ex = deviceProp.major >= 5;
-    // AttentionBody rechecks the exact 6912-row, 512-channel launch shape.
-    const bool layernorm_256_threads =
-        fp16 && deviceProp.major == 8 && deviceProp.minor == 0;
 
     // 0. Check for SE.
     has_se_ = false;
@@ -528,7 +525,7 @@ class CudaNetwork : public Network {
           static_cast<InputEmbedding>(
               file.format().network_format().input_embedding()) ==
               InputEmbedding::INPUT_EMBEDDING_PE_DENSE,
-          use_gemm_ex, use_fused_mha, layernorm_256_threads);
+          use_gemm_ex, use_fused_mha);
       network_.emplace_back(std::move(attention_body));
 
       encoder_last_ = getLastLayer();
