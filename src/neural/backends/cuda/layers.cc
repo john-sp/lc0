@@ -1790,32 +1790,12 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
                                   DataType* scratch, DataType* buffer1,
                                   DataType* buffer2, cublasHandle_t cublas,
                                   cudaStream_t stream,
-                                  DataType*** offset_pointers,
-                                  const SmolgenOverlapResources<DataType>*
-                                      smolgen_overlap) const {
+                                  DataType*** offset_pointers) const {
   const int d_model = mha_q_size_;
   const int depth = d_model / encoder_heads_;
 
-  const bool overlap_smolgen = has_smolgen_ && smolgen_overlap != nullptr;
-  const cudaStream_t smolgen_stream =
-      overlap_smolgen ? smolgen_overlap->stream : stream;
-  const cublasHandle_t smolgen_cublas =
-      overlap_smolgen ? smolgen_overlap->cublas : cublas;
-  DataType* const smolgen_scratch =
-      overlap_smolgen ? smolgen_overlap->scratch : scratch;
-  DataType* const smolgen_buffer =
-      overlap_smolgen ? smolgen_overlap->buffer : buffer1;
-  DataType* const smolgen_output =
-      overlap_smolgen ? smolgen_overlap->output : buffer2;
-
-  if (overlap_smolgen) {
-    ReportCUDAErrors(cudaEventRecord(smolgen_overlap->input_ready, stream));
-    ReportCUDAErrors(cudaStreamWaitEvent(smolgen_stream,
-                                         smolgen_overlap->input_ready, 0));
-  }
-
-  // Calculate smolgen weights. The overlap path uses dedicated storage, so
-  // this independent read of in_out_tensor can run alongside QKV projection.
+  // Calculate smolgen weights. Do this first so we can make use of
+  // scratch, buffer1 and buffer2.
   if (has_smolgen_) {
     {
       // Compress.
@@ -1825,10 +1805,9 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
       const int num_outputs = smol_compress_size_;
       const int batch = N * 64;
       cublasXgemm<DataType>(
-          smolgen_cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch,
-          num_inputs,
+          cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch, num_inputs,
           1.0f, (const DataType*)smol_compress, num_inputs, in_out_tensor,
-          num_inputs, 0.0f, smolgen_scratch, num_outputs);
+          num_inputs, 0.0f, scratch, num_outputs);
     }
 
     {
@@ -1838,15 +1817,14 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
       const int num_inputs = 64 * smol_compress_size_;
       const int num_outputs = smol_dense_1_size_;
       const int batch = N;
-      cublasXgemm<DataType>(
-          smolgen_cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch,
-          num_inputs, 1.0f, (const DataType*)smol_dense1_w, num_inputs,
-          smolgen_scratch, num_inputs, 0.0f, smolgen_buffer, num_outputs);
+      cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs,
+                            batch, num_inputs, 1.0f,
+                            (const DataType*)smol_dense1_w, num_inputs, scratch,
+                            num_inputs, 0.0f, buffer1, num_outputs);
 
-      LayerNorm<DataType>(batch, num_outputs, smolgen_scratch, smolgen_buffer,
-                          smol_dense1_b, (DataType*)nullptr, smol_ln1_gammas,
-                          smol_ln1_betas, 1e-3, 1.0, smolgen_activation_,
-                          smolgen_stream);
+      LayerNorm<DataType>(batch, num_outputs, scratch, buffer1, smol_dense1_b,
+                          (DataType*)nullptr, smol_ln1_gammas, smol_ln1_betas,
+                          1e-3, 1.0, smolgen_activation_, stream);
     }
 
     {
@@ -1856,15 +1834,14 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
       const int num_inputs = smol_dense_1_size_;
       const int num_outputs = smol_dense_2_size_;
       const int batch = N;
-      cublasXgemm<DataType>(
-          smolgen_cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch,
-          num_inputs, 1.0f, (const DataType*)smol_dense2_w, num_inputs,
-          smolgen_scratch, num_inputs, 0.0f, smolgen_buffer, num_outputs);
+      cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs,
+                            batch, num_inputs, 1.0f,
+                            (const DataType*)smol_dense2_w, num_inputs, scratch,
+                            num_inputs, 0.0f, buffer1, num_outputs);
 
-      LayerNorm<DataType>(batch, num_outputs, smolgen_scratch, smolgen_buffer,
-                          smol_dense2_b, (DataType*)nullptr, smol_ln2_gammas,
-                          smol_ln2_betas, 1e-3, 1.0, smolgen_activation_,
-                          smolgen_stream);
+      LayerNorm<DataType>(batch, num_outputs, scratch, buffer1, smol_dense2_b,
+                          (DataType*)nullptr, smol_ln2_gammas, smol_ln2_betas,
+                          1e-3, 1.0, smolgen_activation_, stream);
     }
 
     {
@@ -1877,13 +1854,10 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
           smol_dense_2_size_ / encoder_heads_; /* num_inputs == gen_sz == 256 */
       const int num_outputs = smol_global_size_; /* hwhw: 64 * 64 */
       const int batch = N * encoder_heads_;
-      cublasXgemm<DataType>(
-          smolgen_cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs, batch,
-          num_inputs, 1.0f, (const DataType*)smol_global, num_inputs,
-          smolgen_scratch, num_inputs, 0.0f, smolgen_output, num_outputs);
-    }
-    if (overlap_smolgen) {
-      ReportCUDAErrors(cudaEventRecord(smolgen_overlap->done, smolgen_stream));
+      cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, num_outputs,
+                            batch, num_inputs, 1.0f,
+                            (const DataType*)smol_global, num_inputs, scratch,
+                            num_inputs, 0.0f, buffer2, num_outputs);
     }
   }
 
@@ -1942,17 +1916,12 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
   // shape(k)[-1] = depth
   float factor = 1.0f / sqrt((float)depth);
 
-  if (overlap_smolgen) {
-    ReportCUDAErrors(cudaStreamWaitEvent(stream, smolgen_overlap->done, 0));
-  }
-
 #ifdef USE_CUTLASS
   if (use_fused_mha_) {
     // TODO: check if we need skip in a different tensor than same tensor as
     // output!
-    fusedMHA(buffer2, mha_q, mha_k, mha_v,
-             has_smolgen_ ? smolgen_output : nullptr, N, encoder_heads_, depth,
-             stream);
+    fusedMHA(buffer2, mha_q, mha_k, mha_v, has_smolgen_ ? buffer2 : nullptr, N,
+             encoder_heads_, depth, stream);
   } else
 #endif
   // matmul_qk = tf.matmul(q, k, transpose_b=True)
@@ -2000,8 +1969,7 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
     if (has_smolgen_) {
       // Add smolgen weights to the scaled matmul_qk attention logits before
       // softmax.
-      Softmax(encoder_heads_ * N * 64, 64, buffer1, buffer1, smolgen_output,
-              stream);
+      Softmax(encoder_heads_ * N * 64, 64, buffer1, buffer1, buffer2, stream);
     } else {
       Softmax(encoder_heads_ * N * 64, 64, buffer1, buffer1,
               (const DataType*)nullptr, stream);
@@ -2260,9 +2228,7 @@ AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,
                                        int num_res_blocks, int input_c,
                                        int max_batch_size,
                                        bool is_pe_dense_embedding,
-                                       bool use_gemm_ex, bool fused_mha,
-                                       bool smolgen_overlap,
-                                       bool smolgen_overlap_all_batches)
+                                       bool use_gemm_ex, bool fused_mha)
     : BaseLayer<DataType>(weights.ip_emb_b.size(), 8, 8, nullptr, false,
                           use_gemm_ex),
       embedding_op_size_(weights.ip_emb_b.size()),
@@ -2274,9 +2240,7 @@ AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,
                   weights.ip_add_gate.size() > 0),
       has_smolgen_(weights.has_smolgen),
       is_pe_dense_embedding_(is_pe_dense_embedding),
-      use_fused_mha_(fused_mha),
-      smolgen_overlap_(smolgen_overlap),
-      smolgen_overlap_all_batches_(smolgen_overlap_all_batches) {
+      use_fused_mha_(fused_mha) {
   allocAndUpload<DataType>(&ip_emb_w_, weights.ip_emb_w, scratch);
   allocAndUpload<DataType>(&ip_emb_b_, weights.ip_emb_b, scratch);
 
@@ -2334,38 +2298,6 @@ AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,
         is_pe_dense_embedding_ ? 1e-3 : 1e-6, use_gemm_ex, use_fused_mha_);
     encoder_weights_.emplace_back(pW);
   }
-
-  if (smolgen_overlap_) {
-    size_t temporary_elements = 0;
-    for (const auto& enc : weights.encoder) {
-      const auto& smolgen = enc.mha.smolgen;
-      const size_t compress_size = smolgen.compress.size() / enc.mha.q_b.size();
-      temporary_elements = std::max(
-          temporary_elements,
-          static_cast<size_t>(max_batch_size) *
-              std::max({64 * compress_size, smolgen.dense1_b.size(),
-                        smolgen.dense2_b.size()}));
-    }
-    const size_t output_elements = static_cast<size_t>(max_batch_size) *
-                                   encoder_head_count_ * smolgen_global_size_;
-    ReportCUDAErrors(cudaStreamCreateWithFlags(
-        &smolgen_overlap_resources_.stream, cudaStreamNonBlocking));
-    ReportCUBLASErrors(cublasCreate(&smolgen_overlap_resources_.cublas));
-    ReportCUBLASErrors(cublasSetStream(smolgen_overlap_resources_.cublas,
-                                       smolgen_overlap_resources_.stream));
-    ReportCUBLASErrors(cublasSetMathMode(smolgen_overlap_resources_.cublas,
-                                         CUBLAS_TENSOR_OP_MATH));
-    ReportCUDAErrors(cudaMalloc(&smolgen_overlap_resources_.scratch,
-                                temporary_elements * sizeof(DataType)));
-    ReportCUDAErrors(cudaMalloc(&smolgen_overlap_resources_.buffer,
-                                temporary_elements * sizeof(DataType)));
-    ReportCUDAErrors(cudaMalloc(&smolgen_overlap_resources_.output,
-                                output_elements * sizeof(DataType)));
-    ReportCUDAErrors(cudaEventCreateWithFlags(
-        &smolgen_overlap_resources_.input_ready, cudaEventDisableTiming));
-    ReportCUDAErrors(cudaEventCreateWithFlags(
-        &smolgen_overlap_resources_.done, cudaEventDisableTiming));
-  }
 }
 
 template <typename DataType>
@@ -2394,16 +2326,6 @@ AttentionBody<DataType>::~AttentionBody() {
     ReportCUDAErrors(cudaFree(smolgen_global_));
   }
   for (const auto pEnc : encoder_weights_) delete pEnc;
-  if (smolgen_overlap_) {
-    ReportCUDAErrors(cudaFree(smolgen_overlap_resources_.scratch));
-    ReportCUDAErrors(cudaFree(smolgen_overlap_resources_.buffer));
-    ReportCUDAErrors(cudaFree(smolgen_overlap_resources_.output));
-    ReportCUDAErrors(
-        cudaEventDestroy(smolgen_overlap_resources_.input_ready));
-    ReportCUDAErrors(cudaEventDestroy(smolgen_overlap_resources_.done));
-    ReportCUBLASErrors(cublasDestroy(smolgen_overlap_resources_.cublas));
-    ReportCUDAErrors(cudaStreamDestroy(smolgen_overlap_resources_.stream));
-  }
 }
 
 template <typename DataType>
@@ -2592,13 +2514,9 @@ void AttentionBody<DataType>::Eval(int N, DataType* output,
   }
 
   // 2. Encoder blocks
-  const SmolgenOverlapResources<DataType>* smolgen_overlap =
-      smolgen_overlap_ && (smolgen_overlap_all_batches_ || N == 108)
-          ? &smolgen_overlap_resources_
-          : nullptr;
   for (const auto pEnc : encoder_weights_) {
     pEnc->Eval(N, output_tensor, (DataType*)scratch, buffer1, buffer2, cublas,
-               stream, offset_pointers, smolgen_overlap);
+               stream, offset_pointers);
   }  // End of encoder blocks
 }
 

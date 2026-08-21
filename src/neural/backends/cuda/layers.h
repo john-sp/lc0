@@ -335,17 +335,6 @@ class ResidualBlock : public BaseLayer<DataType> {
 };
 
 template <typename DataType>
-struct SmolgenOverlapResources {
-  cudaStream_t stream;
-  cublasHandle_t cublas;
-  DataType* scratch;
-  DataType* buffer;
-  DataType* output;
-  cudaEvent_t input_ready;
-  cudaEvent_t done;
-};
-
-template <typename DataType>
 class EncoderBlock {
  public:
   EncoderBlock(const MultiHeadWeights::EncoderLayer& cpu_weights, void* scratch,
@@ -358,9 +347,7 @@ class EncoderBlock {
 
   void Eval(int N, DataType* inpop, DataType* scratch0, DataType* scratch1,
             DataType* scratch2, cublasHandle_t cublas, cudaStream_t stream,
-            DataType*** offset_pointers,
-            const SmolgenOverlapResources<DataType>* smolgen_overlap = nullptr)
-      const;
+            DataType*** offset_pointers) const;
 
   // all GPU side pointers
   DataType *mha_q_w, *mha_q_b;
@@ -496,8 +483,7 @@ class AttentionBody : public BaseLayer<DataType> {
   AttentionBody(const MultiHeadWeights& weights, void* scratch,
                 Activations activations, int num_res_blocks, int input_c,
                 int max_batch_size, bool is_pe_dense_embedding,
-                bool use_gemm_ex, bool fused_mha, bool smolgen_overlap,
-                bool smolgen_overlap_all_batches);
+                bool use_gemm_ex, bool fused_mha);
   ~AttentionBody();
   void Eval(int N, DataType* output, const DataType* input,
             const DataType* input2, void* scratch, size_t scratch_size,
@@ -529,9 +515,6 @@ class AttentionBody : public BaseLayer<DataType> {
   const bool has_smolgen_;
   bool is_pe_dense_embedding_;  // flag for dense position encoding
   const bool use_fused_mha_;
-  const bool smolgen_overlap_;
-  const bool smolgen_overlap_all_batches_;
-  SmolgenOverlapResources<DataType> smolgen_overlap_resources_ = {};
 };
 
 // The value head implementation
