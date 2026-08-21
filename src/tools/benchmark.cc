@@ -34,6 +34,7 @@
 #include "search/classic/search.h"
 #include "search/classic/stoppers/factory.h"
 #include "search/classic/stoppers/stoppers.h"
+#include "utils/numa.h"
 #include "utils/string.h"
 
 namespace lczero {
@@ -53,6 +54,7 @@ const OptionId kNumPositionsId{"num-positions", "",
 void Benchmark::Run(bool run_shorter_benchmark) {
   OptionsParser options;
   SharedBackendParams::Populate(&options);
+  Numa::Init(&options);
   options.Add<IntOption>(kThreadsOptionId, 1, 128) = kDefaultThreads;
   options.GetMutableDefaultsOptions()->Set(SharedBackendParams::kNNCacheSizeId,
                                            200000);
@@ -74,7 +76,9 @@ void Benchmark::Run(bool run_shorter_benchmark) {
     auto option_dict = options.GetOptionsDict();
 
     auto backend = CreateMemCache(
-        BackendManager::Get()->CreateFromParams(option_dict), option_dict);
+        BackendManager::Get()->CreateFromParams(option_dict), option_dict,
+        option_dict.Get<float>(
+            classic::BaseSearchParams::kMaxOutOfOrderEvalsFactorId));
 
     const int visits = option_dict.Get<int>(kNodesId);
     const int movetime = option_dict.Get<int>(kMovetimeId);

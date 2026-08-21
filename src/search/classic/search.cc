@@ -39,6 +39,7 @@
 #include "neural/encoder.h"
 #include "search/classic/node.h"
 #include "utils/fastmath.h"
+#include "utils/numa.h"
 #include "utils/random.h"
 #include "utils/spinhelper.h"
 #include "utils/trace.h"
@@ -223,13 +224,25 @@ namespace {
 // WDL conversion formula based on random walk model.
 inline double WDLRescale(float& v, float& d, float wdl_rescale_ratio,
                          float wdl_rescale_diff, float sign, bool invert,
-                         float max_reasonable_s) {
+                         float max_reasonable_s, bool use_threshold = false) {
   if (invert) {
     wdl_rescale_diff = -wdl_rescale_diff;
     wdl_rescale_ratio = 1.0f / wdl_rescale_ratio;
   }
   auto w = (1 + v - d) / 2;
   auto l = (1 - v - d) / 2;
+  if (use_threshold) {
+    // Keep centipawn scores within resonable limits when l or d becomes close
+    // to zero.
+    const float wl_threshold = 0.006f;
+    const float d_threshold = 0.0004875f;
+    w = std::max(w, wl_threshold);
+    l = std::max(l, wl_threshold);
+    d = std::max(d, d_threshold);
+    const float scale = 1.0f / (w + l + d);
+    w *= scale;
+    l *= scale;
+  }
   // Safeguard against numerical issues; skip WDL transformation if WDL is too
   // extreme.
   const float eps = 0.0001f;
@@ -304,12 +317,22 @@ void Search::SendUciInfo() REQUIRES(nodes_mutex_) REQUIRES(counters_mutex_) {
                    played_history_.IsBlackToMove())
                       ? 1.0f
                       : -1.0f;
+      auto wl_copy = wl, d_copy = d;
       mu_uci = WDLRescale(
-          wl, d, params_.GetWDLRescaleRatio(),
+          wl_copy, d_copy, params_.GetWDLRescaleRatio(),
+
           contempt_mode_ == ContemptMode::NONE
               ? 0
               : params_.GetWDLRescaleDiff() * params_.GetWDLEvalObjectivity(),
-          sign, true, params_.GetWDLMaxS());
+          sign, true, params_.GetWDLMaxS(), true);
+      if (params_.GetWDLRescaleDiff() != 0.0f &&
+          contempt_mode_ != ContemptMode::NONE &&
+          params_.GetWDLEvalObjectivity() != 0.0f) {
+        WDLRescale(
+            wl, d, params_.GetWDLRescaleRatio(),
+            params_.GetWDLRescaleDiff() * params_.GetWDLEvalObjectivity(), sign,
+            true, params_.GetWDLMaxS());
+      }
     }
     const auto q = edge.GetQ(default_q, draw_score);
     if (edge.IsTerminal() && wl != 0.0f) {
@@ -319,6 +342,8 @@ void Search::SendUciInfo() REQUIRES(nodes_mutex_) REQUIRES(counters_mutex_) {
     } else if (score_type == "centipawn_with_drawscore") {
       uci_info.score = 90 * tan(1.5637541897 * q);
     } else if (score_type == "centipawn") {
+      uci_info.score = 100.79055 * tan(1.56292199291664 * wl);
+    } else if (score_type == "centipawn_2020") {
       uci_info.score = 90 * tan(1.5637541897 * wl);
     } else if (score_type == "centipawn_2019") {
       uci_info.score = 295 * wl / (1 - 0.976953126 * std::pow(wl, 14));
@@ -331,17 +356,7 @@ void Search::SendUciInfo() REQUIRES(nodes_mutex_) REQUIRES(counters_mutex_) {
     } else if (score_type == "W-L") {
       uci_info.score = wl * 10000;
     } else if (score_type == "WDL_mu") {
-      // Reports the WDL mu value whenever it is reasonable, and defaults to
-      // centipawn otherwise.
-      const float centipawn_fallback_threshold = 0.996f;
-      float centipawn_score = 45 * tan(1.56728071628 * wl);
-      uci_info.score =
-          backend_attributes_.has_wdl && mu_uci != 0.0f &&
-                  std::abs(wl) + d < centipawn_fallback_threshold &&
-                  (std::abs(mu_uci) < 1.0f ||
-                   std::abs(centipawn_score) < std::abs(100 * mu_uci))
-              ? 100 * mu_uci
-              : centipawn_score;
+      uci_info.score = 100 * mu_uci;
     }
 
     auto wdl_w =
@@ -427,8 +442,8 @@ float Search::GetDrawScore(bool is_odd_depth) const {
 }
 
 namespace {
-inline float GetFpu(const SearchParams& params, const Node* node, bool is_root_node,
-                    float draw_score) {
+inline float GetFpu(const SearchParams& params, const Node* node,
+                    bool is_root_node, float draw_score) {
   const auto value = params.GetFpuValue(is_root_node);
   return params.GetFpuAbsolute(is_root_node)
              ? value
@@ -437,8 +452,8 @@ inline float GetFpu(const SearchParams& params, const Node* node, bool is_root_n
 }
 
 // Faster version for if visited_policy is readily available already.
-inline float GetFpu(const SearchParams& params, const Node* node, bool is_root_node,
-                    float draw_score, float visited_pol) {
+inline float GetFpu(const SearchParams& params, const Node* node,
+                    bool is_root_node, float draw_score, float visited_pol) {
   const auto value = params.GetFpuValue(is_root_node);
   return params.GetFpuAbsolute(is_root_node)
              ? value
@@ -471,8 +486,7 @@ std::vector<std::string> Search::GetVerboseStats(const Node* node) const {
   edges.reserve(node->GetNumEdges());
   for (const auto& edge : node->Edges()) {
     edges.emplace_back(edge.GetN(),
-                       edge.GetQ(fpu, draw_score) + edge.GetU(U_coeff),
-                       edge);
+                       edge.GetQ(fpu, draw_score) + edge.GetU(U_coeff), edge);
   }
   std::sort(edges.begin(), edges.end());
 
@@ -899,6 +913,7 @@ void Search::StartThreads(size_t how_many) {
     how_many = backend_attributes_.suggested_num_search_threads +
                !backend_attributes_.runs_on_cpu;
   }
+  Numa::ReserveSearchWorkers(how_many);
   thread_count_.store(how_many, std::memory_order_release);
   // First thread is a watchdog thread.
   if (threads_.size() == 0) {
@@ -906,7 +921,8 @@ void Search::StartThreads(size_t how_many) {
   }
   // Start working threads.
   for (size_t i = 0; i < how_many; i++) {
-    threads_.emplace_back([this]() {
+    threads_.emplace_back([this, i]() {
+      Numa::BindThread(i);
       SearchWorker worker(this, params_);
       worker.RunBlocking();
     });
@@ -1204,7 +1220,6 @@ void SearchWorker::ExecuteOneIteration() {
   // 2. Gather minibatch.
   GatherMinibatch();
   task_count_.store(-1, std::memory_order_release);
-  search_->backend_waiting_counter_.fetch_add(1, std::memory_order_relaxed);
 
   // 2b. Collect collisions.
   CollectCollisions();
@@ -1218,7 +1233,6 @@ void SearchWorker::ExecuteOneIteration() {
 
   // 4. Run NN computation.
   RunNNComputation();
-  search_->backend_waiting_counter_.fetch_add(-1, std::memory_order_relaxed);
 
   // 5. Retrieve NN computations (and terminal values) into nodes.
   FetchMinibatchResults();
@@ -1411,6 +1425,9 @@ void SearchWorker::GatherMinibatch() {
           minibatch_.erase(minibatch_.begin() + i);
           --minibatch_size;
           ++number_out_of_order_;
+        } else if (minibatch_[i].is_delayed_cache_hit) {
+          --minibatch_size;
+          ++number_out_of_order_;
         }
       }
     }
@@ -1466,13 +1483,22 @@ void SearchWorker::ProcessPickedTask(int start_idx, int end_idx,
                        std::back_inserter(legal_moves),
                        [](const auto& edge) { return edge.GetMove(); });
         picked_node.eval->p.resize(legal_moves.size());
-        picked_node.is_cache_hit = computation_->AddInput(
-                                       EvalPosition{
-                                           .pos = history.GetPositions(),
-                                           .legal_moves = legal_moves,
-                                       },
-                                       picked_node.eval->AsPtr()) ==
-                                   BackendComputation::FETCHED_IMMEDIATELY;
+        auto cache_result = computation_->AddInput(
+            EvalPosition{
+                .pos = history.GetPositions(),
+                .legal_moves = legal_moves,
+            },
+            picked_node.eval->AsPtr());
+        switch (cache_result) {
+          case BackendComputation::ENQUEUED_FOR_EVAL:
+            break;
+          case BackendComputation::FETCHED_IMMEDIATELY:
+            picked_node.is_cache_hit = true;
+            break;
+          case BackendComputation::FETCHED_DELAYED:
+            picked_node.is_delayed_cache_hit = true;
+            break;
+        }
       }
     }
     if (params_.GetOutOfOrderEval() && picked_node.CanEvalOutOfOrder()) {
@@ -2143,7 +2169,19 @@ int SearchWorker::PrefetchIntoCache(Node* node, int budget, bool is_odd_depth) {
 // 4. Run NN computation.
 // ~~~~~~~~~~~~~~~~~~~~~~
 void SearchWorker::RunNNComputation() {
-  if (computation_->UsedBatchSize() > 0) computation_->ComputeBlocking();
+  if (computation_->UsedBatchSize() > 0) {
+    int old = search_->backend_waiting_counter_.fetch_add(1, std::memory_order_relaxed);
+    assert(old <= search_->thread_count_);
+    std::ignore = old;
+    computation_->ComputeBlocking([&](ComputationEvent event) {
+      assert(event == ComputationEvent::FIRST_BACKEND_IDLE);
+      int old = search_->backend_waiting_counter_.fetch_sub(
+          1, std::memory_order_relaxed);
+      assert(old > 0);
+      std::ignore = old;
+      std::ignore = event;
+    });
+  }
 }
 
 // 5. Retrieve NN computations (and terminal values) into nodes.
@@ -2292,7 +2330,8 @@ void SearchWorker::DoBackupUpdateSingleNode(
     }
   }
   search_->total_playouts_ += node_to_process.multivisit;
-  if (node_to_process.nn_queried && !node_to_process.is_cache_hit) {
+  if (node_to_process.nn_queried && !node_to_process.is_cache_hit &&
+      !node_to_process.is_delayed_cache_hit) {
     search_->network_evaluations_++;
   }
   search_->cum_depth_ += node_to_process.depth * node_to_process.multivisit;

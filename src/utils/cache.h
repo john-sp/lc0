@@ -31,10 +31,28 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "utils/mutex.h"
 
 namespace lczero {
+
+namespace dag_classic {
+template <typename T>
+class IntrusiveSharedPtr;
+}  // namespace dag_classic
+
+template <typename T>
+class IsManagedPointerType {
+ public:
+  static constexpr bool value = false;
+};
+
+template <typename U>
+class IsManagedPointerType<dag_classic::IntrusiveSharedPtr<U>> {
+ public:
+  static constexpr bool value = true;
+};
 
 // A hash-keyed cache. Thread-safe. Takes ownership of all values, which are
 // deleted upon eviction; thus, using values stored requires pinning them, which
@@ -51,6 +69,11 @@ class HashKeyedCache {
   static const double constexpr kLoadFactor = 1.9;
 
  public:
+  static constexpr bool kIsManagedPointerType = IsManagedPointerType<V>::value;
+  using element_type =
+      std::conditional_t<kIsManagedPointerType, V, std::unique_ptr<V>>;
+  using pointer = typename element_type::element_type*;
+
   HashKeyedCache(int capacity = 128)
       : capacity_(capacity),
         hash_(static_cast<size_t>(capacity * kLoadFactor + 1)) {}
@@ -62,9 +85,11 @@ class HashKeyedCache {
   }
 
   // Inserts the element under key @key with value @val. Unless the key is
-  // already in the cache.
-  void Insert(uint64_t key, std::unique_ptr<V> val) {
-    if (capacity_.load(std::memory_order_relaxed) == 0) return;
+  // already in the cache. If the key is already in the cache, the new value is
+  // silently ignored and the old value is kept. If the key is not in the cache,
+  // the new value is moved to cache.
+  bool Insert(uint64_t key, element_type&& val) {
+    if (capacity_.load(std::memory_order_relaxed) == 0) return true;
 
     SpinMutex::Lock lock(mutex_);
 
@@ -73,7 +98,7 @@ class HashKeyedCache {
       if (!hash_[idx].in_use) break;
       if (hash_[idx].key == key) {
         // Already exists.
-        return;
+        return false;
       }
       ++idx;
       if (idx >= hash_.size()) idx -= hash_.size();
@@ -87,6 +112,7 @@ class HashKeyedCache {
     ++allocated_;
 
     EvictToCapacity(capacity_);
+    return true;
   }
 
   // Checks whether a key exists. Doesn't pin. Of course the next moment the
@@ -110,7 +136,7 @@ class HashKeyedCache {
   // Looks up and pins the element by key. Returns nullptr if not found.
   // If found, a call to Unpin must be made for each such element.
   // Use of HashedKeyCacheLock is recommended to automate this pin management.
-  V* LookupAndPin(uint64_t key) {
+  pointer LookupAndPin(uint64_t key) {
     if (capacity_.load(std::memory_order_relaxed) == 0) return nullptr;
 
     SpinMutex::Lock lock(mutex_);
@@ -130,13 +156,13 @@ class HashKeyedCache {
 
   // Unpins the element given key and value. Use of HashedKeyCacheLock is
   // recommended to automate this pin management.
-  void Unpin(uint64_t key, V* value) {
+  void Unpin(uint64_t key, pointer value) {
     SpinMutex::Lock lock(mutex_);
 
     // Checking evicted list first.
     for (auto it = evicted_.begin(); it != evicted_.end(); ++it) {
       auto& entry = *it;
-      if (key == entry.key && value == entry.value.get()) {
+      if (key == entry.key && entry.value.get() == value) {
         if (--entry.pins == 0) {
           --allocated_;
           evicted_.erase(it);
@@ -212,10 +238,9 @@ class HashKeyedCache {
  private:
   struct Entry {
     Entry() {}
-    Entry(uint64_t key, std::unique_ptr<V> value)
-        : key(key), value(std::move(value)) {}
+    Entry(uint64_t key, element_type value) : key(key), value(std::move(value)) {}
     uint64_t key;
-    std::unique_ptr<V> value;
+    element_type value;
     int pins = 0;
     bool in_use = false;
   };

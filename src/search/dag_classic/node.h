@@ -46,6 +46,7 @@
 #include "chess/gamestate.h"
 #include "chess/position.h"
 #include "neural/backend.h"
+#include "utils/cache.h"
 #include "utils/mutex.h"
 
 namespace lczero {
@@ -143,9 +144,7 @@ class atomic_unique_ptr {
   // Returns the managed pointer.
   pointer operator->() const noexcept { return get(); }
   // Returns the managed pointer.
-  pointer get() const noexcept {
-    return ptr.load(std::memory_order_acquire);
-  }
+  pointer get() const noexcept { return ptr.load(std::memory_order_acquire); }
 
   // Checks whether there is a managed pointer.
   explicit operator bool() const noexcept { return get() != pointer(); }
@@ -178,7 +177,7 @@ class Node;
 class Edge {
  public:
   // Creates array of edges from the list of moves.
-  static std::unique_ptr<Edge[]> FromMovelist(const MoveList& moves);
+  static void FromMovelist(Edge* dst, const MoveList& moves);
 
   // Returns move from the point of view of the player making it (if as_opponent
   // is false) or as opponent (if as_opponent is true).
@@ -207,9 +206,10 @@ class Edge {
 };
 
 struct Eval {
-  float wl;
-  float d;
+  double wl;
+  double d;
   float ml;
+  float e;
 };
 
 struct NNEval {
@@ -242,12 +242,94 @@ class Edge_Iterator;
 template <bool is_const>
 class VisitedNode_Iterator;
 
-class NodeGarbageCollector;
+template <typename Types>
 class ReleaseNodesWork;
+
+// Intrusive shared pointer for LowNode. It allows reducing 16 bytes of
+// std::shared_ptr to 8 bytes. It should require minimal changes to replace
+// std::shared_ptr. The main difference is requirement that stored object must
+// implement AddRef and Release functions. Release returns true if this object
+// holds the last reference.
+template <typename T>
+class IntrusiveSharedPtr {
+ public:
+  using element_type = T;
+
+  explicit IntrusiveSharedPtr(T* ptr = nullptr) noexcept : ptr_(ptr) {
+    if (ptr_) {
+      ptr_->AddRef();
+    }
+  }
+
+  ~IntrusiveSharedPtr() { Release(); }
+
+  IntrusiveSharedPtr(const IntrusiveSharedPtr& other) noexcept
+      : ptr_(other.ptr_) {
+    AddRef();
+  }
+
+  IntrusiveSharedPtr& operator=(const IntrusiveSharedPtr& other) noexcept {
+    assert(this != &other);
+    reset(other.ptr_);
+    return *this;
+  }
+  IntrusiveSharedPtr& operator=(IntrusiveSharedPtr&& other) noexcept {
+    assert(this != &other);
+    Release();
+    ptr_ = other.ptr_;
+    other.ptr_ = nullptr;
+    return *this;
+  }
+
+  void reset(T* ptr = nullptr) noexcept {
+    Release();
+    ptr_ = ptr;
+    AddRef();
+  }
+
+  T* get() const { return ptr_; }
+  T* operator->() const { return ptr_; }
+  T& operator*() const { return *ptr_; }
+
+  explicit operator bool() const { return ptr_ != nullptr; }
+  auto operator<=>(const IntrusiveSharedPtr& other) const {
+    return ptr_ <=> other.ptr_;
+  }
+  bool operator==(const IntrusiveSharedPtr& other) const {
+    return ptr_ == other.ptr_;
+  }
+
+ private:
+  void AddRef() {
+    if (!ptr_) return;
+    ptr_->AddRef();
+  }
+  void Release() {
+    if (!ptr_) return;
+
+    if (ptr_->Release()) {
+      delete ptr_;
+    }
+    ptr_ = nullptr;
+  }
+
+  T* ptr_ = nullptr;
+};
+
+template <typename T>
+std::ostream& operator<<(std::ostream& os, const IntrusiveSharedPtr<T>& ptr) {
+  return os << ptr.get();
+}
+
+template <typename T, typename... Args>
+IntrusiveSharedPtr<T> MakeShared(Args&&... args) {
+  return IntrusiveSharedPtr<T>(new T(std::forward<Args>(args)...));
+}
 
 class LowNode;
 class Node {
  public:
+  static constexpr size_t kAlignment = 64;
   using Iterator = Edge_Iterator<false>;
   using ConstIterator = Edge_Iterator<true>;
 
@@ -256,26 +338,35 @@ class Node {
       : index_(index),
         terminal_type_(Terminal::NonTerminal),
         lower_bound_(GameResult::BLACK_WON),
-        upper_bound_(GameResult::WHITE_WON),
-        repetition_(false) {}
+        upper_bound_(GameResult::WHITE_WON) {}
   // Takes own @edge and @index in the parent.
   Node(const Edge& edge, uint16_t index)
       : edge_(edge),
         index_(index),
         terminal_type_(Terminal::NonTerminal),
         lower_bound_(GameResult::BLACK_WON),
-        upper_bound_(GameResult::WHITE_WON),
-        repetition_(false) {}
+        upper_bound_(GameResult::WHITE_WON) {}
+
+  Node(Node&& other);
+  Node& operator=(Node&& other);
+
   ~Node();
+
+  // Returns mutex for backup propagation. It is used to synchronize access to
+  // the evaluation. Mutex must be locked in order from child to parent to avoid
+  // deadlocks. The parent LowNode must be locked before this node is released.
+  auto& GetMutex() { return backprop_mutex_; }
 
   // Trim node, resetting everything except parent, sibling, edge and index.
   void Trim();
+
+  Node* MakeSingleChild(Move move);
 
   // Allocates a new edge and a new node. The node has to be without edges
   // before that.
   Node* CreateSingleChildNode(Move move) {
     assert(!low_node_);
-    auto low_node = std::make_shared<LowNode>(MoveList({move}), 0);
+    auto low_node = MakeShared<LowNode>(MoveList({move}));
     SetLowNode(low_node);
     return GetChild();
   }
@@ -294,18 +385,21 @@ class Node {
 
   // Returns sum of policy priors which have had at least one playout.
   float GetVisitedPolicy() const;
-  uint32_t GetN() const { return n_; }
+  double GetWeight() const { return weight_; }
+  float GetN() const { return weight_; }
   uint32_t GetNInFlight() const;
-  uint32_t GetChildrenVisits() const;
-  uint32_t GetTotalVisits() const;
+  float GetChildrenVisits() const;
+  float GetTotalVisits() const;
   // Returns n + n_in_flight.
-  int GetNStarted() const { return n_ + GetNInFlight(); }
+  float GetNStarted() const {
+    return weight_ + static_cast<float>(GetNInFlight());
+  }
 
-  float GetQ(float draw_score) const { return wl_ + draw_score * d_; }
+  double GetQ(double draw_score) const { return wl_ + draw_score * d_; }
   // Returns node eval, i.e. average subtree V for non-terminal node and -1/0/1
   // for terminal nodes.
-  float GetWL() const { return wl_; }
-  float GetD() const { return d_; }
+  double GetWL() const { return wl_; }
+  double GetD() const { return d_; }
   float GetM() const { return m_; }
 
   // Returns whether the node is known to be draw/lose/win.
@@ -333,11 +427,12 @@ class Node {
   // Updates the node with newly computed value v.
   // Updates:
   // * Q (weighted average of all V in a subtree)
-  // * N (+=multivisit)
-  // * N-in-flight (-=multivisit)
-  void FinalizeScoreUpdate(float v, float d, float m, uint32_t multivisit);
+  // * W (+=multiweight)
+  // * N-in-flight (-=1)
+  double FinalizeScoreUpdate(double v, double d, float m, double multiweight);
   // Like FinalizeScoreUpdate, but it updates n existing visits by delta amount.
-  void AdjustForTerminal(float v, float d, float m, uint32_t multivisit);
+  void AdjustForTerminal(double v, double d, float m, double divisor,
+                         double multiweight);
   // When search decides to treat one visit as several (in case of collisions
   // or visiting terminal nodes several times), it amplifies the visit by
   // incrementing n_in_flight.
@@ -354,8 +449,9 @@ class Node {
   // Deletes all children except one.
   // The node provided may be moved, so should not be relied upon to exist
   // afterwards.
-  void ReleaseChildrenExceptOne(Node* node_to_save) const;
+  void ReleaseChildrenExceptOne(Move move);
 
+  Edge& GetEdge() { return edge_; }
   // Returns move from the point of view of the player making it (if as_opponent
   // is false) or as opponent (if as_opponent is true).
   Move GetMove(bool as_opponent = false) const {
@@ -367,17 +463,16 @@ class Node {
   float GetP() const { return edge_.GetP(); }
   void SetP(float val) { edge_.SetP(val); }
 
-  const std::shared_ptr<LowNode>& GetLowNode() const { return low_node_; }
+  const auto& GetLowNode() const { return low_node_; }
 
-  void SetLowNode(std::shared_ptr<LowNode> low_node);
+  void SetLowNode(IntrusiveSharedPtr<LowNode> low_node);
   void UnsetLowNode();
 
   // Debug information about the node.
   std::string DebugString() const;
   // Return string describing the edge from node's parent to its low node in the
   // Graphviz dot format.
-  void DotEdgeString(std::ofstream& file,
-                     bool as_opponent = false,
+  void DotEdgeString(std::ofstream& file, bool as_opponent = false,
                      const LowNode* parent = nullptr) const;
   // Return string describing the graph starting at this node in the Graphviz
   // dot format.
@@ -391,9 +486,7 @@ class Node {
 
   // Index in parent's edges - useful for correlated ordering.
   uint16_t Index() const { return index_; }
-
-  void SetRepetition() { repetition_ = true; }
-  bool IsRepetition() const { return repetition_; }
+  void SetIndex(uint16_t index) { index_ = index; }
 
   bool WLDMInvariantsHold() const;
 
@@ -414,13 +507,12 @@ class Node {
     explicit VisitorId();
     ~VisitorId();
 
-    operator type() const {
-      return id_;
-    }
+    operator type() const { return id_; }
 
     friend class Node;
     friend class LowNode;
-  private:
+
+   private:
     type id_;
   };
 #endif
@@ -432,7 +524,7 @@ class Node {
 
   // 16 byte fields on 64-bit platforms, 8 byte on 32-bit.
   // Shared pointer to the low node.
-  std::shared_ptr<LowNode> low_node_;
+  IntrusiveSharedPtr<LowNode> low_node_;
 
   // 8 byte fields.
   // Average value (from value head of neural network) of all visited nodes in
@@ -445,6 +537,10 @@ class Node {
   // flipped depending on the side to move.
   double d_ = 0.0f;
 
+  // W is completed visits adjusted by uncertainty. It is used to estimate
+  // confidence bounds of evaluation.
+  double weight_ = 0.0;
+
   // 8 byte fields on 64-bit platforms, 4 byte on 32-bit.
   // Pointer to a next sibling. nullptr if there are no further siblings.
   atomic_unique_ptr<Node> sibling_;
@@ -452,12 +548,13 @@ class Node {
   // 4 byte fields.
   // Estimated remaining plies.
   float m_ = 0.0f;
+
   // How many completed visits this node had.
-  uint32_t n_ = 0;
   // (AKA virtual loss.) How many threads currently process this node (started
   // but not finished). This value is added to n during selection which node
   // to pick in MCTS, and also when selecting the best move.
   std::atomic<uint32_t> n_in_flight_ = 0;
+  SpinMutex backprop_mutex_;
 
   // Move and policy for this edge.
   Edge edge_;
@@ -474,8 +571,6 @@ class Node {
   // Best and worst result for this node.
   GameResult lower_bound_ : 2;
   GameResult upper_bound_ : 2;
-  // Edge was handled as a repetition at some point.
-  bool repetition_ : 1;
 };
 
 // Check that Node still fits into an expected cache line size.
@@ -483,71 +578,68 @@ static_assert(sizeof(Node) <= 64, "Node is too large");
 
 class LowNode {
  public:
-  LowNode()
-      : terminal_type_(Terminal::NonTerminal),
-        lower_bound_(GameResult::BLACK_WON),
-        upper_bound_(GameResult::WHITE_WON) {}
-  // Init from from another low node, but use it for NNEval only.
-  LowNode(const LowNode& p)
-      : wl_(p.wl_),
-        d_(p.d_),
-        m_(p.m_),
-        num_edges_(p.num_edges_),
-        terminal_type_(Terminal::NonTerminal),
-        lower_bound_(GameResult::BLACK_WON),
-        upper_bound_(GameResult::WHITE_WON) {
-    assert(p.edges_);
-    edges_ = std::make_unique<Edge[]>(num_edges_);
-    std::memcpy(edges_.get(), p.edges_.get(), num_edges_ * sizeof(Edge));
-  }
   // Init @edges_ with moves from @moves and 0 policy.
   LowNode(const MoveList& moves)
       : num_edges_(moves.size()),
         terminal_type_(Terminal::NonTerminal),
         lower_bound_(GameResult::BLACK_WON),
         upper_bound_(GameResult::WHITE_WON) {
-    edges_ = Edge::FromMovelist(moves);
+    child_.first_ = ChildAndEdges::FromMovelist(moves).release();
   }
-  // Init @edges_ with moves from @moves and 0 policy.
-  // Also create the first child at @index.
-  LowNode(const MoveList& moves, uint16_t index)
+  struct RootTag {};
+  LowNode(const MoveList& moves, RootTag)
       : num_edges_(moves.size()),
         terminal_type_(Terminal::NonTerminal),
         lower_bound_(GameResult::BLACK_WON),
-        upper_bound_(GameResult::WHITE_WON) {
-    edges_ = Edge::FromMovelist(moves);
-    child_ = std::make_unique<Node>(edges_[index], index);
+        upper_bound_(GameResult::WHITE_WON),
+        solid_edges_(true) {
+    child_.solid_ = SolidChildren::FromMovelist(moves).release();
   }
+  LowNode(const LowNode& low_node, Move saved_child);
   ~LowNode();
 
+  // Returns mutex for backup propagation. It is used to synchronize access to
+  // the evaluation. Mutex must be locked in order from child to parent to avoid
+  // deadlocks. The parent Node must be locked before this node is released.
+  auto& GetMutex() { return backprop_mutex_; }
+
   void SetNNEval(const EvalResult* eval) {
-    assert(n_ == 0);
-    assert(!child_);
+    assert(weight_ == 0);
+    assert(GetChild()->GetNStarted() == 0);
+
+    Edge* edges = GetEdges();
+
+    assert(edges);
 
     for (size_t idx = 0; idx < num_edges_; idx++) {
-      edges_.get()[idx].SetP(eval->p[idx]);
+      edges[idx].SetP(eval->p[idx]);
     }
 
     wl_ = eval->q;
     d_ = eval->d;
     m_ = eval->m;
+    weight_ = eval->e;
 
     assert(WLDMInvariantsHold());
   }
 
   // Gets the first child.
-  atomic_unique_ptr<Node>* GetChild() { return &child_; }
+  Node* GetChild() const {
+    return !solid_edges_ ? child_.first_->GetChild()
+                         : child_.solid_->GetChild();
+  }
 
   // Returns whether a node has children.
   bool HasChildren() const { return num_edges_ > 0; }
 
-  uint32_t GetN() const { return n_; }
-  uint32_t GetChildrenVisits() const { return n_ - 1; }
+  double GetWeight() const { return weight_; }
+  float GetN() const { return weight_; }
+  float GetChildrenVisits() const { return weight_ - 1.0; }
 
   // Returns node eval, i.e. average subtree V for non-terminal node and -1/0/1
   // for terminal nodes.
-  float GetWL() const { return wl_; }
-  float GetD() const { return d_; }
+  double GetWL() const { return wl_; }
+  double GetD() const { return d_; }
   float GetM() const { return m_; }
 
   // Returns whether the node is known to be draw/loss/win.
@@ -557,7 +649,10 @@ class LowNode {
 
   uint8_t GetNumEdges() const { return num_edges_; }
   // Gets pointer to the start of the edge array.
-  Edge* GetEdges() const { return edges_.get(); }
+  Edge* GetEdges() const {
+    return !solid_edges_ ? child_.first_->GetEdges()
+                         : child_.solid_->GetEdges(num_edges_);
+  }
 
   // Makes the node terminal and sets it's score.
   void MakeTerminal(GameResult result, float plies_left = 0.0f,
@@ -572,22 +667,22 @@ class LowNode {
   // Updates the node with newly computed value v.
   // Updates:
   // * Q (weighted average of all V in a subtree)
-  // * N (+=multivisit)
-  // * N-in-flight (-=multivisit)
-  void FinalizeScoreUpdate(float v, float d, float m, uint32_t multivisit);
+  // * W (+=multiweight)
+  // * N-in-flight (-=1)
+  double FinalizeScoreUpdate(double v, double d, float m, double multiweight);
   // Like FinalizeScoreUpdate, but it updates n existing visits by delta amount.
-  void AdjustForTerminal(float v, float d, float m, uint32_t multivisit);
-
-  // Deletes all children.
-  void ReleaseChildren();
+  void AdjustForTerminal(double v, double d, float m, double divisor,
+                         double multiweight);
 
   // Deletes all children except one.
   // The node provided may be moved, so should not be relied upon to exist
   // afterwards.
-  void ReleaseChildrenExceptOne(Node* node_to_save);
+  void ReleaseChildrenExceptOne(Move move);
 
   // Return move policy for edge/node at @index.
   const Edge& GetEdgeAt(uint16_t index) const;
+  // Return child node at @index.
+  Node* GetChildAt(uint16_t index) const;
 
   // Debug information about the node.
   std::string DebugString() const;
@@ -595,24 +690,45 @@ class LowNode {
   void DotNodeString(std::ofstream& file) const;
 
   void SortEdges() {
-    assert(edges_);
-    assert(!child_);
-    Edge::SortEdges(edges_.get(), num_edges_);
+    assert(child_.first_);
+    assert(GetChild()->GetNStarted() == 0);
+    Edge::SortEdges(GetEdges(), num_edges_);
+    // Copy the best edge to the preallocated first child.
+    if (solid_edges_) {
+      for (size_t i = 0; i < num_edges_; ++i) {
+        GetChildAt(i)->GetEdge() = GetEdges()[i];
+      }
+    } else {
+      GetChild()->GetEdge() = *GetEdges();
+    }
   }
 
+  bool IsLastChild(Node* child) const {
+    return num_edges_ == child->Index() + 1;
+  }
+  bool CanMakeSolid() const { return num_edges_ > 1 && !solid_edges_; }
+  bool IsSolid() const { return solid_edges_; }
+  struct PointerChanges;
+  // Reallocate edge evaluations to a solid array.
+  // @return Changes array in iteration memory.
+  PointerChanges* MakeSolid(bool no_results = false);
+
   // Add new parent with @n_in_flight visits.
-  void AddParent() {
+  void AddRef() {
     num_parents_.fetch_add(1, std::memory_order_acq_rel);
 
     assert(num_parents_ > 0);
   }
   // Remove parent and its first visit.
-  void RemoveParent() {
+  bool Release() {
     assert(num_parents_ > 0);
-    num_parents_.fetch_sub(1, std::memory_order_acq_rel);
+    return num_parents_.fetch_sub(1, std::memory_order_acq_rel) == 1;
+  }
+  uint32_t GetNumParents() const {
+    return num_parents_.load(std::memory_order_acquire);
   }
   bool IsTransposition() const {
-    return num_parents_.load(std::memory_order_acquire) > 1;
+    return num_parents_.load(std::memory_order_acquire) > 2;
   }
 
   bool WLDMInvariantsHold() const;
@@ -620,6 +736,213 @@ class LowNode {
 #ifndef NDEBUG
   bool Visit(Node::VisitorId::type id);
 #endif
+
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4200)  // zero-sized array in struct/union
+#elif defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+#endif
+
+  // Structure of arrays container for a pair of pointers to replace old
+  // pointers with new pointers in BackupPaths.
+  struct PointerChanges {
+    struct ElementRef;
+
+    // Value type.
+    struct Element {
+      Node* old_;
+      Node* new_;
+      Element(Node* old, Node* new_node) : old_(old), new_(new_node) {}
+      Element(const Element&) = default;
+      Element(const ElementRef& other) : old_(other.old_), new_(other.new_) {}
+
+      Element& operator=(const Element& other) = default;
+      Element& operator=(const ElementRef& other) {
+        old_ = other.old_;
+        new_ = other.new_;
+        return *this;
+      }
+
+      auto operator<=>(const Element& other) const {
+        return old_ <=> other.old_;
+      }
+      auto operator<=>(const ElementRef& other) const {
+        return old_ <=> other.old_;
+      }
+    };
+
+    // Reference type which provides direct mapping to per member arrays in the
+    // container.
+    struct ElementRef {
+      Node*& old_;
+      Node*& new_;
+
+      ElementRef(Node*& old, Node*& new_node) : old_(old), new_(new_node) {}
+      ElementRef(const ElementRef&) = delete;
+      ElementRef& operator=(const ElementRef& other) {
+        old_ = other.old_;
+        new_ = other.new_;
+        return *this;
+      }
+      ElementRef& operator=(const Element& other) {
+        old_ = other.old_;
+        new_ = other.new_;
+        return *this;
+      }
+
+      friend void swap(ElementRef a, ElementRef b) {
+        std::swap(a.old_, b.old_);
+        std::swap(a.new_, b.new_);
+      }
+
+      auto operator<=>(const ElementRef& other) const {
+        return old_ <=> other.old_;
+      }
+      auto operator<=>(const Element& other) const {
+        return old_ <=> other.old_;
+      }
+    };
+    using value_type = Element;
+    using difference_type = std::ptrdiff_t;
+    using pointer = value_type*;
+    using reference = ElementRef;
+
+    // Index based iterator to use container index operator for access.
+    struct iterator {
+      using iterator_category = std::random_access_iterator_tag;
+      using value_type = Element;
+      using difference_type = std::ptrdiff_t;
+      using pointer = value_type*;
+      using reference = ElementRef;
+
+      iterator() = default;
+      iterator(const PointerChanges* c, size_t index)
+          : container_(const_cast<PointerChanges*>(c)), index_(index) {}
+
+      iterator& operator++() {
+        ++index_;
+        return *this;
+      }
+      iterator operator++(int) {
+        iterator tmp = *this;
+        ++*this;
+        return tmp;
+      }
+      iterator& operator--() {
+        --index_;
+        return *this;
+      }
+      iterator operator--(int) {
+        iterator tmp = *this;
+        --*this;
+        return tmp;
+      }
+
+      iterator& operator+=(difference_type n) {
+        index_ += n;
+        return *this;
+      }
+      iterator& operator-=(difference_type n) {
+        index_ -= n;
+        return *this;
+      }
+
+      friend iterator operator+(const iterator& it, difference_type n) {
+        iterator tmp = it;
+        tmp += n;
+        return tmp;
+      }
+      friend iterator operator+(difference_type n, const iterator& it) {
+        return it + n;
+      }
+      friend iterator operator-(const iterator& it, difference_type n) {
+        return it + -n;
+      }
+      friend difference_type operator-(const iterator& a, const iterator& b) {
+        return a.index_ - b.index_;
+      }
+
+      auto operator<=>(const iterator& other) const {
+        return index_ <=> other.index_;
+      }
+      bool operator==(const iterator& other) const {
+        return index_ == other.index_;
+      }
+
+      reference operator*() const { return (*container_)[index_]; }
+      reference operator[](difference_type n) const {
+        return (*container_)[index_ + n];
+      }
+
+     private:
+      PointerChanges* container_ = nullptr;
+      size_t index_ = 0;
+    };
+
+    size_t size() const { return num_edges_; }
+    size_t capacity() const { return capacity_; }
+    bool empty() const { return num_edges_ == 0; }
+
+    iterator begin() const { return {this, 0}; }
+    iterator end() const { return {this, num_edges_}; }
+
+    reference operator[](size_t index) {
+      return {changes_[index], changes_[index + capacity_]};
+    }
+
+    // Allocate variable size object in iteration memory.
+    static PointerChanges* Allocate(size_t capacity);
+
+    size_t num_edges_;
+    size_t capacity_;
+    Node* changes_[];
+  };
+
+  // Store the first child and edges in the same memory allocation.
+  class ChildAndEdges {
+   public:
+    Node* GetChild() const { return const_cast<Node*>(&child_); }
+    Edge* GetEdges() const { return const_cast<Edge*>(edges_); }
+
+    // Creates a new ChildAndEdges object with a moves list.
+    static std::unique_ptr<ChildAndEdges> FromMovelist(const MoveList& moves,
+                                                       uint16_t index = 0);
+    static std::unique_ptr<ChildAndEdges> FromNode(Node&& node,
+                                                   uint8_t num_edges);
+
+    static ChildAndEdges* Allocate(size_t num_edges);
+    static void operator delete(ChildAndEdges* ptr, std::destroying_delete_t);
+
+   private:
+    Node child_;
+    Edge edges_[];
+  };
+
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#elif defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+
+  // Store all children and edges in the same allocation.
+  class SolidChildren {
+   public:
+    ~SolidChildren();
+    static std::unique_ptr<SolidChildren> Make(uint8_t num_edges, Node* child,
+                                               Edge* edges);
+    static std::unique_ptr<SolidChildren> FromMovelist(const MoveList& moves);
+    static SolidChildren* Allocate(size_t num_edges);
+    static void operator delete(SolidChildren* ptr, std::destroying_delete_t);
+    Node* GetChild() const { return const_cast<Node*>(&child_); }
+    Edge* GetEdges(uint8_t num_edges) const {
+      return reinterpret_cast<Edge*>(const_cast<Node*>(&GetChild()[num_edges]));
+    }
+
+   private:
+    Node child_;
+  };
 
  private:
   // To minimize the number of padding bytes and to avoid having unnecessary
@@ -637,21 +960,25 @@ class LowNode {
   // flipped depending on the side to move.
   double d_ = 0.0f;
 
+  // How many completed visits this node had.
+  double weight_ = 0.0f;
+
   // 8 byte fields on 64-bit platforms, 4 byte on 32-bit.
   // Array of edges.
-  std::unique_ptr<Edge[]> edges_;
-  // Pointer to the first child. nullptr when no children.
-  atomic_unique_ptr<Node> child_;
+  // Child link union to help debugging based on type of edge data storage.
+  union {
+    ChildAndEdges* first_;
+    SolidChildren* solid_;
+  } child_;
 
   // 4 byte fields.
   // Estimated remaining plies.
-  float m_ = 0.0f;
-  // How many completed visits this node had.
-  uint32_t n_ = 0;
 
-  // 2 byte fields.
+  float m_ = 0.0f;
+  SpinMutex backprop_mutex_;
+
   // Number of parents.
-  std::atomic<uint16_t> num_parents_ = {};
+  std::atomic<uint32_t> num_parents_ = {};
 
   // 1 byte fields.
   // Number of edges in @edges_.
@@ -662,6 +989,8 @@ class LowNode {
   // Best and worst result for this node.
   GameResult lower_bound_ : 2;
   GameResult upper_bound_ : 2;
+  // Set true if all edges (Node) are solid in a continues array. It
+  bool solid_edges_ : 1 = false;
   // Debug only id as the last to avoid taking place of actively used variables
   // in the cache.
 #ifndef NDEBUG
@@ -691,22 +1020,24 @@ class EdgeAndNode {
   Node* node() const { return node_; }
 
   // Proxy functions for easier access to node/edge.
-  float GetQ(float default_q, float draw_score) const {
+  double GetQ(double default_q, double draw_score) const {
     return (node_ && node_->GetN() > 0) ? node_->GetQ(draw_score) : default_q;
   }
-  float GetWL(float default_wl) const {
+  double GetWL(double default_wl) const {
     return (node_ && node_->GetN() > 0) ? node_->GetWL() : default_wl;
   }
-  float GetD(float default_d) const {
+  double GetD(double default_d) const {
     return (node_ && node_->GetN() > 0) ? node_->GetD() : default_d;
   }
   float GetM(float default_m) const {
     return (node_ && node_->GetN() > 0) ? node_->GetM() : default_m;
   }
   // N-related getters, from Node (if exists).
-  uint32_t GetN() const { return node_ ? node_->GetN() : 0; }
-  int GetNStarted() const { return node_ ? node_->GetNStarted() : 0; }
+  float GetN() const { return node_ ? node_->GetN() : 0.0f; }
+  float GetNStarted() const { return node_ ? node_->GetNStarted() : 0.0f; }
   uint32_t GetNInFlight() const { return node_ ? node_->GetNInFlight() : 0; }
+
+  double GetWeight() const { return node_ ? node_->GetWeight() : 0; }
 
   // Whether the node is known to be terminal.
   bool IsTerminal() const { return node_ ? node_->IsTerminal() : false; }
@@ -727,7 +1058,7 @@ class EdgeAndNode {
   // Returns U = numerator * p / N.
   // Passed numerator is expected to be equal to (cpuct * sqrt(N[parent])).
   float GetU(float numerator) const {
-    return numerator * GetP() / (1 + GetNStarted());
+    return numerator * GetP() / (1.0f + GetNStarted());
   }
 
   std::string DebugString() const;
@@ -772,11 +1103,11 @@ class Edge_Iterator : public EdgeAndNode {
   // Creates "begin()" iterator.
   Edge_Iterator(LowNode* parent_node)
       : EdgeAndNode(parent_node != nullptr ? parent_node->GetEdges() : nullptr,
-                    nullptr) {
+                    parent_node ? parent_node->GetChild() : nullptr) {
     if (parent_node != nullptr) {
-      node_ptr_ = parent_node->GetChild();
+      assert(node_->Index() == 0);
+      node_ptr_ = node_->GetSibling();
       total_count_ = parent_node->GetNumEdges();
-      if (edge_) Actualize();
     }
   }
 
@@ -902,7 +1233,7 @@ class VisitedNode_Iterator {
   // Creates "begin()" iterator.
   VisitedNode_Iterator(LowNode* parent_node) {
     if (parent_node != nullptr) {
-      node_ptr_ = parent_node->GetChild()->get();
+      node_ptr_ = parent_node->GetChild();
       total_count_ = parent_node->GetNumEdges();
       if (node_ptr_ != nullptr && node_ptr_->GetN() == 0) {
         operator++();
@@ -955,8 +1286,7 @@ inline VisitedNode_Iterator<false> Node::VisitedNodes() {
 }
 
 // Transposition Table type for holding references to all low nodes in DAG.
-typedef absl::flat_hash_map<uint64_t, std::weak_ptr<LowNode>>
-    TranspositionTable;
+typedef HashKeyedCache<IntrusiveSharedPtr<LowNode>> TranspositionTable;
 
 class NodeTree {
  public:
@@ -995,37 +1325,46 @@ class NodeTree {
 
 // Implement thread local queues. It tracks GC thread to allow faster removal in
 // the thread.
+template <typename Types>
 class ReleaseNodesWork {
   static constexpr size_t kCapacity = 32;
-public:
+
+ public:
   ReleaseNodesWork(bool gc_thread = false);
   ~ReleaseNodesWork();
   bool IsWorker() const;
 
   // A limited vector like interface to operate on the container.
-  void emplace_back(std::unique_ptr<Node>&& node);
+  template <typename Type>
+  void emplace_back(std::unique_ptr<Type>&& node);
   bool empty() const;
 
   // Swap is used to transfer queue into a new stack variable. The stack
   // variable will flush the queue in the desctructor.
-  void swap(ReleaseNodesWork &other);
-private:
+  void swap(ReleaseNodesWork& other);
+
+ private:
   // Flush the local queue to the shared queue.
   void Submit();
 
   // No locks required because only one thread can access this object.
-  std::vector<std::unique_ptr<Node>> released_nodes_;
+  std::vector<Types> released_nodes_;
   bool is_gc_thread_;
 };
 
+template <typename Types>
 class NodeGarbageCollector {
   NodeGarbageCollector();
   ~NodeGarbageCollector();
-public:
+
+ public:
+  static constexpr size_t kQueueWakeupThreshold = 20;
+
   enum State {
     Running,
-    GoToSleep,
+    Waiting,
     Sleeping,
+    GoToSleep,
     Exit,
   };
 
@@ -1035,7 +1374,7 @@ public:
     return singleton;
   }
   // Delays node destruction until GC thread activates.
-  template<typename UniquePtr>
+  template <typename UniquePtr>
   void AddToGcQueue(UniquePtr& node);
 
   // Allow search to control when garbage collection runs.
@@ -1050,17 +1389,17 @@ public:
   // there is no need to call this.
   void NotifyThreadGoingSleep();
 
-private:
+ private:
   // Helper to transition between states safely
   bool SetState(State& old, State desired);
   bool IsActive() const;
-  bool ShouldQueue(std::unique_ptr<Node>& node) const;
+  bool ShouldQueue(bool holds_node) const;
   // The collection thread implementation.
   void GCThread();
   // Thread local collection queue. Local queues flush to the shared queue
   // in batches to avoid lock contention.
-  static ReleaseNodesWork& LocalWork(bool gc_thread = false) {
-    static thread_local ReleaseNodesWork shared{gc_thread};
+  static ReleaseNodesWork<Types>& LocalWork(bool gc_thread = false) {
+    static thread_local ReleaseNodesWork<Types> shared{gc_thread};
     return shared;
   }
 
@@ -1073,10 +1412,15 @@ private:
 #endif
   std::thread gc_thread_;
   SpinMutex mutex_;
-  std::deque<std::vector<std::unique_ptr<Node>>> released_nodes_ GUARDED_BY(mutex_);
+  std::deque<std::vector<Types>> released_nodes_ GUARDED_BY(mutex_);
 
-  friend class ReleaseNodesWork;
+  friend class ReleaseNodesWork<Types>;
 };
+
+using NGCTypes = std::variant<std::unique_ptr<LowNode::ChildAndEdges>,
+                              std::unique_ptr<LowNode::SolidChildren>,
+                              std::unique_ptr<Node>>;
+using NGC = NodeGarbageCollector<NGCTypes>;
 
 }  // namespace dag_classic
 }  // namespace lczero

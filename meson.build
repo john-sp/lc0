@@ -229,6 +229,7 @@ endif
 if get_option('dag_classic')
   files += [
     'src/search/dag_classic/node.cc',
+    'src/search/dag_classic/params.cc',
     'src/search/dag_classic/search.cc',
     'src/search/dag_classic/wrapper.cc',
   ]
@@ -520,6 +521,7 @@ if get_option('build_backends')
     foreach x : get_option('cudnn_include')
       nvcc_arguments += ['-I', x]
     endforeach
+    nvcc_arguments += ['-I', meson.current_build_dir()]
     if host_machine.system() == 'windows'
       outputname = '@BASENAME@.obj'
     else
@@ -854,6 +856,24 @@ endif
     deps += dependency('zlib', fallback: ['zlib', 'zlib_dep'])
   endif
 
+  ## ~~~~~
+  ## hwloc
+  ## ~~~~~
+  hwloc_dep = dependency('hwloc', required: false, fallback: ['hwloc'])
+  numa_config = configuration_data()
+  if hwloc_dep.found()
+    deps += hwloc_dep
+    numa_config.set('HAVE_LIBHWLOC', '1')
+  else
+    numa_config.set('HAVE_LIBHWLOC', '0')
+  endif
+  if cu_dart.found()
+    numa_config.set('HAVE_CUDART', '1')
+  else
+    numa_config.set('HAVE_CUDART', '0')
+  endif
+  configure_file(output: 'numa_config.h', configuration: numa_config)
+
   trace_lib = get_option('trace_library')
   trace_config = configuration_data()
 
@@ -883,6 +903,7 @@ endif
         endif
       endif
     endforeach
+    deps += cc.find_library('dl', required: false)
     if not nvtx_header_found
       error('nvtx3/nvtx3.hpp header not found in cudnn_include paths')
     endif

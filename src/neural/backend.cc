@@ -34,6 +34,33 @@
 
 namespace lczero {
 
+BackendAttributes::BackendAttributes(const Network& network) {
+  const NetworkCapabilities& caps = network.GetCapabilities();
+  has_mlh = caps.has_mlh();
+  has_wdl = caps.has_wdl();
+  runs_on_cpu = network.IsCpu();
+  concurrent_add_input = network.IsConcurrentAddInputSupported();
+  suggested_num_search_threads = network.GetThreads();
+  recommended_batch_size = network.GetMiniBatchSize();
+  maximum_batch_size = 1024;
+  preferred_batch_step = network.GetPreferredBatchStep();
+}
+
+BackendAttributes& BackendAttributes::operator+=(
+    const BackendAttributes& other) {
+  has_mlh = has_mlh && other.has_mlh;
+  has_wdl = has_wdl && other.has_wdl;
+  runs_on_cpu = runs_on_cpu && other.runs_on_cpu;
+  concurrent_add_input = concurrent_add_input && other.concurrent_add_input;
+  suggested_num_search_threads = std::max(suggested_num_search_threads,
+                                          other.suggested_num_search_threads);
+  recommended_batch_size += other.recommended_batch_size;
+  maximum_batch_size = std::max(maximum_batch_size, other.maximum_batch_size);
+  preferred_batch_step =
+      std::max(preferred_batch_step, other.preferred_batch_step);
+  return *this;
+}
+
 std::vector<EvalResult> Backend::EvaluateBatch(
     std::span<const EvalPosition> positions) {
   std::vector<EvalResult> results;
@@ -44,7 +71,7 @@ std::vector<EvalResult> Backend::EvaluateBatch(
     EvalResult& result = results.back();
     result.p.resize(pos.legal_moves.size());
     computation->AddInput(
-        pos, EvalResultPtr{&result.q, &result.d, &result.m,
+        pos, EvalResultPtr{&result.q, &result.d, &result.m, &result.e,
                            std::span<float>(result.p.data(), result.p.size())});
   }
   computation->ComputeBlocking();

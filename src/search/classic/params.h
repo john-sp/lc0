@@ -158,6 +158,7 @@ class BaseSearchParams {
     return kMaxCollisionVisitsScalingPower;
   }
   bool GetSearchSpinBackoff() const { return kSearchSpinBackoff; }
+  int GetSolidTreeThreshold() const { return kSolidTreeThreshold; }
 
   float GetGarbageCollectionDelay() const {
     return kGarbageCollectionDelay;
@@ -230,6 +231,7 @@ class BaseSearchParams {
   static const OptionId kUCIOpponentId;
   static const OptionId kUCIRatingAdvId;
   static const OptionId kSearchSpinBackoffId;
+  static const OptionId kSolidTreeThresholdId;
   static const OptionId kGarbageCollectionDelayId;
 
  protected:
@@ -289,6 +291,7 @@ class BaseSearchParams {
   const int kMaxCollisionVisitsScalingEnd;
   const float kMaxCollisionVisitsScalingPower;
   const bool kSearchSpinBackoff;
+  const int kSolidTreeThreshold;
   const float kGarbageCollectionDelay;
 };
 
@@ -304,14 +307,11 @@ class SearchParams : public BaseSearchParams {
   int GetMaxPrefetchBatch() const {
     return options_.Get<int>(kMaxPrefetchBatchId);
   }
-  int GetSolidTreeThreshold() const { return kSolidTreeThreshold; }
 
   // Search parameter IDs.
   static const OptionId kMaxPrefetchBatchId;
-  static const OptionId kSolidTreeThresholdId;
 
  private:
-  const int kSolidTreeThreshold;
 };
 }  // namespace classic
 }  // namespace lczero

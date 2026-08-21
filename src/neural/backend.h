@@ -44,15 +44,22 @@ struct BackendAttributes {
   bool has_mlh;
   bool has_wdl;
   bool runs_on_cpu;
+  bool concurrent_add_input;
   int suggested_num_search_threads;
   int recommended_batch_size;
   int maximum_batch_size;
+  int preferred_batch_step;
+
+  BackendAttributes() = default;
+  BackendAttributes(const Network& network);
+  BackendAttributes& operator+=(const BackendAttributes& other);
 };
 
 struct EvalResultPtr {
   float* q = nullptr;
   float* d = nullptr;
   float* m = nullptr;
+  float* e = nullptr;
   std::span<float> p = {};
 };
 
@@ -60,10 +67,11 @@ struct EvalResult {
   float q;
   float d;
   float m;
+  float e;
   std::vector<float> p;
 
   EvalResultPtr AsPtr() {
-    return EvalResultPtr{.q = &q, .d = &d, .m = &m, .p = p};
+    return EvalResultPtr{.q = &q, .d = &d, .m = &m, .e = &e, .p = p};
   }
 };
 
@@ -72,6 +80,12 @@ struct EvalPosition {
   std::span<const Move> legal_moves;
 };
 
+enum class ComputationEvent {
+  FIRST_BACKEND_IDLE,
+};
+
+using ComputationCallback = std::function<void(ComputationEvent)>;
+
 class BackendComputation {
  public:
   virtual ~BackendComputation() = default;
@@ -79,11 +93,13 @@ class BackendComputation {
   enum AddInputResult {
     ENQUEUED_FOR_EVAL = 0,    // Will be computed during ComputeBlocking();
     FETCHED_IMMEDIATELY = 1,  // Was in cache, the result is already populated.
+    FETCHED_DELAYED = 2,      // Was already queued for evaluation but results
+                              // aren't available yet.
   };
   virtual AddInputResult AddInput(
       const EvalPosition& pos,    // Input position.
       EvalResultPtr result) = 0;  // Where to fetch data into.
-  virtual void ComputeBlocking() = 0;
+  virtual void ComputeBlocking(ComputationCallback callback = [](ComputationEvent) {}) = 0;
 };
 
 class Backend {

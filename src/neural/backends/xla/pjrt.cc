@@ -384,8 +384,10 @@ std::vector<PjrtKeyValue> Pjrt::GetAttributes() const {
   return result;
 }
 
-std::unique_ptr<PjrtClient> Pjrt::CreateClient() {
+std::unique_ptr<PjrtClient> Pjrt::CreateClient(const ArgT& options) {
   auto args = MakeStruct<PJRT_Client_Create_Args>();
+  args.create_options = options.data();
+  args.num_options = options.size();
   CheckError(api_->PJRT_Client_Create(&args));
   return std::make_unique<PjrtClient>(api_, args.client);
 }

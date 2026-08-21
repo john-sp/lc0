@@ -37,7 +37,6 @@
 #include "utils/trace.h"
 
 namespace lczero {
-namespace {
 
 FillEmptyHistory EncodeHistoryFill(std::string history_fill) {
   if (history_fill == "fen_only") return FillEmptyHistory::FEN_ONLY;
@@ -46,22 +45,64 @@ FillEmptyHistory EncodeHistoryFill(std::string history_fill) {
   return FillEmptyHistory::NO;
 }
 
+namespace {
+void SoftmaxPolicy(std::span<float> dst, const NetworkComputation& computation,
+                   int sample, const std::span<uint16_t>& indices,
+                   const float temperature) {
+  // Copy the values to the destination array and compute the maximum.
+  const float max_p = std::accumulate(
+      indices.begin(), indices.end(), std::numeric_limits<float>::lowest(),
+      [&, counter = 0](float max_p, const uint16_t idx) mutable {
+        return std::max(max_p,
+                        dst[counter++] = computation.GetPVal(sample, idx));
+      });
+  // Compute the softmax and compute the total.
+  float total = std::accumulate(
+      dst.begin(), dst.end(), 0.0f, [&](float total, float& val) {
+        return total + (val = FastExp((val - max_p) * temperature));
+      });
+  const float scale = total > 0.0f ? 1.0f / total : 1.0f;
+  // Scale the values to sum to 1.0.
+  std::for_each(dst.begin(), dst.end(), [&](float& val) { val *= scale; });
+}
+}  // namespace
+
+std::unique_ptr<uint16_t[]> NetworkComputationRequest::ToNNIndices(
+    const std::span<const Move>& moves, const int transform) {
+  auto indices = std::make_unique<uint16_t[]>(moves.size());
+  for (size_t i = 0; i < moves.size(); ++i) {
+    indices[i] = MoveToNNIndex(moves[i], transform);
+  }
+  return indices;
+}
+
+void NetworkComputationRequest::ProcessResult(
+    const NetworkComputation& computation, int sample,
+    const float temperature) {
+  if (result.q) *result.q = computation.GetQVal(sample);
+  if (result.d) *result.d = computation.GetDVal(sample);
+  if (result.e) *result.e = computation.GetEVal(sample);
+  if (result.m) *result.m = computation.GetMVal(sample);
+  if (!result.p.empty()) {
+    SoftmaxPolicy(result.p, computation, sample,
+                  std::span<uint16_t>(nn_indices.get(), result.p.size()),
+                  temperature);
+  }
+}
+
+namespace {
+
 class NetworkAsBackend : public Backend {
  public:
   NetworkAsBackend(std::unique_ptr<Network> network, const OptionsDict& options)
       : network_(std::move(network)),
+        attrs_(*network_),
         backend_opts_(
             options.Get<std::string>(SharedBackendParams::kBackendOptionsId)),
         weights_path_(
             options.Get<std::string>(SharedBackendParams::kWeightsId)) {
     UpdateConfiguration(options);
     const NetworkCapabilities& caps = network_->GetCapabilities();
-    attrs_.has_mlh = caps.has_mlh();
-    attrs_.has_wdl = caps.has_wdl();
-    attrs_.runs_on_cpu = network_->IsCpu();
-    attrs_.suggested_num_search_threads = network_->GetThreads();
-    attrs_.recommended_batch_size = network_->GetMiniBatchSize();
-    attrs_.maximum_batch_size = 1024;
     input_format_ = caps.input_format;
   }
 
@@ -102,70 +143,61 @@ class NetworkAsBackendComputation : public BackendComputation {
   NetworkAsBackendComputation(NetworkAsBackend* backend)
       : backend_(backend),
         computation_(backend_->network_->NewComputation()),
-        entries_(backend_->attrs_.maximum_batch_size) {}
+        entries_(backend_->attrs_.maximum_batch_size) {
+  }
 
   size_t UsedBatchSize() const override { return entries_.size(); }
 
   AddInputResult AddInput(const EvalPosition& pos,
                           EvalResultPtr result) override {
     int transform;
-    const size_t idx = entries_.emplace_back(Entry{
-        .input = EncodePositionForNN(backend_->input_format_, pos.pos, 8,
-                                     backend_->fill_empty_history_, &transform),
-        .legal_moves = MoveList(pos.legal_moves.begin(), pos.legal_moves.end()),
+    auto input = EncodePositionForNN(backend_->input_format_, pos.pos, 8,
+                                     backend_->fill_empty_history_, &transform);
+    size_t idx = 0;
+    NetworkComputationRequest request{
+        .input = backend_->attrs_.concurrent_add_input ? InputPlanes{} : std::move(input),
+        .nn_indices =
+            NetworkComputationRequest::ToNNIndices(pos.legal_moves, transform),
         .result = result,
-        .transform = 0});
-    entries_[idx].transform = transform;
+        .transform = transform};
+    if (backend_->attrs_.concurrent_add_input) {
+      idx = computation_->AddInputConcurrent(std::move(input));
+      entries_.ResizeAtLeast(idx + 1);
+      std::construct_at(&entries_[idx], std::move(request));
+    } else {
+      entries_.emplace_back(std::move(request));
+    }
     return ENQUEUED_FOR_EVAL;
   }
 
-  void ComputeBlocking() override {
-    for (auto& entry : entries_) computation_->AddInput(std::move(entry.input));
+  void ComputeBlocking(ComputationCallback callback) override {
+    ForwardInputs();
     computation_->ComputeBlocking();
+    callback(ComputationEvent::FIRST_BACKEND_IDLE);
+    ConvertNetworkOutputToBackend();
+  }
+
+  void ConvertNetworkOutputToBackend() {
     LCTRACE_FUNCTION_SCOPE;
     for (size_t i = 0; i < entries_.size(); ++i) {
-      const EvalResultPtr& result = entries_[i].result;
-      if (result.q) *result.q = computation_->GetQVal(i);
-      if (result.d) *result.d = computation_->GetDVal(i);
-      if (result.m) *result.m = computation_->GetMVal(i);
-      if (!result.p.empty()) SoftmaxPolicy(result.p, computation_.get(), i);
+      entries_[i].ProcessResult(*computation_, i,
+                                backend_->softmax_policy_temperature_);
     }
   }
 
-  void SoftmaxPolicy(std::span<float> dst,
-                     const NetworkComputation* computation, int idx) {
-    LCTRACE_FUNCTION_SCOPE;
-    const std::vector<Move>& moves = entries_[idx].legal_moves;
-    const int transform = entries_[idx].transform;
-    // Copy the values to the destination array and compute the maximum.
-    const float max_p = std::accumulate(
-        moves.begin(), moves.end(), -std::numeric_limits<float>::infinity(),
-        [&, counter = 0](float max_p, const Move& move) mutable {
-          return std::max(max_p, dst[counter++] = computation->GetPVal(
-                                     idx, MoveToNNIndex(move, transform)));
-        });
-    // Compute the softmax and compute the total.
-    const float temperature = backend_->softmax_policy_temperature_;
-    float total = std::accumulate(
-        dst.begin(), dst.end(), 0.0f, [&](float total, float& val) {
-          return total + (val = FastExp((val - max_p) * temperature));
-        });
-    const float scale = total > 0.0f ? 1.0f / total : 1.0f;
-    // Scale the values to sum to 1.0.
-    std::for_each(dst.begin(), dst.end(), [&](float& val) { val *= scale; });
-  }
-
  private:
-  struct Entry {
-    InputPlanes input;
-    MoveList legal_moves;
-    EvalResultPtr result;
-    int transform;
-  };
+  void ForwardInputs() {
+    if (backend_->attrs_.concurrent_add_input) return;
+    LCTRACE_FUNCTION_SCOPE;
+    for (auto& entry : entries_) {
+      computation_->AddInput(std::move(entry.input));
+      entry.input = {};
+    }
+  }
 
   NetworkAsBackend* backend_;
   std::unique_ptr<NetworkComputation> computation_;
-  AtomicVector<Entry> entries_;
+  AtomicVector<NetworkComputationRequest> entries_;
 };
 
 std::unique_ptr<BackendComputation> NetworkAsBackend::CreateComputation() {

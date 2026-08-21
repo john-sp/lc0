@@ -27,12 +27,16 @@
 
 #include <cassert>
 
+#include <stdlib.h>
+
 #include "neural/backends/xla/xla_runner.h"
 #include "neural/factory.h"
 #include "neural/network.h"
 #include "neural/onnx/converter.h"
 #include "neural/xla/onnx2hlo.h"
 #include "utils/bititer.h"
+
+#include <pjrt_c_api.h>
 
 namespace lczero {
 namespace {
@@ -277,6 +281,24 @@ std::unique_ptr<Network> MakeXlaNetwork(const std::optional<WeightsFile>& w,
                                         const OptionsDict& opts) {
   if (!w) throw Exception("The XLA backend requires a network file.");
   int device = opts.GetOrDefault<int>("device", 0);
+  int threads = opts.GetOrDefault<int>("threads", 0);
+  ArgT args;
+  if (threads > 0) {
+    args.push_back({
+        .struct_size = sizeof(PJRT_NamedValue),
+        .extension_start = nullptr,
+        .name = "cpu_device_count",
+        .name_size = strlen("cpu_device_count"),
+        .type = PJRT_NamedValue_kInt64,
+        .int64_value = threads,
+        .value_size = 1,
+      });
+#ifdef _WIN32
+    _putenv_s("PJRT_NPROC", std::to_string(threads).c_str());
+#else
+    setenv("PJRT_NPROC", std::to_string(threads).c_str(), 1);
+#endif
+  }
   // Note: if the plugin_path does NOT contain a slash, it's looked up in the
   // LD_LIBRARY_PATH (and a few other system defined places). If it does
   // contain a slash, it's looked up at the exact relative or absolute path.
@@ -284,7 +306,7 @@ std::unique_ptr<Network> MakeXlaNetwork(const std::optional<WeightsFile>& w,
       opts.GetOrDefault<std::string>("plugin_path",
                                      "./pjrt_c_api_gpu_plugin.so")
           .c_str(),
-      device);
+      device, args);
   int max_batch_size = opts.GetOrDefault<int>("max_batch", 512);
   int steps = opts.GetOrDefault<int>("steps", 16);
 

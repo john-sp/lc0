@@ -31,6 +31,7 @@
 #include "search/register.h"
 #include "search/search.h"
 #include "neural/shared_params.h"
+#include "utils/numa.h"
 #include "utils/trace.h"
 
 namespace lczero {
@@ -50,10 +51,16 @@ const OptionId kClearTree{
      .help_text = "Clear the tree before the next search.",
      .visibility = OptionId::kProOnly}};
 
+const OptionId kHashId{{.long_flag = "hash",
+                        .uci_option = "Hash",
+                        .help_text = "Size of the transposition table in MB.",
+                        .visibility = OptionId::kAlwaysVisible}};
+
 class DagClassicSearch : public SearchBase {
  public:
   DagClassicSearch(UciResponder* responder, const OptionsDict* options)
-      : SearchBase(responder), options_(options) {}
+      : SearchBase(responder), options_(options) {
+  }
   ~DagClassicSearch() { search_.reset(); }
 
  private:
@@ -74,12 +81,18 @@ class DagClassicSearch : public SearchBase {
     if (search_) search_->Abort();
   }
 
+  float GetMaxOutOfOrderFactor() const override {
+    return options_->Get<float>(
+        classic::BaseSearchParams::kMaxOutOfOrderEvalsFactorId);
+  }
+
   const OptionsDict* options_;
   std::unique_ptr<classic::TimeManager> time_manager_;
   std::unique_ptr<Search> search_;
   std::unique_ptr<NodeTree> tree_;
   TranspositionTable tt_;
   std::optional<std::chrono::steady_clock::time_point> move_start_time_;
+  SearchCachedState search_cached_state_;
 };
 
 MoveList StringsToMovelist(const std::vector<std::string>& moves,
@@ -104,7 +117,7 @@ void DagClassicSearch::NewGame() {
   LCTRACE_FUNCTION_SCOPE;
   LOGFILE << "New game.";
   search_.reset();
-  tt_.clear();
+  tt_.Clear();
   tree_.reset();
   time_manager_ = classic::MakeTimeManager(*options_);
 }
@@ -115,6 +128,9 @@ void DagClassicSearch::SetPosition(const GameState& pos) {
   const bool is_same_game = tree_->ResetToPosition(pos);
   LOGFILE << "Tree reset to a new position.";
   if (!is_same_game) time_manager_ = classic::MakeTimeManager(*options_);
+  // Transposition table size.
+  tt_.SetCapacity(options_->Get<int>(kHashId) * 1000000 /
+                  tt_.GetItemStructSize());
 }
 
 void DagClassicSearch::StartSearch(const GoParams& params) {
@@ -137,17 +153,21 @@ void DagClassicSearch::StartSearch(const GoParams& params) {
       sizeof(float[classic::MemoryWatchingStopper::kAvgMovesPerPosition]);
   size_t total_memory =
       tree_.get()->GetCurrentHead()->GetN() * kAvgNodeSize +
-      (sizeof(TranspositionTable::value_type) + 1) * tt_.bucket_count() +
+      tt_.GetCapacity() * tt_.GetItemStructSize() +
       cache_size * kAvgCacheItemSize;
   auto stopper = time_manager_->GetStopper(
       params, tree_.get()->HeadPosition(), total_memory, kAvgNodeSize,
       tree_.get()->GetCurrentHead()->GetN());
+  // The previous search should stop using shared state before the new search
+  // starts using it.
+  search_.reset();
   search_ = std::make_unique<Search>(
-      *tree_, backend_, std::move(forwarder),
+      search_cached_state_, *tree_, backend_, std::move(forwarder),
       StringsToMovelist(params.searchmoves, tree_->HeadPosition().GetBoard()),
       *move_start_time_, std::move(stopper), params.infinite, params.ponder,
       *options_, &tt_, syzygy_tb_);
-
+  LOGFILE << "Transposition table load factor is "
+          << tt_.GetSize() / static_cast<float>(tt_.GetCapacity());
   LOGFILE << "Timer started at "
           << FormatTime(SteadyClockToSystemClock(*move_start_time_));
   search_->StartThreads(options_->Get<int>(kThreadsOptionId));
@@ -163,6 +183,7 @@ class DagClassicSearchFactory : public SearchFactory {
 
   void PopulateParams(OptionsParser* parser) const override {
     parser->Add<IntOption>(kThreadsOptionId, 0, 128) = 0;
+    parser->Add<IntOption>(kHashId, 0, 10000) = 50;
     SearchParams::Populate(parser);
     classic::PopulateTimeManagementOptions(classic::RunType::kUci, parser);
 

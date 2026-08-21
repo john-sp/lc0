@@ -28,6 +28,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <shared_mutex>
 #include <thread>
@@ -37,6 +38,16 @@
 #endif
 
 #include "utils/cppattributes.h"
+#include "utils/trace.h"
+
+#ifndef __has_feature
+#define __has_feature(x) 0
+#endif
+
+#if __has_feature(thread_sanitizer) || defined(__SANITIZE_THREAD__)
+#define TSAN_BUILD 1
+#include <sanitizer/tsan_interface.h>
+#endif
 
 namespace lczero {
 
@@ -77,6 +88,10 @@ class CAPABILITY("mutex") Mutex {
     Lock(Mutex& m) ACQUIRE(m) : lock_(m.get_raw()) {}
     ~Lock() RELEASE() {}
     std::unique_lock<std::mutex>& get_raw() { return lock_; }
+
+    void lock() ACQUIRE() { lock_.lock(); }
+    void unlock() RELEASE() { lock_.unlock(); }
+    bool owns_lock() const { return lock_.owns_lock(); }
 
    private:
     std::unique_lock<std::mutex> lock_;
@@ -143,30 +158,84 @@ class CAPABILITY("mutex") SpinMutex {
     Lock(SpinMutex& m) ACQUIRE(m) : lock_(m) {}
     ~Lock() RELEASE() {}
 
+    void unlock() RELEASE() { lock_.unlock(); }
+    void lock() ACQUIRE() { lock_.lock(); }
+
+    bool owns_lock() const { return lock_.owns_lock(); }
+
    private:
     std::unique_lock<SpinMutex> lock_;
   };
 
+#if TSAN_BUILD
+  SpinMutex() { __tsan_mutex_create(&mutex_, 0); }
+#endif
+#if TSAN_BUILD
+  ~SpinMutex() { __tsan_mutex_destroy(&mutex_, 0); }
+#endif
+
   void lock() ACQUIRE() {
-    int spins = 0;
+#if TSAN_BUILD
+    __tsan_mutex_pre_lock(&mutex_, 0);
+#endif
+    int val = 0;
+    if (mutex_.compare_exchange_strong(val, 1, std::memory_order_acq_rel))
+        [[likely]] {
+#if TSAN_BUILD
+      __tsan_mutex_post_lock(&mutex_, 0, 0);
+#endif
+      return;
+    }
+    SpinMutexSlowLock();
+  }
+  void unlock() RELEASE() {
+#if TSAN_BUILD
+    __tsan_mutex_pre_unlock(&mutex_, 0);
+#endif
+    mutex_.store(0, std::memory_order_release);
+#if TSAN_BUILD
+    __tsan_mutex_post_unlock(&mutex_, 0);
+#endif
+  }
+
+ private:
+  void SpinMutexSlowLock() {
+    // Slow contention path. We use random spin count with occasional yield to
+    // avoid starvation.
+    LCTRACE_FUNCTION_SCOPE;
+
+    unsigned spins = 0;
+    const auto tp = std::chrono::high_resolution_clock::now();
+    const auto ticks = tp.time_since_epoch().count();
+    const auto nowhash = std::hash<std::remove_cv_t<decltype(ticks)>>{}(ticks);
+    const auto tidhash =
+        std::hash<std::thread::id>{}(std::this_thread::get_id());
+    const auto hash = nowhash ^ tidhash;
+
+    const unsigned min_spins = 512;
+    const unsigned max_spins = min_spins + 1024;
+    const unsigned spin_count = min_spins + (hash % (max_spins - min_spins));
+
     while (true) {
       int val = 0;
       if (mutex_.compare_exchange_weak(val, 1, std::memory_order_acq_rel)) {
+#if TSAN_BUILD
+        __tsan_mutex_post_lock(&mutex_, 0, 0);
+#endif
         break;
       }
       ++spins;
       // Help avoid complete resource starvation by yielding occasionally if
       // needed.
-      if (spins % 512 == 0) {
+      if (spins == spin_count) {
         std::this_thread::yield();
+        spins = 0;
       } else {
         SpinloopPause();
       }
     }
   }
-  void unlock() RELEASE() { mutex_.store(0, std::memory_order_release); }
 
- private:
   std::atomic<int> mutex_{0};
 };
 

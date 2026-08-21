@@ -45,7 +45,7 @@ namespace lczero {
 class XlaRunner {
  public:
   // The library_path is the path to the PJRT library, and device indx.
-  XlaRunner(const char* library_path, int device);
+  XlaRunner(const char* library_path, int device, const ArgT& options);
   // Compiles and adds a module for the given batch size.
   void AddModule(size_t minibatch_size, const pblczero::HloModuleProto& module);
   // Transfers inputs to the device and execute the executable corresponding to
