@@ -142,7 +142,7 @@ class Search {
 
   PositionHistory GetPositionHistoryAtNode(const Node* node) const;
 
-  void StoreOriginalPolicy(const Node* node, std::unique_ptr<Edge []>& dst);
+  void InitializeForcedExploration();
 
   mutable Mutex counters_mutex_ ACQUIRED_AFTER(nodes_mutex_);
   // Tells all threads to stop.

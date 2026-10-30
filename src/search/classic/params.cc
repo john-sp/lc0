@@ -587,7 +587,7 @@ const OptionId SearchParams::kTemperatureSimulatedCpuctId{
      .help_text =
          "When picking a move with temperature, use this cpuct value for "
          "simulating the search behavior. It allows consistent blunder chances "
-         "with changing root CPuct. It is only used if ForcedExplorationFactor "
+         "with changing root CPuct. It is only used if ForcedExplorationVisits "
          "is greater than zero.",
      .visibility = OptionId::kProOnly}};
 
@@ -688,7 +688,7 @@ void SearchParams::Populate(OptionsParser* options) {
   BaseSearchParams::Populate(options);
   options->Add<IntOption>(kMaxPrefetchBatchId, 0, 1024) = DEFAULT_MAX_PREFETCH;
   options->Add<IntOption>(kSolidTreeThresholdId, 1, 2000000000) = 100;
-  options->Add<BoolOption>(kUsePolicyPostProcessingId) = true;
+  options->Add<BoolOption>(kUsePolicyPostProcessingId) = false;
   options->Add<IntOption>(kForcedExplorationVisitsId, 0, 100000) = 0;
   options->Add<FloatOption>(kForcedExplorationMaxPolicyId, 0.0f, 100.0f) = 7.0f;
   options->Add<FloatOption>(kSingleChildForcedBoostId, 0.0f, 100.0f) = 5.0f;

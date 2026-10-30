@@ -157,7 +157,7 @@ void V6TrainingDataArray::Add(
       throw Exception("More visited children than legal moves");
     }
     const Move move = *move_iter++;
-    const float fracv = std::get<0>(child) / total_n;
+    const float fracv = total_n > 0 ? std::get<0>(child) / total_n : 1.0f;
     const float P = std::get<1>(child);
     if (fracv > 0 && P > 0) {
       kld_sum += fracv * std::log(fracv / P);

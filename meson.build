@@ -1186,6 +1186,13 @@ if get_option('gtest')
     include_directories: includes, link_with: lc0_lib, dependencies: gtest),
     args: '--gtest_output=xml:network_demux.xml', timeout: 90)
 
+  test('ClassicSearchTest',
+    executable('classic_search_test', 'src/search/classic/search_test.cc',
+               'src/search/classic/search.cc', 'src/search/classic/params.cc',
+               'src/search/classic/stoppers/timemgr.cc', pb_files,
+    include_directories: includes, link_with: lc0_lib, dependencies: [gtest, deps]),
+    args: '--gtest_output=xml:classic_search.xml', timeout: 90)
+
   test('EngineTest',
     executable('engine_test', 'src/engine_test.cc', 'src/engine.cc',
                'src/neural/memcache.cc', pb_files,
