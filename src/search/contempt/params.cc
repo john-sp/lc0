@@ -92,6 +92,36 @@ HybridRatioMode EncodeHybridRatioMode(const std::string& mode_str) {
 
 }  // namespace
 
+const OptionId SearchParams::kUseUncertaintyWeightingId{
+    {.long_flag = "use-uncertainty-weighting",
+     .uci_option = "UseUncertaintyWeighting",
+     .help_text =
+         "Enable uncertainty weighting in MCTS. It uses logistic function to "
+         "convert network uncertainty to a weight factor."}};
+const OptionId SearchParams::kUncertaintyWeightingMidPointId{
+    {.long_flag = "uncertainty-weighting-mid-point",
+     .uci_option = "UncertaintyWeightingMidPoint",
+     .help_text = "The mid point of logistic function. It gets subtracted from "
+                  "network uncertainty."}};
+const OptionId SearchParams::kUncertaintyWeightingMinusExponentId{
+    {.long_flag = "uncertainty-weighting-minus-exponent",
+     .uci_option = "UncertaintyWeightingMinusExponent",
+     .help_text = "Minus exponent in the logistic function. Multiplies mid "
+                  "point corrected uncertainty for exponent."}};
+const OptionId SearchParams::kUncertaintyWeightingScaleId{
+    {.long_flag = "uncertainty-weighting-scale",
+     .uci_option = "UncertaintyWeightingScale",
+     .help_text = "Numerator in the logistic function."}};
+const OptionId SearchParams::kUncertaintyWeightingBaseId{
+    {.long_flag = "uncertainty-weighting-base",
+     .uci_option = "UncertaintyWeightingBase",
+     .help_text = "Base is added to logistic function output."}};
+const OptionId SearchParams::kUncertaintyWeightingCapId{
+    {.long_flag = "uncertainty-weighting-cap",
+     .uci_option = "UncertaintyWeightingCap",
+     .help_text = "Maximum value of uncertainty weighting. It is used for "
+                  "non-network evaluations like tablebase."}};
+
 const OptionId SearchParams::kScLimitId{
     "search-contempt-node-limit", "ScLimit",
     "UCT until this number of nodes"
@@ -137,7 +167,16 @@ const OptionId SearchParams::kHybridShapeParam2Id{
 // END: ADDED FOR DYNAMIC HYBRID RATIO
 
 void SearchParams::Populate(OptionsParser* options) {
-  classic::SearchParams::Populate(options);
+  classic::BaseSearchParams::Populate(options);
+  options->Add<BoolOption>(kUseUncertaintyWeightingId) = true;
+  options->Add<FloatOption>(kUncertaintyWeightingMidPointId, 0.0f, 1.0f) =
+      0.2086f;
+  options->Add<FloatOption>(kUncertaintyWeightingMinusExponentId, 0.0f,
+                            1000000.0f) = 51.34f;
+  options->Add<FloatOption>(kUncertaintyWeightingScaleId, 0.0f, 10.0f) =
+      0.6523f;
+  options->Add<FloatOption>(kUncertaintyWeightingBaseId, 0.0f, 10.0f) = 0.5388f;
+  options->Add<FloatOption>(kUncertaintyWeightingCapId, 0.0f, 10.0f) = 1.216f;
   options->Add<IntOption>(kScLimitId, 1, 1000000000) = 1000000000;
   options->Add<IntOption>(kContemptModeTBId, 0, 9) = 6;
   options->Add<FloatOption>(kHybridSamplingRatioId, 0.0f, 1.0f) = 0.8f;
@@ -159,7 +198,17 @@ void SearchParams::Populate(OptionsParser* options) {
 }
 
 SearchParams::SearchParams(const OptionsDict& options)
-    : classic::SearchParams(options),
+    : classic::BaseSearchParams(options),
+      kUseUncertaintyWeighting(options.Get<bool>(kUseUncertaintyWeightingId)),
+      kUncertaintyWeightingMidPoint(
+          options.Get<float>(kUncertaintyWeightingMidPointId)),
+      kUncertaintyWeightingMinusExponent(
+          options.Get<float>(kUncertaintyWeightingMinusExponentId)),
+      kUncertaintyWeightingScale(
+          options.Get<float>(kUncertaintyWeightingScaleId)),
+      kUncertaintyWeightingBase(
+          options.Get<float>(kUncertaintyWeightingBaseId)),
+      kUncertaintyWeightingCap(options.Get<float>(kUncertaintyWeightingCapId)),
       kContemptModeTB(options.Get<int>(kContemptModeTBId)),
       // START: ADDED FOR DYNAMIC HYBRID RATIO
       kHybridRatioMode(EncodeHybridRatioMode(options.Get<std::string>(kHybridRatioModeId))),
@@ -275,6 +324,7 @@ float SearchParams::GetDynamicHybridRatio(int node_count) const {
             ratio = max_r - (max_r - min_r) * std::exp(-5.0f * clamped_progress);
             break;
         case HybridRatioMode::CHAOTIC: { // p1 is 'r' param for logistic map
+            Mutex::Lock lock(chaotic_mutex_);
             chaotic_state_ = p1 * chaotic_state_ * (1.0f - chaotic_state_);
             ratio = min_r + (max_r - min_r) * chaotic_state_;
             break;

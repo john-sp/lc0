@@ -32,6 +32,7 @@
 #include <cmath>
 #include <vector>
 
+#include "utils/mutex.h"
 #include "utils/random.h"
 
 namespace lczero {
@@ -67,7 +68,7 @@ enum class HybridRatioMode {
 };
 // END: ADDED FOR DYNAMIC HYBRID RATIO
 
-class SearchParams : public classic::SearchParams {
+class SearchParams : public classic::BaseSearchParams {
  public:
   SearchParams(const OptionsDict& options);
   SearchParams(const SearchParams&) = delete;
@@ -80,6 +81,14 @@ class SearchParams : public classic::SearchParams {
   float GetDynamicHybridRatio(int node_count) const;
   // END: ADDED FOR DYNAMIC HYBRID RATIO
 
+  ContemptMode ResolveContemptMode(bool root_black, bool infinite,
+                                  bool ponder) const {
+    const auto mode = GetContemptMode();
+    if (mode != ContemptMode::PLAY) return mode;
+    if (infinite) return ContemptMode::NONE;
+    return root_black != ponder ? ContemptMode::BLACK : ContemptMode::WHITE;
+  }
+
   // Parameter getters.
   int GetScLimit() const { return options_.Get<int>(kScLimitId); }
   int GetContemptModeTB() const { return kContemptModeTB; }
@@ -91,6 +100,23 @@ class SearchParams : public classic::SearchParams {
   int GetHybridScalingFactor() const { return options_.Get<int>(kHybridScalingFactorId); }
   float GetHybridShapeParam1() const { return options_.Get<float>(kHybridShapeParam1Id); }
   float GetHybridShapeParam2() const { return options_.Get<float>(kHybridShapeParam2Id); }
+
+  bool GetUseUncertaintyWeighting() const { return kUseUncertaintyWeighting; }
+  float GetUncertaintyWeightingMidPoint() const {
+    return kUncertaintyWeightingMidPoint;
+  }
+  float GetUncertaintyWeightingMinusExponent() const {
+    return kUncertaintyWeightingMinusExponent;
+  }
+  float GetUncertaintyWeightingScale() const {
+    return kUncertaintyWeightingScale;
+  }
+  float GetUncertaintyWeightingBase() const {
+    return kUncertaintyWeightingBase;
+  }
+  float GetUncertaintyWeightingCap() const {
+    return kUncertaintyWeightingCap;
+  }
 
   // Search parameter IDs.
   static const OptionId kScLimitId;
@@ -106,10 +132,25 @@ class SearchParams : public classic::SearchParams {
   static const OptionId kHybridShapeParam2Id;
   // END: ADDED FOR DYNAMIC HYBRID RATIO
 
+  static const OptionId kUseUncertaintyWeightingId;
+  static const OptionId kUncertaintyWeightingMidPointId;
+  static const OptionId kUncertaintyWeightingMinusExponentId;
+  static const OptionId kUncertaintyWeightingScaleId;
+  static const OptionId kUncertaintyWeightingBaseId;
+  static const OptionId kUncertaintyWeightingCapId;
+
+  // Search parameter values.
+  const bool kUseUncertaintyWeighting;
+  const float kUncertaintyWeightingMidPoint;
+  const float kUncertaintyWeightingMinusExponent;
+  const float kUncertaintyWeightingScale;
+  const float kUncertaintyWeightingBase;
+  const float kUncertaintyWeightingCap;
   const int kContemptModeTB;
   // START: ADDED FOR DYNAMIC HYBRID RATIO
   const HybridRatioMode kHybridRatioMode;
   const std::vector<std::pair<int, float>> kHybridRatioSchedule;
+  mutable Mutex chaotic_mutex_;
   mutable float chaotic_state_{0.5f}; // Mutable for chaotic function state
   // END: ADDED FOR DYNAMIC HYBRID RATIO
 };

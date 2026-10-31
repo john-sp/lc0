@@ -1183,8 +1183,8 @@ class CudaNetwork : public Network {
     if (free_inputs_outputs_.empty()) {
       constexpr bool is_fp16 = std::is_same<half, DataType>::value;
       return std::make_unique<InputsOutputs<DataType>>(
-          max_batch_size_, wdl_, moves_left_, tensor_mem_size_, scratch_size_,
-          !has_tensor_cores_ && is_fp16);
+          max_batch_size_, wdl_, wdl_err_, moves_left_, tensor_mem_size_,
+          scratch_size_, !has_tensor_cores_ && is_fp16);
     } else {
       std::unique_ptr<InputsOutputs<DataType>> resource =
           std::move(free_inputs_outputs_.front());

@@ -25,6 +25,10 @@
   Program grant you additional permission to convey the resulting work.
 */
 
+#include <iomanip>
+#include <limits>
+#include <sstream>
+
 #include "chess/gamestate.h"
 #include "neural/shared_params.h"
 #include "search/classic/stoppers/factory.h"
@@ -54,6 +58,17 @@ class ContemptSearch : public SearchBase {
  public:
   ContemptSearch(UciResponder* responder, const OptionsDict* options)
       : SearchBase(responder), options_(options) {}
+  ~ContemptSearch() { search_.reset(); }
+
+  void SetBackend(Backend* backend) override {
+    if (backend_ != backend) {
+      search_.reset();
+      tt_.clear();
+      tree_.reset();
+      reuse_key_.clear();
+    }
+    SearchBase::SetBackend(backend);
+  }
 
  private:
   void NewGame() override;
@@ -63,6 +78,7 @@ class ContemptSearch : public SearchBase {
     move_start_time_ = std::chrono::steady_clock::now();
   }
   void WaitSearch() override {
+    LOGFILE << "Waiting for the search.";
     if (search_) search_->Wait();
   }
   void StopSearch() override {
@@ -73,9 +89,11 @@ class ContemptSearch : public SearchBase {
   }
 
   const OptionsDict* options_;
-  std::unique_ptr<TimeManager> time_manager_;
+  std::unique_ptr<classic::TimeManager> time_manager_;
   std::unique_ptr<Search> search_;
   std::unique_ptr<NodeTree> tree_;
+  TranspositionTable tt_;
+  std::string reuse_key_;
   std::optional<std::chrono::steady_clock::time_point> move_start_time_;
 };
 
@@ -99,42 +117,94 @@ MoveList StringsToMovelist(const std::vector<std::string>& moves,
 
 void ContemptSearch::NewGame() {
   LCTRACE_FUNCTION_SCOPE;
+  LOGFILE << "New game.";
   search_.reset();
+  tt_.clear();
   tree_.reset();
+  reuse_key_.clear();
   time_manager_ = classic::MakeTimeManager(*options_);
 }
 
 void ContemptSearch::SetPosition(const GameState& pos) {
   LCTRACE_FUNCTION_SCOPE;
+  search_.reset();
   if (!tree_) tree_ = std::make_unique<NodeTree>();
   const bool is_same_game = tree_->ResetToPosition(pos);
-  if (!is_same_game) time_manager_ = classic::MakeTimeManager(*options_);
+  LOGFILE << "Tree reset to a new position.";
+  if (!is_same_game) {
+    tt_.clear();
+    time_manager_ = classic::MakeTimeManager(*options_);
+  }
 }
 
 void ContemptSearch::StartSearch(const GoParams& params) {
   LCTRACE_FUNCTION_SCOPE;
+  search_.reset();
+  // Stored values and frozen sampling policies must belong to one evaluation
+  // configuration. Clearing the TT alone would leave the old graph reachable.
+  const SearchParams config(*options_);
+  const auto mode = config.ResolveContemptMode(
+      tree_->HeadPosition().IsBlackToMove(), params.infinite, params.ponder);
+  std::ostringstream key;
+  key << std::setprecision(std::numeric_limits<float>::max_digits10)
+      << backend_ << ' ' << syzygy_tb_ << ' ' << static_cast<int>(mode) << ' '
+      << config.GetWDLRescaleRatio() << ' ' << config.GetWDLRescaleDiff() << ' '
+      << config.GetWDLMaxS() << ' ' << config.GetContemptModeTB() << ' '
+      << config.GetCacheHistoryLength() << ' '
+      << static_cast<int>(config.GetHistoryFill()) << ' '
+      << config.GetSyzygyFastPlay() << ' ' << config.GetTwoFoldDraws() << ' '
+      << config.GetStickyEndgames() << ' ' << config.GetDrawScore() << ' '
+      << config.GetPolicySoftmaxTemp() << ' ' << config.GetNoiseEpsilon() << ' '
+      << config.GetNoiseAlpha() << ' ' << config.GetUseUncertaintyWeighting() << ' '
+      << config.GetUncertaintyWeightingMidPoint() << ' '
+      << config.GetUncertaintyWeightingMinusExponent() << ' '
+      << config.GetUncertaintyWeightingScale() << ' '
+      << config.GetUncertaintyWeightingBase() << ' '
+      << config.GetUncertaintyWeightingCap() << ' ' << config.GetScLimit() << ' '
+      << static_cast<int>(config.GetHybridRatioMode()) << ' '
+      << config.GetHybridSamplingRatio() << ' ' << config.GetHybridMinRatio() << ' '
+      << config.GetHybridMaxRatio() << ' ' << config.GetHybridScalingFactor() << ' '
+      << config.GetHybridShapeParam1() << ' ' << config.GetHybridShapeParam2();
+  for (const auto& [visits, ratio] : config.GetHybridRatioSchedule()) {
+    key << ' ' << visits << ':' << ratio;
+  }
+  const std::string reuse_key = key.str();
+  if (!reuse_key_.empty() && reuse_key_ != reuse_key) {
+    tt_.clear();
+    tree_->TrimTreeAtHead();
+  }
+  reuse_key_ = reuse_key;
+
   auto forwarder =
       std::make_unique<NonOwningUciRespondForwarder>(uci_responder_);
-  if (options_->Get<Button>(kClearTree).TestAndReset()) tree_->TrimTreeAtHead();
+  if (options_->Get<Button>(kClearTree).TestAndReset()) {
+    tt_.clear();
+    tree_->TrimTreeAtHead();
+    LOGFILE << "Tree cleared.";
+  }
 
   const auto cache_size =
       options_->Get<int>(SharedBackendParams::kNNCacheSizeId);
+  // Conservatively include a shared position and frozen CDF per visited edge.
   const size_t kAvgNodeSize =
-      sizeof(Node) +
-      classic::MemoryWatchingStopper::kAvgMovesPerPosition * sizeof(Edge);
+      sizeof(Node) + sizeof(LowNode) +
+      classic::MemoryWatchingStopper::kAvgMovesPerPosition *
+          (sizeof(Edge) + sizeof(double));
   const size_t kAvgCacheItemSize =
-      3 * sizeof(float) + sizeof(std::unique_ptr<float[]>) +
+      4 * sizeof(float) + sizeof(std::unique_ptr<float[]>) +
       sizeof(float[classic::MemoryWatchingStopper::kAvgMovesPerPosition]);
-  size_t total_memory = tree_.get()->GetCurrentHead()->GetN() * kAvgNodeSize +
-                        cache_size * kAvgCacheItemSize;
+  size_t total_memory =
+      tree_.get()->GetCurrentHead()->GetCompletedVisits() * kAvgNodeSize +
+      (sizeof(TranspositionTable::value_type) + 1) * tt_.bucket_count() +
+      cache_size * kAvgCacheItemSize;
   auto stopper = time_manager_->GetStopper(
       params, tree_.get()->HeadPosition(), total_memory, kAvgNodeSize,
-      tree_.get()->GetCurrentHead()->GetN());
+      tree_.get()->GetCurrentHead()->GetCompletedVisits());
   search_ = std::make_unique<Search>(
       *tree_, backend_, std::move(forwarder),
       StringsToMovelist(params.searchmoves, tree_->HeadPosition().GetBoard()),
       *move_start_time_, std::move(stopper), params.infinite, params.ponder,
-      *options_, syzygy_tb_);
+      *options_, &tt_, syzygy_tb_);
 
   LOGFILE << "Timer started at "
           << FormatTime(SteadyClockToSystemClock(*move_start_time_));
@@ -152,7 +222,7 @@ class ContemptSearchFactory : public SearchFactory {
   void PopulateParams(OptionsParser* parser) const override {
     parser->Add<IntOption>(kThreadsOptionId, 0, 128) = 0;
     SearchParams::Populate(parser);
-    PopulateTimeManagementOptions(classic::RunType::kUci, parser);
+    classic::PopulateTimeManagementOptions(classic::RunType::kUci, parser);
 
     parser->Add<ButtonOption>(kClearTree);
   }

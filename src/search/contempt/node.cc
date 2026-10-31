@@ -32,90 +32,17 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <fstream>
+#include <list>
 #include <sstream>
 #include <thread>
+#include <unordered_set>
 
-#include "neural/encoder.h"
-#include "neural/network.h"
 #include "utils/exception.h"
 #include "utils/hashcat.h"
 
 namespace lczero {
 namespace contempt {
-
-/////////////////////////////////////////////////////////////////////////
-// Node garbage collector
-/////////////////////////////////////////////////////////////////////////
-
-namespace {
-// Periodicity of garbage collection, milliseconds.
-const int kGCIntervalMs = 100;
-
-// Every kGCIntervalMs milliseconds release nodes in a separate GC thread.
-class NodeGarbageCollector {
- public:
-  NodeGarbageCollector() : gc_thread_([this]() { Worker(); }) {}
-
-  // Takes ownership of a subtree, to dispose it in a separate thread when
-  // it has time.
-  void AddToGcQueue(std::unique_ptr<Node> node, size_t solid_size = 0) {
-    if (!node) return;
-    Mutex::Lock lock(gc_mutex_);
-    subtrees_to_gc_.emplace_back(std::move(node));
-    subtrees_to_gc_solid_size_.push_back(solid_size);
-  }
-
-  ~NodeGarbageCollector() {
-    // Flips stop flag and waits for a worker thread to stop.
-    stop_.store(true);
-    gc_thread_.join();
-  }
-
- private:
-  void GarbageCollect() {
-    while (!stop_.load()) {
-      // Node will be released in destructor when mutex is not locked.
-      std::unique_ptr<Node> node_to_gc;
-      size_t solid_size = 0;
-      {
-        // Lock the mutex and move last subtree from subtrees_to_gc_ into
-        // node_to_gc.
-        Mutex::Lock lock(gc_mutex_);
-        if (subtrees_to_gc_.empty()) return;
-        node_to_gc = std::move(subtrees_to_gc_.back());
-        subtrees_to_gc_.pop_back();
-        solid_size = subtrees_to_gc_solid_size_.back();
-        subtrees_to_gc_solid_size_.pop_back();
-      }
-      // Solid is a hack...
-      if (solid_size != 0) {
-        for (size_t i = 0; i < solid_size; i++) {
-          node_to_gc.get()[i].~Node();
-        }
-        std::allocator<Node> alloc;
-        alloc.deallocate(node_to_gc.release(), solid_size);
-      }
-    }
-  }
-
-  void Worker() {
-    while (!stop_.load()) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(kGCIntervalMs));
-      GarbageCollect();
-    };
-  }
-
-  mutable Mutex gc_mutex_;
-  std::vector<std::unique_ptr<Node>> subtrees_to_gc_ GUARDED_BY(gc_mutex_);
-  std::vector<size_t> subtrees_to_gc_solid_size_ GUARDED_BY(gc_mutex_);
-
-  // When true, Worker() should stop and exit.
-  std::atomic<bool> stop_{false};
-  std::thread gc_thread_;
-};
-
-NodeGarbageCollector gNodeGc;
-}  // namespace
 
 /////////////////////////////////////////////////////////////////////////
 // Edge
@@ -167,26 +94,9 @@ void Edge::SetP(float p) {
   p_ = (tmp < 0) ? 0 : static_cast<uint16_t>(tmp >> 12);
 }
 
-void Edge::SetP_frozen(float p) {
-  assert(0.0f <= p && p <= 1.0f);
-  constexpr int32_t roundings = (1 << 11) - (3 << 28);
-  int32_t tmp;
-  std::memcpy(&tmp, &p, sizeof(float));
-  tmp += roundings;
-  p_frozen_ = (tmp < 0) ? 0 : static_cast<uint16_t>(tmp >> 12);
-}
-
 float Edge::GetP() const {
   // Reshift into place and set the assumed-set exponent bits.
   uint32_t tmp = (static_cast<uint32_t>(p_) << 12) | (3 << 28);
-  float ret;
-  std::memcpy(&ret, &tmp, sizeof(uint32_t));
-  return ret;
-}
-
-float Edge::GetP_frozen() const {
-  // Reshift into place and set the assumed-set exponent bits.
-  uint32_t tmp = (static_cast<uint32_t>(p_frozen_) << 12) | (3 << 28);
   float ret;
   std::memcpy(&ret, &tmp, sizeof(uint32_t));
   return ret;
@@ -207,115 +117,194 @@ std::unique_ptr<Edge[]> Edge::FromMovelist(const MoveList& moves) {
 }
 
 /////////////////////////////////////////////////////////////////////////
-// Node
+// LowNode + Node
 /////////////////////////////////////////////////////////////////////////
 
-Node* Node::CreateSingleChildNode(Move move) {
-  assert(!edges_);
-  assert(!child_);
-  edges_ = Edge::FromMovelist({move});
-  num_edges_ = 1;
-  child_ = std::make_unique<Node>(this, 0);
-  return child_.get();
+void Node::Trim() {
+  wl_ = 0.0f;
+
+  UnsetLowNode();
+  // sibling_
+
+  d_ = 0.0f;
+  m_ = 0.0f;
+  weight_ = 0.0;
+  completed_visits_ = 0;
+  n_in_flight_.store(0, std::memory_order_release);
+
+  // edge_
+
+  // index_
+
+  terminal_type_ = Terminal::NonTerminal;
+  lower_bound_ = GameResult::BLACK_WON;
+  upper_bound_ = GameResult::WHITE_WON;
+  repetition_ = false;
 }
 
-void Node::CreateEdges(const MoveList& moves) {
-  assert(!edges_);
-  assert(!child_);
-  edges_ = Edge::FromMovelist(moves);
-  num_edges_ = moves.size();
+LowNode::~LowNode() {
+  NodeGarbageCollector::Instance().AddToGcQueue(child_);
 }
 
-Node::ConstIterator Node::Edges() const {
-  return {*this, !solid_children_ ? &child_ : nullptr};
+Node::~Node() {
+  NodeGarbageCollector::Instance().AddToGcQueue(sibling_);
+  UnsetLowNode();
 }
-Node::Iterator Node::Edges() {
-  return {*this, !solid_children_ ? &child_ : nullptr};
+
+Node* Node::GetChild() const {
+  if (!low_node_) return nullptr;
+  return low_node_->GetChild()->get();
 }
+
+bool Node::HasChildren() const { return low_node_ && low_node_->HasChildren(); }
 
 float Node::GetVisitedPolicy() const {
   float sum = 0.0f;
-  for (auto* node : VisitedNodes()) sum += GetEdgeToNode(node)->GetP();
+  for (auto* node : VisitedNodes()) sum += node->GetP();
   return sum;
 }
 
-Edge* Node::GetEdgeToNode(const Node* node) const {
-  assert(node->parent_ == this);
-  assert(node->index_ < num_edges_);
-  return &edges_[node->index_];
+uint32_t Node::GetNInFlight() const {
+  return n_in_flight_.load(std::memory_order_acquire);
 }
 
-Edge* Node::GetOwnEdge() const { return GetParent()->GetEdgeToNode(this); }
+float Node::GetChildrenVisits() const {
+  return low_node_ ? low_node_->GetChildrenVisits() : 0.0f;
+}
+
+float Node::GetTotalVisits() const {
+  return low_node_ ? low_node_->GetN() : 0.0f;
+}
+
+const Edge& LowNode::GetEdgeAt(uint16_t index) const { return edges_[index]; }
 
 std::string Node::DebugString() const {
   std::ostringstream oss;
-  oss << " Term:" << static_cast<int>(terminal_type_) << " This:" << this
-      << " Parent:" << parent_ << " Index:" << index_
-      << " Child:" << child_.get() << " Sibling:" << sibling_.get()
-      << " WL:" << wl_ << " N:" << n_ << " N_:" << n_in_flight_
-      << " Edges:" << static_cast<int>(num_edges_)
+  oss << " <Node> This:" << this << " LowNode:" << low_node_.get()
+      << " Index:" << index_ << " Move:" << GetMove().ToString(true)
+      << " Sibling:" << sibling_.get() << " P:" << GetP() << " WL:" << wl_
+      << " D:" << d_ << " M:" << m_ << " N:" << weight_
+      << " N_:" << GetNInFlight()
+      << " Term:" << static_cast<int>(terminal_type_)
       << " Bounds:" << static_cast<int>(lower_bound_) - 2 << ","
-      << static_cast<int>(upper_bound_) - 2 << " Solid:" << solid_children_;
+      << static_cast<int>(upper_bound_) - 2;
   return oss.str();
 }
 
-bool Node::MakeSolid() {
-  if (solid_children_ || num_edges_ == 0 || IsTerminal()) return false;
-  // Can only make solid if no immediate leaf children are in flight since we
-  // allow the search code to hold references to leaf nodes across locks.
-  Node* old_child_to_check = child_.get();
-  uint32_t total_in_flight = 0;
-  while (old_child_to_check != nullptr) {
-    if (old_child_to_check->GetN() <= 1 &&
-        old_child_to_check->GetNInFlight() > 0) {
-      return false;
-    }
-    if (old_child_to_check->IsTerminal() &&
-        old_child_to_check->GetNInFlight() > 0) {
-      return false;
-    }
-    total_in_flight += old_child_to_check->GetNInFlight();
-    old_child_to_check = old_child_to_check->sibling_.get();
-  }
-  // If the total of children in flight is not the same as self, then there are
-  // collisions against immediate children (which don't update the GetNInFlight
-  // of the leaf) and its not safe.
-  if (total_in_flight != GetNInFlight()) {
-    return false;
-  }
-  std::allocator<Node> alloc;
-  auto* new_children = alloc.allocate(num_edges_);
-  for (int i = 0; i < num_edges_; i++) {
-    new (&(new_children[i])) Node(this, i);
-  }
-  std::unique_ptr<Node> old_child = std::move(child_);
-  while (old_child) {
-    int index = old_child->index_;
-    new_children[index] = std::move(*old_child.get());
-    // This isn't needed, but it helps crash things faster if something has gone
-    // wrong.
-    old_child->parent_ = nullptr;
-    gNodeGc.AddToGcQueue(std::move(old_child));
-    new_children[index].UpdateChildrenParents();
-    old_child = std::move(new_children[index].sibling_);
-  }
-  // This is a hack.
-  child_ = std::unique_ptr<Node>(new_children);
-  solid_children_ = true;
-  return true;
+std::string LowNode::DebugString() const {
+  std::ostringstream oss;
+  oss << " <LowNode> This:" << this << " Edges:" << edges_.get()
+      << " NumEdges:" << static_cast<int>(num_edges_)
+      << " Child:" << child_.get() << " WL:" << wl_ << " D:" << d_
+      << " M:" << m_ << " N:" << weight_ << " NP:" << num_parents_
+      << " Term:" << static_cast<int>(terminal_type_)
+      << " Bounds:" << static_cast<int>(lower_bound_) - 2 << ","
+      << static_cast<int>(upper_bound_) - 2;
+  return oss.str();
 }
 
-void Node::SortEdges() {
-  assert(edges_);
-  assert(!child_);
+void Edge::SortEdges(Edge* edges, int num_edges) {
   // Sorting on raw p_ is the same as sorting on GetP() as a side effect of
   // the encoding, and its noticeably faster.
-  std::sort(edges_.get(), (edges_.get() + num_edges_),
+  std::sort(edges, (edges + num_edges),
             [](const Edge& a, const Edge& b) { return a.p_ > b.p_; });
 }
 
+void LowNode::MakeTerminal(GameResult result, float plies_left, Terminal type) {
+  SetBounds(result, result);
+  terminal_type_ = type;
+  m_ = plies_left;
+  if (result == GameResult::DRAW) {
+    wl_ = 0.0f;
+    d_ = 1.0f;
+  } else if (result == GameResult::WHITE_WON) {
+    wl_ = 1.0f;
+    d_ = 0.0f;
+  } else if (result == GameResult::BLACK_WON) {
+    wl_ = -1.0f;
+    d_ = 0.0f;
+  }
+
+  assert(WLDMInvariantsHold());
+}
+
+void LowNode::MakeNotTerminal(const Node* node) {
+  assert(edges_);
+  if (!IsTerminal()) return;
+
+  terminal_type_ = Terminal::NonTerminal;
+  frozen_policy_.reset();
+  initial_weight_ = 0.0f;
+  lower_bound_ = GameResult::BLACK_WON;
+  upper_bound_ = GameResult::WHITE_WON;
+  weight_ = 0.0;
+  completed_visits_ = 0;
+  wl_ = 0.0;
+  d_ = 0.0;
+  m_ = 0.0;
+
+  // Include children too.
+  if (node->GetNumEdges() > 0) {
+    for (const auto& child : node->Edges()) {
+      auto weight = child.GetWeight();
+      if (weight > 0) {
+        weight_ += weight;
+        completed_visits_ += child.node()->GetCompletedVisits();
+        // Flip Q for opponent.
+        // Default values don't matter as n is > 0.
+        wl_ += child.GetWL(0.0f) * weight;
+        d_ += child.GetD(0.0f) * weight;
+        m_ += child.GetM(0.0f) * weight;
+      }
+    }
+
+    // Recompute with current eval (instead of network's) and children's eval.
+    if (weight_ > 0.0) {
+      wl_ /= weight_;
+      d_ /= weight_;
+      m_ /= weight_;
+    }
+  }
+
+  assert(WLDMInvariantsHold());
+}
+
+void LowNode::FreezePolicy(bool root_black) {
+  auto policy = std::make_shared<FrozenPolicy>();
+  policy->root_black = root_black;
+  policy->cumulative.resize(num_edges_, 0.0);
+  double total = 0.0;
+  for (auto edge = Edge_Iterator<false>(this); edge != edge.end(); ++edge) {
+    if (auto* child = edge.node()) {
+      const double visits = child->GetCompletedVisits();
+      policy->cumulative[child->Index()] = visits;
+      total += visits;
+    }
+  }
+  if (total == 0.0) return;
+  double sum = 0.0;
+  for (double& mass : policy->cumulative) {
+    sum += mass / total;
+    mass = sum;
+  }
+  // Normalize the complete CDF to avoid assigning rounding residue to an
+  // unvisited trailing edge.
+  for (double& mass : policy->cumulative) mass /= sum;
+  std::atomic_store(&frozen_policy_,
+                    std::shared_ptr<const FrozenPolicy>(std::move(policy)));
+}
+
+void LowNode::SetBounds(GameResult lower, GameResult upper) {
+  lower_bound_ = lower;
+  upper_bound_ = upper;
+}
+
+uint8_t Node::GetNumEdges() const {
+  return low_node_ ? low_node_->GetNumEdges() : 0;
+}
+
 void Node::MakeTerminal(GameResult result, float plies_left, Terminal type) {
-  if (type != Terminal::TwoFold) SetBounds(result, result);
+  SetBounds(result, result);
   terminal_type_ = type;
   m_ = plies_left;
   if (result == GameResult::DRAW) {
@@ -329,56 +318,43 @@ void Node::MakeTerminal(GameResult result, float plies_left, Terminal type) {
     d_ = 0.0f;
     // Terminal losses have no uncertainty and no reason for their U value to be
     // comparable to another non-loss choice. Force this by clearing the policy.
-    if (GetParent() != nullptr) GetOwnEdge()->SetP(0.0f);
+    SetP(0.0f);
   }
+
+  assert(WLDMInvariantsHold());
 }
 
-void Node::SetNodeLimitFrozen(bool value) {
-     node_limit_frozen_ = value;
-}
+void Node::MakeNotTerminal(bool also_low_node) {
+  // At least one of node and low node pair needs to be a terminal.
+  if (!IsTerminal() &&
+      (!also_low_node || !low_node_ || !low_node_->IsTerminal()))
+    return;
 
-void Node::SetNodeLimitFrozenLock(bool value) {
-     node_limit_frozen_lock_ = value;
-}
-
-bool Node::GetNodeLimitFrozen() {
-     return node_limit_frozen_;
-}
-
-bool Node::GetNodeLimitFrozenLock() {
-     return node_limit_frozen_lock_;
-}
-
-uint8_t Node::GetVisitedNumberOfEdges() {
-	return num_visited_edges_;
-}
-
-void Node::SetVisitedNumberOfEdges(int value) {
-	num_visited_edges_ = value;
-}
-
-void Node::MakeNotTerminal() {
   terminal_type_ = Terminal::NonTerminal;
-  n_ = 0;
+  repetition_ = false;
+  if (low_node_) {  // Two-fold or derived terminal.
+    // Revert low node first.
+    if (also_low_node && low_node_) low_node_->MakeNotTerminal(this);
 
-  // If we have edges, we've been extended (1 visit), so include children too.
-  if (edges_) {
-    n_++;
-    for (const auto& child : Edges()) {
-      const auto n = child.GetN();
-      if (n > 0) {
-        n_ += n;
-        // Flip Q for opponent.
-        // Default values don't matter as n is > 0.
-        wl_ += -child.GetWL(0.0f) * n;
-        d_ += child.GetD(0.0f) * n;
-      }
-    }
-
-    // Recompute with current eval (instead of network's) and children's eval.
-    wl_ /= n_;
-    d_ /= n_;
+    auto [lower_bound, upper_bound] = low_node_->GetBounds();
+    lower_bound_ = -upper_bound;
+    upper_bound_ = -lower_bound;
+    weight_ = low_node_->GetWeight();
+    completed_visits_ = low_node_->GetCompletedVisits();
+    wl_ = -low_node_->GetWL();
+    d_ = low_node_->GetD();
+    m_ = low_node_->GetM() + 1;
+  } else {  // Real terminal.
+    lower_bound_ = GameResult::BLACK_WON;
+    upper_bound_ = GameResult::WHITE_WON;
+    weight_ = 0.0f;
+    completed_visits_ = 0;
+    wl_ = 0.0f;
+    d_ = 0.0f;
+    m_ = 0.0f;
   }
+
+  assert(WLDMInvariantsHold());
 }
 
 void Node::SetBounds(GameResult lower, GameResult upper) {
@@ -387,106 +363,317 @@ void Node::SetBounds(GameResult lower, GameResult upper) {
 }
 
 bool Node::TryStartScoreUpdate() {
-  if (n_ == 0 && n_in_flight_ > 0) return false;
-  ++n_in_flight_;
+  if (weight_ > 0) {
+    n_in_flight_.fetch_add(1, std::memory_order_acq_rel);
+    return true;
+  } else {
+    uint32_t expected_n_if_flight_ = 0;
+    return n_in_flight_.compare_exchange_strong(expected_n_if_flight_, 1,
+                                                std::memory_order_acq_rel);
+  }
+}
+
+void Node::CancelScoreUpdate(uint32_t multivisit) {
+  assert(GetNInFlight() >= (uint32_t)multivisit);
+  n_in_flight_.fetch_sub(multivisit, std::memory_order_acq_rel);
+}
+
+void LowNode::FinalizeScoreUpdate(float v, float d, float m,
+                                  float multiweight) {
+  assert(edges_);
+  // Increment N.
+  if (completed_visits_ == 0) initial_weight_ = multiweight;
+  weight_ += multiweight;
+  ++completed_visits_;
+
+  // Recompute Q.
+  wl_ += multiweight * (v - wl_) / weight_;
+  d_ += multiweight * (d - d_) / weight_;
+  m_ += multiweight * (m - m_) / weight_;
+
+  assert(WLDMInvariantsHold());
+}
+
+void LowNode::AdjustForTerminal(float v, float d, float m, float multiweight) {
+  assert(multiweight <= weight_);
+
+  // Recompute Q.
+  wl_ += multiweight * v / weight_;
+  d_ += multiweight * d / weight_;
+  m_ += multiweight * m / weight_;
+
+  assert(WLDMInvariantsHold());
+}
+
+void Node::FinalizeScoreUpdate(float v, float d, float m, float multiweight) {
+  // Increment N.
+  weight_ += multiweight;
+  ++completed_visits_;
+
+  // Recompute Q.
+  wl_ += multiweight * (v - wl_) / weight_;
+  d_ += multiweight * (d - d_) / weight_;
+  m_ += multiweight * (m - m_) / weight_;
+
+  assert(WLDMInvariantsHold());
+
+  // Decrement virtual loss.
+  auto old = n_in_flight_.fetch_sub(1, std::memory_order_acq_rel);
+  assert(old > 0);
+}
+
+void Node::AdjustForTerminal(float v, float d, float m, float multiweight) {
+  assert(multiweight <= weight_);
+
+  // Recompute Q.
+  wl_ += multiweight * v / weight_;
+  d_ += multiweight * d / weight_;
+  m_ += multiweight * m / weight_;
+
+  assert(WLDMInvariantsHold());
+}
+
+void Node::IncrementNInFlight(uint32_t multivisit) {
+  n_in_flight_.fetch_add(multivisit, std::memory_order_acq_rel);
+}
+
+void LowNode::ReleaseChildren() {
+  frozen_policy_.reset();
+  NodeGarbageCollector::Instance().AddToGcQueue(child_);
+}
+
+void LowNode::ReleaseChildrenExceptOne(Node* node_to_save) {
+  frozen_policy_.reset();
+  auto& ngc = NodeGarbageCollector::Instance();
+  // Stores node which will have to survive (or nullptr if it's not found).
+  std::unique_ptr<Node> saved_node;
+  // Pointer to atomic_unique_ptr, so that we could move from it.
+  for (auto node = &child_; *node; node = (*node)->GetSibling()) {
+    // If current node is the one that we have to save.
+    if (node->get() == node_to_save) {
+      // Kill all remaining siblings.
+      ngc.AddToGcQueue(*(*node)->GetSibling());
+      // Save the node, and take the ownership from the unique_ptr.
+      saved_node.reset(node->release());
+      break;
+    }
+  }
+  // Make saved node the only child. (kills previous siblings).
+  ngc.AddToGcQueue(child_);
+  child_ = std::move(saved_node);
+}
+
+void Node::ReleaseChildrenExceptOne(Node* node_to_save) const {
+  // Sometime we have no graph yet or a reverted terminal without low node.
+  if (low_node_) {
+    low_node_->ReleaseChildrenExceptOne(node_to_save);
+  }
+}
+
+void Node::SetLowNode(std::shared_ptr<LowNode> low_node) {
+  assert(!low_node_);
+  low_node->AddParent();
+  low_node_ = low_node;
+}
+void Node::UnsetLowNode() {
+  if (low_node_) low_node_->RemoveParent();
+  low_node_.reset();
+}
+
+#ifndef NDEBUG
+namespace {
+static Node::VisitorId::storage current_visitor_id = 0;
+}
+
+Node::VisitorId::VisitorId() {
+  id_ = ++current_visitor_id;
+  if (id_ == 0)
+    id_ = ++current_visitor_id;
+}
+
+Node::VisitorId::~VisitorId() {
+  assert(current_visitor_id == id_);
+}
+
+bool LowNode::Visit(Node::VisitorId::type id) {
+  if (visitor_id_ == id)
+    return false;
+  visitor_id_ = id;
   return true;
 }
 
-void Node::CancelScoreUpdate(int multivisit) { n_in_flight_ -= multivisit; }
+template<typename VisitorType, typename EdgeVisitorType>
+static void TreeWalk(const Node* node, bool as_opponent,
+                     Node::VisitorId::type id,
+                     VisitorType visitor, EdgeVisitorType edge) {
+  const std::shared_ptr<LowNode>& low_node = node->GetLowNode();
+  if (!low_node || !low_node->Visit(id)) {
+    return;
+  }
 
-void Node::FinalizeScoreUpdate(float v, float d, float m, int multivisit) {
-  // Recompute Q.
-  wl_ += multivisit * (v - wl_) / (n_ + multivisit);
-  d_ += multivisit * (d - d_) / (n_ + multivisit);
-  m_ += multivisit * (m - m_) / (n_ + multivisit);
+  visitor(low_node.get(), as_opponent);
 
-  // Increment N.
-  n_ += multivisit;
-  // Decrement virtual loss.
-  n_in_flight_ -= multivisit;
-}
+  for (auto& child_edge : node->Edges()) {
+    auto child = child_edge.node();
+    if (child == nullptr) {
+      break;
+    }
+    edge(child, as_opponent, low_node.get());
+  }
 
-void Node::AdjustForTerminal(float v, float d, float m, int multivisit) {
-  // Recompute Q.
-  wl_ += multivisit * v / n_;
-  d_ += multivisit * d / n_;
-  m_ += multivisit * m / n_;
-}
-
-void Node::RevertTerminalVisits(float v, float d, float m, int multivisit) {
-  // Compute new n_ first, as reducing a node to 0 visits is a special case.
-  const int n_new = n_ - multivisit;
-  if (n_new <= 0) {
-    // If n_new == 0, reset all relevant values to 0.
-    wl_ = 0.0;
-    d_ = 1.0;
-    m_ = 0.0;
-    n_ = 0;
-  } else {
-    // Recompute Q and M.
-    wl_ -= multivisit * (v - wl_) / n_new;
-    d_ -= multivisit * (d - d_) / n_new;
-    m_ -= multivisit * (m - m_) / n_new;
-    // Decrement N.
-    n_ -= multivisit;
+  for (auto& child_edge : node->Edges()) {
+    auto child = child_edge.node();
+    if (child == nullptr) {
+      return;
+    }
+    TreeWalk(child, !as_opponent, id, visitor, edge);
   }
 }
 
-void Node::UpdateChildrenParents() {
-  if (!solid_children_) {
-    Node* cur_child = child_.get();
-    while (cur_child != nullptr) {
-      cur_child->parent_ = this;
-      cur_child = cur_child->sibling_.get();
-    }
-  } else {
-    Node* child_array = child_.get();
-    for (int i = 0; i < num_edges_; i++) {
-      child_array[i].parent_ = this;
-    }
-  }
+static std::string PtrToNodeName(const void* ptr) {
+  std::ostringstream oss;
+  oss << "n_" << ptr;
+  return oss.str();
 }
 
-void Node::ReleaseChildren() {
-  gNodeGc.AddToGcQueue(std::move(child_), solid_children_ ? num_edges_ : 0);
+template<typename VisitorType, typename EdgeVisitorType>
+static void TreeWalk(const Node* node, bool as_opponent,
+                     VisitorType visitor, EdgeVisitorType edge) {
+  Node::VisitorId id{};
+  edge(node, as_opponent, nullptr);
+  TreeWalk(node, !as_opponent, id, visitor, edge);
 }
 
-void Node::ReleaseChildrenExceptOne(Node* node_to_save) {
-  if (solid_children_) {
-    std::unique_ptr<Node> saved_node;
-    if (node_to_save != nullptr) {
-      saved_node = std::make_unique<Node>(this, node_to_save->index_);
-      *saved_node = std::move(*node_to_save);
-    }
-    gNodeGc.AddToGcQueue(std::move(child_), num_edges_);
-    child_ = std::move(saved_node);
-    if (child_) {
-      child_->UpdateChildrenParents();
-    }
-    solid_children_ = false;
-  } else {
-    // Stores node which will have to survive (or nullptr if it's not found).
-    std::unique_ptr<Node> saved_node;
-    // Pointer to unique_ptr, so that we could move from it.
-    for (std::unique_ptr<Node>* node = &child_; *node;
-         node = &(*node)->sibling_) {
-      // If current node is the one that we have to save.
-      if (node->get() == node_to_save) {
-        // Kill all remaining siblings.
-        gNodeGc.AddToGcQueue(std::move((*node)->sibling_));
-        // Save the node, and take the ownership from the unique_ptr.
-        saved_node = std::move(*node);
-        break;
+void LowNode::DotNodeString(std::ofstream& oss) const {
+  oss << PtrToNodeName(this) << " ["
+      << "shape=box";
+  // Adjust formatting to limit node size.
+  oss << std::fixed << std::setprecision(3);
+  oss << ",label=\""     //
+      << std::showpos    //
+      << "WL=" << wl_    //
+      << std::noshowpos  //
+      << "\\lD=" << d_ << "\\lM=" << m_ << "\\lN=" << weight_ << "\\l\"";
+  // Set precision for tooltip.
+  oss << std::fixed << std::showpos << std::setprecision(5);
+  oss << ",tooltip=\""   //
+      << std::showpos    //
+      << "WL=" << wl_    //
+      << std::noshowpos  //
+      << "\\nD=" << d_ << "\\nM=" << m_ << "\\nN=" << weight_
+      << "\\nNP=" << num_parents_
+      << "\\nTerm=" << static_cast<int>(terminal_type_)  //
+      << std::showpos                                    //
+      << "\\nBounds=" << static_cast<int>(lower_bound_) - 2 << ","
+      << static_cast<int>(upper_bound_) - 2 << std::noshowpos  //
+      << "\\n\\nThis=" << this << "\\nEdges=" << edges_.get()
+      << "\\nNumEdges=" << static_cast<int>(num_edges_)
+      << "\\nChild=" << child_.get() << "\\n\"";
+  oss << "];" << std::endl;
+}
+
+void Node::DotEdgeString(std::ofstream& oss, bool as_opponent,
+                         const LowNode* parent) const {
+  oss << (parent == nullptr ? "top" : PtrToNodeName(parent)) << " -> "
+      << (low_node_ ? PtrToNodeName(low_node_.get()) : PtrToNodeName(this))
+      << " [";
+  oss << "label=\""
+      << (parent == nullptr ? "N/A" : GetMove(as_opponent).ToString(true))
+      << "\\lN=" << weight_ << "\\lN_=" << GetNInFlight();
+  oss << "\\l\"";
+  // Set precision for tooltip.
+  oss << std::fixed << std::setprecision(5);
+  oss << ",labeltooltip=\""
+      << "P=" << (parent == nullptr ? 0.0f : GetP())  //
+      << std::showpos                                 //
+      << "\\nWL= " << wl_                             //
+      << std::noshowpos                               //
+      << "\\nD=" << d_ << "\\nM=" << m_ << "\\nN=" << weight_
+      << "\\nN_=" << GetNInFlight()
+      << "\\nTerm=" << static_cast<int>(terminal_type_)  //
+      << std::showpos                                    //
+      << "\\nBounds=" << static_cast<int>(lower_bound_) - 2 << ","
+      << static_cast<int>(upper_bound_) - 2 << "\\n\\nThis=" << this  //
+      << std::noshowpos                                               //
+      << "\\nLowNode=" << low_node_.get() << "\\nParent=" << parent
+      << "\\nIndex=" << index_ << "\\nSibling=" << sibling_.get() << "\\n\"";
+  oss << "];" << std::endl;
+}
+
+void Node::DotGraphString(std::ofstream& oss, bool as_opponent) const {
+  oss << "strict digraph {" << std::endl;
+  oss << "edge ["
+      << "headport=n"
+      << ",tooltip=\" \""  // Remove default tooltips from edge parts.
+      << "];" << std::endl;
+  oss << "node ["
+      << "shape=point"    // For fake nodes.
+      << ",style=filled"  // Show tooltip everywhere on the node.
+      << ",fillcolor=ivory"
+      << "];" << std::endl;
+  oss << "ranksep=" << 4.0f * std::log10(GetN()) << std::endl;
+
+  TreeWalk(this, !as_opponent,
+    [&](const LowNode* low_node, bool) {
+      low_node->DotNodeString(oss);
+    },
+    [&](const Node* node, bool as_opponent, const LowNode* parent) {
+      node->DotEdgeString(oss, as_opponent, parent);
+    });
+
+  oss << "}" << std::endl;
+}
+
+bool Node::ZeroNInFlight() const {
+  size_t nonzero_node_count = 0;
+  TreeWalk(this, false,
+    [](const LowNode*, bool) {},
+    [&](const Node* node, bool, const LowNode*) {
+      if (node->GetNInFlight() > 0) [[unlikely]] {
+        CERR << node->DebugString() << std::endl;
+        ++nonzero_node_count;
       }
-    }
-    // Make saved node the only child. (kills previous siblings).
-    gNodeGc.AddToGcQueue(std::move(child_));
-    child_ = std::move(saved_node);
+    });
+
+  if (nonzero_node_count > 0) {
+    CERR << "GetNInFlight() is nonzero on " << nonzero_node_count
+              << " nodes" << std::endl;
+    return false;
   }
-  if (!child_) {
-    num_edges_ = 0;
-    edges_.reset();  // Clear edges list.
-  }
+
+  return true;
+}
+#endif
+
+void Node::SortEdges() const {
+  assert(low_node_);
+  low_node_->SortEdges();
+}
+
+static constexpr float wld_tolerance = 0.000001f;
+static constexpr float m_tolerance = 0.000001f;
+
+static bool WLDMInvariantsHold(float wl, float d, float m) {
+  return -(1.0f + wld_tolerance) < wl && wl < (1.0f + wld_tolerance) &&  //
+         -(0.0f + wld_tolerance) < d && d < (1.0f + wld_tolerance) &&    //
+         -(0.0f + m_tolerance) < m &&                                    //
+         std::abs(wl) + std::abs(d) < (1.0f + wld_tolerance);
+}
+
+bool Node::WLDMInvariantsHold() const {
+  if (contempt::WLDMInvariantsHold(GetWL(), GetD(), GetM())) return true;
+
+  std::cerr << DebugString() << std::endl;
+
+  return false;
+}
+
+bool LowNode::WLDMInvariantsHold() const {
+  if (contempt::WLDMInvariantsHold(GetWL(), GetD(), GetM())) return true;
+
+  std::cerr << DebugString() << std::endl;
+
+  return false;
 }
 
 /////////////////////////////////////////////////////////////////////////
@@ -503,6 +690,14 @@ std::string EdgeAndNode::DebugString() const {
 // NodeTree
 /////////////////////////////////////////////////////////////////////////
 
+NodeTree::~NodeTree() {
+  auto& ngc = NodeGarbageCollector::Instance();
+  ngc.AddToGcQueue(gamebegin_node_);
+  ngc.NotifyThreadGoingSleep();
+  // Start garbage collection now because we delete everything.
+  ngc.Start();
+}
+
 void NodeTree::MakeMove(Move move) {
   Node* new_head = nullptr;
   for (auto& n : current_head_->Edges()) {
@@ -514,21 +709,19 @@ void NodeTree::MakeMove(Move move) {
       break;
     }
   }
+  // Release nodes from last move if any.
   current_head_->ReleaseChildrenExceptOne(new_head);
-  new_head = current_head_->child_.get();
+  new_head = current_head_->GetChild();
   current_head_ =
       new_head ? new_head : current_head_->CreateSingleChildNode(move);
   history_.Append(move);
+  moves_.push_back(move);
 }
 
 void NodeTree::TrimTreeAtHead() {
-  // If solid, this will be empty before move and will be moved back empty
-  // afterwards which is fine.
-  auto tmp = std::move(current_head_->sibling_);
-  // Send dependent nodes for GC instead of destroying them immediately.
-  current_head_->ReleaseChildren();
-  *current_head_ = Node(current_head_->GetParent(), current_head_->index_);
-  current_head_->sibling_ = std::move(tmp);
+  current_head_->Trim();
+  // Flush the thread local destruction queue.
+  NodeGarbageCollector::Instance().NotifyThreadGoingSleep();
 }
 
 bool NodeTree::ResetToPosition(const GameState& pos) {
@@ -538,10 +731,11 @@ bool NodeTree::ResetToPosition(const GameState& pos) {
   }
 
   if (!gamebegin_node_) {
-    gamebegin_node_ = std::make_unique<Node>(nullptr, 0);
+    gamebegin_node_ = std::make_unique<Node>(0);
   }
 
   history_.Reset(pos.startpos);
+  moves_.clear();
 
   Node* old_head = current_head_;
   current_head_ = gamebegin_node_.get();
@@ -557,6 +751,7 @@ bool NodeTree::ResetToPosition(const GameState& pos) {
   // retain old n_ and q_ (etc) data, even though its old children were
   // previously trimmed; we need to reset current_head_ in that case.
   if (!seen_old_head) TrimTreeAtHead();
+  NodeGarbageCollector::Instance().NotifyThreadGoingSleep();
   return seen_old_head;
 }
 
@@ -576,11 +771,231 @@ bool NodeTree::ResetToPosition(const std::string& starting_fen,
 }
 
 void NodeTree::DeallocateTree() {
-  // Same as gamebegin_node_.reset(), but actual deallocation will happen in
-  // GC thread.
-  gNodeGc.AddToGcQueue(std::move(gamebegin_node_));
-  gamebegin_node_ = nullptr;
+  NodeGarbageCollector::Instance().AddToGcQueue(gamebegin_node_);
   current_head_ = nullptr;
+}
+
+NodeGarbageCollector::NodeGarbageCollector() :
+  gc_thread_{[this]() {GCThread();}} {
+}
+
+template<typename UniquePtr>
+void NodeGarbageCollector::AddToGcQueue(UniquePtr& shared_node) {
+  std::unique_ptr<Node> node(shared_node.release());
+  if (ShouldQueue(node)) {
+    LocalWork().emplace_back(std::move(node));
+  }
+}
+
+NodeGarbageCollector::~NodeGarbageCollector() {
+  state_.store(Exit, std::memory_order_release);
+#ifndef NO_STD_ATOMIC_WAIT
+  state_.notify_all();
+#else
+  {
+    Mutex::Lock lock(state_mutex_);
+    state_signal_.notify_all();
+  }
+#endif
+  gc_thread_.join();
+}
+
+bool NodeGarbageCollector::SetState(State& old, State desired) {
+  bool rv =  state_.compare_exchange_strong(old, desired,
+                                            std::memory_order_acq_rel);
+  if (rv) {
+#ifndef NO_STD_ATOMIC_WAIT
+    state_.notify_all();
+#else
+    Mutex::Lock lock(state_mutex_);
+    state_signal_.notify_all();
+#endif
+  }
+  return rv;
+}
+
+void NodeGarbageCollector::Start() {
+  State s = state_.load(std::memory_order_acquire);
+  do {
+    if (s == Running)
+      break;
+    assert(s != Exit);
+  } while (!SetState(s, Running));
+}
+
+void NodeGarbageCollector::Stop() {
+  State old = Running;
+  SetState(old, GoToSleep);
+}
+
+void NodeGarbageCollector::Abort() {
+  Stop();
+}
+
+NodeGarbageCollector::State NodeGarbageCollector::Wait() const {
+  State s;
+  while ((s = state_.load(std::memory_order_acquire)) != Sleeping) {
+    assert(s != Exit);
+#ifndef NO_STD_ATOMIC_WAIT
+    state_.wait(s, std::memory_order_acquire);
+#else
+    Mutex::Lock lock(state_mutex_);
+    state_signal_.wait(lock.get_raw(), [this, s]() {return s != state_;});
+#endif
+  }
+  return s;
+}
+
+void NodeGarbageCollector::NotifyThreadGoingSleep() {
+  if (LocalWork().empty()) {
+    return;
+  }
+  ReleaseNodesWork new_work;
+  LocalWork().swap(new_work);
+}
+
+bool NodeGarbageCollector::IsActive() const {
+  return state_.load(std::memory_order_acquire) == Running;
+}
+
+bool NodeGarbageCollector::ShouldQueue(std::unique_ptr<Node>& node) const {
+  // We don't want to queue null pointers.
+  if (!node) {
+    return false;
+  }
+
+  // If state is exit, it means thread local queues have been destroyed.
+  State s = state_.load(std::memory_order_acquire);
+  if (s == Exit) {
+    return false;
+  }
+
+  // We directly free the node, if queue is running and we are in the GC thread.
+  // All other queue request should be pushed to the thread local batch.
+  return s != Running || !LocalWork().IsWorker();
+}
+
+void NodeGarbageCollector::GCThread() {
+  auto& shared_work = LocalWork(true);
+  assert(shared_work.IsWorker());
+  State s;
+  while ((s = state_.load(std::memory_order_acquire)) != Exit) {
+    if (s == GoToSleep) {
+      // Signal other threads that we have stopped destruction work.
+      if (SetState(s, Sleeping)) {
+        s = Sleeping;
+      } else {
+        continue;
+      }
+    }
+    if (s == Sleeping) {
+#ifndef NO_STD_ATOMIC_WAIT
+      state_.wait(Sleeping, std::memory_order_acquire);
+#else
+      Mutex::Lock lock(state_mutex_);
+      state_signal_.wait(lock.get_raw(), [this]() {return Sleeping != state_;});
+#endif
+      if (!shared_work.empty()) {
+        // Check for early exit from previous free. The work can be freed
+        // before the batch is full.
+        ReleaseNodesWork new_work(true);
+        new_work.swap(shared_work);
+      }
+      continue;
+    }
+
+    assert(s == Running);
+
+    bool empty = true;
+    std::vector<std::unique_ptr<Node>> nodes;
+    {
+      SpinMutex::Lock lock(mutex_);
+      if (!released_nodes_.empty()) {
+        empty = false;
+        nodes = std::move(released_nodes_.front());
+        released_nodes_.pop_front();
+      }
+    }
+
+    if (!empty) {
+      LOGFILE << "Garbage collection starting.";
+    }
+
+    // Free nodes one by one. LowNode destructor calls AddToGcQueue which allows
+    // recursive destruction terminate before freeing a whole branch.
+    while (!nodes.empty()) {
+      if (!IsActive()) {
+        break;
+      }
+      nodes.pop_back();
+    }
+
+    if (!empty) {
+      LOGFILE << "Garbage collection ending.";
+    }
+
+    // Go to sleep if empty or search stopped.
+    if (empty || !IsActive()) {
+      // Lock is requrired to avoid race between other thread queueing work and
+      // calling Start().
+      SpinMutex::Lock lock(mutex_);
+      // There wasn't enough time to free all nodes. They must go back to the
+      // list.
+      if (!nodes.empty()) {
+        released_nodes_.emplace_front(std::move(nodes));
+      }
+
+      // Going to sleep if the queue is empty.
+      if (released_nodes_.empty()) {
+        State old = Running;
+        SetState(old, Sleeping);
+      }
+    }
+  }
+}
+ReleaseNodesWork::ReleaseNodesWork(bool gc_thread) :
+    is_gc_thread_(gc_thread) {
+  released_nodes_.reserve(kCapacity);
+}
+
+bool ReleaseNodesWork::IsWorker() const {
+  return is_gc_thread_;
+}
+
+void ReleaseNodesWork::emplace_back(std::unique_ptr<Node>&& node) {
+  if (!node) return;
+  released_nodes_.emplace_back(std::forward<std::unique_ptr<Node>>(node));
+  if (released_nodes_.size() == kCapacity) {
+    ReleaseNodesWork new_work(is_gc_thread_);
+    swap(new_work);
+  }
+}
+
+bool ReleaseNodesWork::empty() const {
+  return released_nodes_.empty();
+}
+
+void ReleaseNodesWork::swap(ReleaseNodesWork &other) {
+  assert(IsWorker() == other.IsWorker());
+  std::swap(released_nodes_, other.released_nodes_);
+}
+
+ReleaseNodesWork::~ReleaseNodesWork() {
+  Submit();
+}
+
+void ReleaseNodesWork::Submit() {
+  if (released_nodes_.empty()) {
+    return;
+  }
+  auto& worker = NodeGarbageCollector::Instance();
+  SpinMutex::Lock lock(worker.mutex_);
+  // If this is worker, we have oldest nodes. Keep them at front of the queue.
+  if (IsWorker()) {
+    worker.released_nodes_.emplace_front(std::move(released_nodes_));
+  } else {
+    worker.released_nodes_.emplace_back(std::move(released_nodes_));
+  }
 }
 
 }  // namespace contempt
