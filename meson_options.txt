@@ -284,3 +284,8 @@ option('corex_root',
        type: 'string',
        value: '/usr/local/corex',
        description: 'Iluvatar CoreX SDK root (clang++, headers, libs)')
+
+option('search_contempt',
+       type: 'boolean',
+       value: true,
+       description: 'Enable search contempt algorithm')
