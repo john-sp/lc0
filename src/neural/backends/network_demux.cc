@@ -75,6 +75,38 @@ class DemuxingComputation final : public BackendComputation {
 
   void ComputeBlocking() override;
 
+  int GetBatchSize() const override { return planes_.size(); }
+
+  float GetQVal(int sample) const override {
+    auto [parent, offset] = GetParent(sample);
+    if (!parent) return 0;
+    return parent->GetQVal(offset);
+  }
+
+  float GetDVal(int sample) const override {
+    auto [parent, offset] = GetParent(sample);
+    if (!parent) return 0;
+    return parent->GetDVal(offset);
+  }
+
+  float GetMVal(int sample) const override {
+    auto [parent, offset] = GetParent(sample);
+    if (!parent) return 0;
+    return parent->GetMVal(offset);
+  }
+
+  float GetPVal(int sample, int move_id) const override {
+    auto [parent, offset] = GetParent(sample);
+    if (!parent) return 0;
+    return parent->GetPVal(offset, move_id);
+  }
+
+  float GetEVal(int sample) const override {
+    auto [parent, offset] = GetParent(sample);
+    if (!parent) return 0;
+    return parent->GetEVal(offset);
+  }
+
   void NotifyComplete() {
     if (dataready_.fetch_sub(1, std::memory_order_release) == 1) {
       {

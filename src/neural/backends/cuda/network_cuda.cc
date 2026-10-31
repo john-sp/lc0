@@ -130,7 +130,7 @@ static size_t getMaxAttentionBodySize(const MultiHeadWeights& weights, int N) {
 template <typename DataType>
 class CudaNetworkComputation : public NetworkComputation {
  public:
-  CudaNetworkComputation(CudaNetwork<DataType>* network, bool wdl,
+  CudaNetworkComputation(CudaNetwork<DataType>* network, bool wdl, bool wdl_err,
                          bool moves_left);
   ~CudaNetworkComputation();
 
@@ -178,6 +178,13 @@ class CudaNetworkComputation : public NetworkComputation {
     return 0.0f;
   }
 
+  float GetEVal(int sample) const override {
+    if (wdl_err_) {
+      return FromType(inputs_outputs_->op_value_err_mem_[sample]);
+    }
+    return 0.0f;
+  }
+
   float GetPVal(int sample, int move_id) const override {
     return FromType(
         inputs_outputs_->op_policy_mem_[sample * kNumOutputPolicy + move_id]);
@@ -195,6 +202,7 @@ class CudaNetworkComputation : public NetworkComputation {
   std::unique_ptr<InputsOutputs<DataType>> inputs_outputs_;
   int batch_size_;
   bool wdl_;
+  bool wdl_err_;
   bool moves_left_;
 
   CudaNetwork<DataType>* network_;
@@ -632,9 +640,21 @@ class CudaNetwork : public Network {
              pblczero::NetworkFormat::VALUE_WDL;
       BaseLayer<DataType>* lastlayer = attn_body_ ? encoder_last_ : resi_last_;
       auto value_main = std::make_unique<ValueHead<DataType>>(
-          lastlayer, head, scratch_mem_, attn_body_, wdl_, act, max_batch_size_,
-          use_gemm_ex);
+          lastlayer, head, scratch_mem_, attn_body_, wdl_, false, act,
+          max_batch_size_, use_gemm_ex);
       network_.emplace_back(std::move(value_main));
+
+      if (weights.value_heads.count("st") != 0) {
+        const MultiHeadWeights::ValueHead& st_head =
+            weights.value_heads.at("st");
+        wdl_err_ = st_head.ip_val_err_b.size() > 0;
+        if (wdl_err_) {
+          auto value_err = std::make_unique<ValueHead<DataType>>(
+              lastlayer, st_head, scratch_mem_, attn_body_, wdl_, true, act,
+              max_batch_size_, use_gemm_ex);
+          network_.emplace_back(std::move(value_err));
+        }
+      }
     }
 
     // Moves left head
@@ -705,7 +725,7 @@ class CudaNetwork : public Network {
     // pre-allocate cuda graphs for search threads
     auto allocateCudaGraphs = [&] {
       ReportCUDAErrors(cudaSetDevice(gpu_id_));
-      CudaNetworkComputation<DataType> comp(this, wdl_, moves_left_);
+      CudaNetworkComputation<DataType> comp(this, wdl_, wdl_err_, moves_left_);
       comp.AddInput(InputPlanes{(size_t)kNumInputPlanes});
       // Make sure cublas is initialized in this thread.
       comp.ComputeBlocking();
@@ -846,6 +866,7 @@ class CudaNetwork : public Network {
 
     auto* opPol = io->op_policy_mem_gpu_;
     auto* opVal = io->op_value_mem_gpu_;
+    auto* opValErr = io->op_value_err_mem_gpu_;
     auto* opMov = io->op_moves_left_mem_gpu_;
 
     // Figure out if the memory requirment for running the res block would fit
@@ -990,7 +1011,7 @@ class CudaNetwork : public Network {
     network_[l++]->Eval(batchSize, (DataType*)opVal, flow, spare2, scratch_mem,
                         scratch_size_, nullptr, cublas,
                         compute_stream);  // value head
-    if (!moves_left_ && !multi_stream_) {
+    if (!(moves_left_ || wdl_err_) && !multi_stream_) {
 #if CUDA_GRAPH_SUPPORTS_EXTERNAL_EVENTS
       ReportCUDAErrors(
           cudaEventRecordWithFlags(compute_ordering_event_, compute_stream,
@@ -1011,6 +1032,29 @@ class CudaNetwork : public Network {
           io->wdl_download_done_event_, download_stream,
           capture ? cudaEventRecordExternal : 0));
 #endif
+    }
+
+    if (wdl_err_) {
+      // value error head
+      network_[l++]->Eval(batchSize, (DataType*)opValErr, flow, spare2,
+                          scratch_mem, scratch_size_, nullptr, cublas,
+                          compute_stream);  // value error head
+
+      if (!moves_left_ && !multi_stream_) {
+#if CUDA_GRAPH_SUPPORTS_EXTERNAL_EVENTS
+        ReportCUDAErrors(
+            cudaEventRecordWithFlags(compute_ordering_event_, compute_stream,
+                                     capture ? cudaEventRecordExternal : 0));
+#endif
+      }
+      ReportCUDAErrors(
+          cudaEventRecord(io->value_err_done_event_, compute_stream));
+      ReportCUDAErrors(
+          cudaStreamWaitEvent(download_stream, io->value_err_done_event_, 0));
+      ReportCUDAErrors(
+          cudaMemcpyAsync(io->op_value_err_mem_, io->op_value_err_mem_gpu_,
+                          sizeof(io->op_value_err_mem_[0]) * batchSize,
+                          cudaMemcpyDeviceToHost, download_stream));
     }
 
     if (moves_left_) {
@@ -1130,8 +1174,8 @@ class CudaNetwork : public Network {
     if (device != gpu_id_) {
       ReportCUDAErrors(cudaSetDevice(gpu_id_));
     }
-    return std::make_unique<CudaNetworkComputation<DataType>>(this, wdl_,
-                                                              moves_left_);
+    return std::make_unique<CudaNetworkComputation<DataType>>(
+        this, wdl_, wdl_err_, moves_left_);
   }
 
   std::unique_ptr<InputsOutputs<DataType>> GetInputsOutputs() {
@@ -1170,6 +1214,7 @@ class CudaNetwork : public Network {
   int min_batch_size_;
   bool enable_graph_capture_;
   bool wdl_;
+  bool wdl_err_ = false;
   bool moves_left_;
   bool use_res_block_winograd_fuse_opt_;  // fuse operations inside the residual
                                           // tower
@@ -1290,8 +1335,8 @@ class CudaNetwork : public Network {
 
 template <typename DataType>
 CudaNetworkComputation<DataType>::CudaNetworkComputation(
-    CudaNetwork<DataType>* network, bool wdl, bool moves_left)
-    : wdl_(wdl), moves_left_(moves_left), network_(network) {
+    CudaNetwork<DataType>* network, bool wdl, bool wdl_err, bool moves_left)
+    : wdl_(wdl), wdl_err_(wdl_err), moves_left_(moves_left), network_(network) {
   batch_size_ = 0;
   inputs_outputs_ = network_->GetInputsOutputs();
 }
