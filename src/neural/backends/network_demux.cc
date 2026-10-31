@@ -57,7 +57,7 @@ struct DemuxingWork {
 
 class DemuxingComputation final : public BackendComputation {
  public:
-  explicit DemuxingComputation(DemuxingBackend* backend);
+  DemuxingComputation(DemuxingBackend* backend, size_t time_remaining);
 
   ~DemuxingComputation() override {
     // Wait for notify_one to finish before destroying the condition variable.
@@ -74,38 +74,6 @@ class DemuxingComputation final : public BackendComputation {
                           EvalResultPtr result) override;
 
   void ComputeBlocking() override;
-
-  int GetBatchSize() const override { return planes_.size(); }
-
-  float GetQVal(int sample) const override {
-    auto [parent, offset] = GetParent(sample);
-    if (!parent) return 0;
-    return parent->GetQVal(offset);
-  }
-
-  float GetDVal(int sample) const override {
-    auto [parent, offset] = GetParent(sample);
-    if (!parent) return 0;
-    return parent->GetDVal(offset);
-  }
-
-  float GetMVal(int sample) const override {
-    auto [parent, offset] = GetParent(sample);
-    if (!parent) return 0;
-    return parent->GetMVal(offset);
-  }
-
-  float GetPVal(int sample, int move_id) const override {
-    auto [parent, offset] = GetParent(sample);
-    if (!parent) return 0;
-    return parent->GetPVal(offset, move_id);
-  }
-
-  float GetEVal(int sample) const override {
-    auto [parent, offset] = GetParent(sample);
-    if (!parent) return 0;
-    return parent->GetEVal(offset);
-  }
 
   void NotifyComplete() {
     if (dataready_.fetch_sub(1, std::memory_order_release) == 1) {
@@ -247,13 +215,14 @@ BackendAttributes AggregateDemuxAttributes(
 
 class DemuxingBackend final : public Backend {
  public:
-  explicit DemuxingBackend(const OptionsDict& options);
+  DemuxingBackend(const OptionsDict& options, const std::string& network);
   ~DemuxingBackend() override { Abort(); }
 
   BackendAttributes GetAttributes() const override { return attrs_; }
 
-  std::unique_ptr<BackendComputation> CreateComputation() override {
-    return std::make_unique<DemuxingComputation>(this);
+  std::unique_ptr<BackendComputation> CreateComputation(
+      size_t time_remaining) override {
+    return std::make_unique<DemuxingComputation>(this, time_remaining);
   }
 
   UpdateConfigurationResult UpdateConfiguration(
@@ -277,7 +246,8 @@ class DemuxingBackend final : public Backend {
   friend class DemuxingComputation;
 };
 
-DemuxingBackend::DemuxingBackend(const OptionsDict& options)
+DemuxingBackend::DemuxingBackend(const OptionsDict& options,
+                                 const std::string& network)
     : backend_opts_(
           options.Get<std::string>(SharedBackendParams::kBackendOptionsId)),
       weights_path_(options.Get<std::string>(SharedBackendParams::kWeightsId)) {
@@ -311,7 +281,9 @@ DemuxingBackend::DemuxingBackend(const OptionsDict& options)
     child_opts.Set<std::string>(SharedBackendParams::kBackendOptionsId,
                                 child_opts_str);
 
-    auto child_be = backend_manager->CreateFromParams(child_opts);
+    auto* factory = backend_manager->GetFactoryByName(child_backend);
+    if (!factory) throw Exception("Unknown backend: " + child_backend);
+    auto child_be = factory->Create(child_opts, network);
     if (child_threads == 0) {
       child_threads = child_be->GetAttributes().suggested_num_search_threads;
     }
@@ -349,7 +321,8 @@ Backend::UpdateConfigurationResult DemuxingBackend::UpdateConfiguration(
   return UPDATE_OK;
 }
 
-DemuxingComputation::DemuxingComputation(DemuxingBackend* backend)
+DemuxingComputation::DemuxingComputation(DemuxingBackend* backend,
+                                         size_t time_remaining)
     : backend_(backend),
       start_index_(
           backend->start_index_.fetch_add(1, std::memory_order_relaxed) %
@@ -357,7 +330,7 @@ DemuxingComputation::DemuxingComputation(DemuxingBackend* backend)
   computations_.reserve(backend_->backends_.size());
   work_items_.reserve(backend_->backends_.size());
   for (const auto& child : backend_->backends_) {
-    computations_.push_back(child->backend_->CreateComputation());
+    computations_.push_back(child->backend_->CreateComputation(time_remaining));
     work_items_.push_back({this, computations_.back().get()});
   }
 }
@@ -399,8 +372,9 @@ class DemuxingBackendFactory : public BackendFactory {
  public:
   int GetPriority() const override { return -1001; }
   std::string_view GetName() const override { return "demux"; }
-  std::unique_ptr<Backend> Create(const OptionsDict& options) override {
-    return std::make_unique<DemuxingBackend>(options);
+  std::unique_ptr<Backend> Create(const OptionsDict& options,
+                                  const std::string& network) override {
+    return std::make_unique<DemuxingBackend>(options, network);
   }
 };
 

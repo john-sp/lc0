@@ -68,7 +68,7 @@ class TestBackend : public Backend {
             .recommended_batch_size = capacity_,
             .maximum_batch_size = capacity_};
   }
-  std::unique_ptr<BackendComputation> CreateComputation() override {
+  std::unique_ptr<BackendComputation> CreateComputation(size_t) override {
     return std::make_unique<TestComputation>(id_, capacity_, inputs);
   }
   std::atomic<size_t> inputs = 0;
@@ -82,7 +82,8 @@ class TestBackendFactory : public BackendFactory {
  public:
   int GetPriority() const override { return 1000000; }
   std::string_view GetName() const override { return "demux-test"; }
-  std::unique_ptr<Backend> Create(const OptionsDict& options) override {
+  std::unique_ptr<Backend> Create(const OptionsDict& options,
+                                  const std::string&) override {
     OptionsDict child;
     child.AddSubdictFromString(
         options.Get<std::string>(SharedBackendParams::kBackendOptionsId));

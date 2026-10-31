@@ -793,10 +793,10 @@ class ClientComputation {
     assert(policy_offset + legal_moves <= policy_.size());
     results_[index].policy_ =
         std::span<float>(policy_.data() + policy_offset, legal_moves);
-    return {&results_[index].value_,
-            &results_[index].draw_,
-            &results_[index].moves_left_,
-            {policy_.data() + policy_offset, legal_moves}};
+    return {.q = &results_[index].value_,
+            .d = &results_[index].draw_,
+            .m = &results_[index].moves_left_,
+            .p = {policy_.data() + policy_offset, legal_moves}};
   }
 
   // Backend notifies that results are read for a computation request.
